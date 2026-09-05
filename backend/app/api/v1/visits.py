@@ -1,0 +1,379 @@
+"""Visit endpoints: scheduling, lifecycle, transcripts, and insight generation."""
+
+from __future__ import annotations
+
+from datetime import date
+from typing import List, Optional
+from uuid import UUID
+
+import psycopg
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    Query,
+    Response,
+    UploadFile,
+    status,
+)
+
+from app.api.deps import get_db, require_auth
+from app.config import get_settings
+from app.db.repositories import jobs as jobs_repo
+from app.db.repositories import visits as visits_repo
+from app.schemas.common import ErrorResponse
+from app.schemas.insights import (
+    GenerateInsightsRequest,
+    InsightOut,
+    JobAccepted,
+    JobOut,
+)
+from app.schemas.transcripts import TranscriptOut
+from app.schemas.visits import (
+    VisitCancelRequest,
+    VisitCompleteRequest,
+    VisitCreate,
+    VisitOut,
+    VisitUpdate,
+)
+from app.services import insight_service, job_service, transcript_service, visit_service
+
+router = APIRouter(prefix="/visits", tags=["visits"],
+                   dependencies=[Depends(require_auth)])
+
+
+# --------------------------------------------------------------------------- #
+# Scheduling and reads
+# --------------------------------------------------------------------------- #
+
+@router.post(
+    "",
+    response_model=VisitOut,
+    status_code=status.HTTP_201_CREATED,
+    responses={404: {"model": ErrorResponse, "description": "Unknown patient"},
+               409: {"model": ErrorResponse, "description": "Visit number taken"},
+               422: {"model": ErrorResponse, "description": "Bad transcript path"}},
+    summary="Schedule a visit",
+)
+def schedule_visit(
+    payload: VisitCreate,
+    conn: psycopg.Connection = Depends(get_db),
+) -> VisitOut:
+    """Create a visit for an existing patient.
+
+    `visit_number` is assigned sequentially when omitted. `transcript_path` is
+    optional because a scheduled visit has no recording yet; upload it later.
+
+    Scheduling also closes any open follow-up from an earlier visit for this
+    patient, in the same transaction.
+    """
+    visit = visit_service.schedule_visit(
+        conn,
+        patient_id=str(payload.patient_id),
+        visit_date=payload.visit_date,
+        visit_time=payload.visit_time,
+        visit_number=payload.visit_number,
+        visit_type=payload.visit_type,
+        visit_status=payload.visit_status,
+        transcript_path=payload.transcript_path,
+        transcript_provider=payload.transcript_provider,
+    )
+    return VisitOut.model_validate(visit)
+
+
+@router.get("", response_model=List[VisitOut], summary="List visits")
+def list_visits(
+    response: Response,
+    status_filter: Optional[List[str]] = Query(
+        default=None, alias="status",
+        description="Repeatable: scheduled | in_progress | completed | cancelled"),
+    date_from: Optional[date] = Query(default=None, alias="from",
+                                      description="Inclusive on visit_date"),
+    date_to: Optional[date] = Query(default=None, alias="to",
+                                    description="Inclusive on visit_date"),
+    has_transcript: Optional[bool] = Query(default=None),
+    patient_id: Optional[UUID] = Query(default=None),
+    pending_only: bool = Query(default=False,
+                               description="Only visits without insights"),
+    sort: str = Query(default="date_desc",
+                      pattern="^(date_desc|date_asc|patient)$"),
+    limit: Optional[int] = Query(default=None, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    conn: psycopg.Connection = Depends(get_db),
+) -> List[VisitOut]:
+    """Visits newest first by default, which is what a schedule queue needs."""
+    kwargs = {
+        "patient_id": str(patient_id) if patient_id else None,
+        "statuses": status_filter,
+        "date_from": date_from,
+        "date_to": date_to,
+        "has_transcript": has_transcript,
+        "pending_only": pending_only,
+    }
+    rows = visits_repo.list_visits(conn, sort=sort, limit=limit, offset=offset,
+                                   **kwargs)
+    response.headers["X-Total-Count"] = str(visits_repo.count_visits(conn, **kwargs))
+    return [VisitOut.model_validate(r) for r in rows]
+
+
+@router.get(
+    "/{visit_id}",
+    response_model=VisitOut,
+    responses={404: {"model": ErrorResponse}},
+    summary="Get one visit",
+)
+def get_visit(
+    visit_id: UUID,
+    conn: psycopg.Connection = Depends(get_db),
+) -> VisitOut:
+    return VisitOut.model_validate(visit_service.get_visit(conn, str(visit_id)))
+
+
+@router.patch(
+    "/{visit_id}",
+    response_model=VisitOut,
+    responses={404: {"model": ErrorResponse},
+               422: {"model": ErrorResponse, "description": "Bad transcript path"}},
+    summary="Update a visit's details",
+)
+def update_visit(
+    visit_id: UUID,
+    payload: VisitUpdate,
+    conn: psycopg.Connection = Depends(get_db),
+) -> VisitOut:
+    """Patch a visit's details.
+
+    Attaching a transcript here does **not** complete the visit: completion is an
+    explicit transition via `/complete`, so the status never changes as a side
+    effect of an unrelated action.
+    """
+    visit = visit_service.update_visit(
+        conn,
+        str(visit_id),
+        transcript_path=payload.transcript_path,
+        transcript_provider=payload.transcript_provider,
+        visit_status=payload.visit_status,
+        visit_date=payload.visit_date,
+        visit_time=payload.visit_time,
+        visit_type=payload.visit_type,
+    )
+    return VisitOut.model_validate(visit)
+
+
+# --------------------------------------------------------------------------- #
+# Lifecycle
+# --------------------------------------------------------------------------- #
+
+@router.post(
+    "/{visit_id}/complete",
+    response_model=VisitOut,
+    responses={404: {"model": ErrorResponse},
+               409: {"model": ErrorResponse, "description": "Visit is cancelled"}},
+    summary="Mark a visit completed",
+)
+def complete_visit(
+    visit_id: UUID,
+    payload: Optional[VisitCompleteRequest] = None,
+    conn: psycopg.Connection = Depends(get_db),
+) -> VisitOut:
+    """Complete a consultation, optionally correcting the actual date and time.
+
+    Idempotent: completing an already-completed visit returns 200 and leaves
+    `completed_at` unchanged, so a double click is harmless.
+    """
+    options = payload or VisitCompleteRequest()
+    visit = visit_service.complete_visit(
+        conn, str(visit_id),
+        visit_date=options.visit_date,
+        visit_time=options.visit_time,
+    )
+    return VisitOut.model_validate(visit)
+
+
+@router.post(
+    "/{visit_id}/cancel",
+    response_model=VisitOut,
+    responses={404: {"model": ErrorResponse},
+               409: {"model": ErrorResponse, "description": "Visit has insights"}},
+    summary="Cancel a visit",
+)
+def cancel_visit(
+    visit_id: UUID,
+    payload: Optional[VisitCancelRequest] = None,
+    conn: psycopg.Connection = Depends(get_db),
+) -> VisitOut:
+    """Cancel a visit and reopen any follow-up it had resolved.
+
+    A cancelled visit no longer answers anything, so follow-ups it closed return
+    to the queue; otherwise the patient would be silently dropped.
+    """
+    options = payload or VisitCancelRequest()
+    visit = visit_service.cancel_visit(conn, str(visit_id), reason=options.reason)
+    return VisitOut.model_validate(visit)
+
+
+# --------------------------------------------------------------------------- #
+# Transcript
+# --------------------------------------------------------------------------- #
+
+@router.post(
+    "/{visit_id}/transcript",
+    response_model=VisitOut,
+    status_code=status.HTTP_201_CREATED,
+    responses={404: {"model": ErrorResponse},
+               409: {"model": ErrorResponse,
+                     "description": "Visit not completed, or transcript already "
+                                    "attached without replace=true"},
+               413: {"model": ErrorResponse, "description": "Transcript too large"},
+               422: {"model": ErrorResponse,
+                     "description": "Not a .txt file, not UTF-8, or empty"}},
+    summary="Upload a visit's transcript",
+)
+async def upload_transcript(
+    visit_id: UUID,
+    file: UploadFile = File(..., description="Plain UTF-8 .txt transcript"),
+    replace: bool = Form(default=False,
+                         description="Required to overwrite an existing transcript"),
+    conn: psycopg.Connection = Depends(get_db),
+) -> VisitOut:
+    """Attach a transcript to a completed visit.
+
+    Only completed visits accept an upload, which is what makes an Add Transcript
+    button legitimately disabled until the consultation is marked done.
+
+    The file is stored as `transcripts/{visit_id}.txt` — never under the client's
+    filename, which is attacker controlled. The original name is kept on the
+    visit for display only.
+    """
+    raw = await file.read()
+    visit = transcript_service.store_transcript(
+        conn, str(visit_id), filename=file.filename, raw=raw, replace=replace)
+    return VisitOut.model_validate(visit)
+
+
+@router.get(
+    "/{visit_id}/transcript",
+    response_model=TranscriptOut,
+    responses={404: {"model": ErrorResponse,
+                     "description": "Unknown visit, or no transcript attached"}},
+    summary="Read a visit's transcript",
+)
+def read_transcript(
+    visit_id: UUID,
+    conn: psycopg.Connection = Depends(get_db),
+) -> TranscriptOut:
+    """The transcript text, so a brief can be checked against its source."""
+    return TranscriptOut.model_validate(
+        transcript_service.read_transcript(conn, str(visit_id)))
+
+
+@router.delete(
+    "/{visit_id}/transcript",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={404: {"model": ErrorResponse},
+               409: {"model": ErrorResponse, "description": "Visit has insights"}},
+    summary="Delete a visit's transcript",
+)
+def delete_transcript(
+    visit_id: UUID,
+    conn: psycopg.Connection = Depends(get_db),
+) -> Response:
+    """Remove the transcript file and clear its columns.
+
+    Refused once insights exist: removing the source of a generated brief would
+    leave a clinical record that cannot be audited.
+    """
+    transcript_service.delete_transcript(conn, str(visit_id))
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --------------------------------------------------------------------------- #
+# Insights
+# --------------------------------------------------------------------------- #
+
+@router.post(
+    "/{visit_id}/insights",
+    response_model=JobAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={404: {"model": ErrorResponse, "description": "Unknown visit"},
+               409: {"model": ErrorResponse,
+                     "description": "No transcript, insights exist, or a job is "
+                                    "already running"}},
+    summary="Generate insights for a visit",
+)
+def generate_insights(
+    visit_id: UUID,
+    background: BackgroundTasks,
+    payload: Optional[GenerateInsightsRequest] = None,
+) -> JobAccepted:
+    """Start the three-layer chain and return a job to poll.
+
+    202 rather than the finished insight because the chain is three sequential
+    model calls, roughly a minute, which is past common proxy timeouts.
+
+    `poll_url` and `insights_url` are **root-relative and already include the
+    `/api/v1` prefix**. Join them against the server origin, not against a base
+    URL that already ends in `/api/v1`.
+
+    Regenerating overwrites the previous brief: `visit_insights` is upserted in
+    place, so there is no history. Warn before offering it.
+    """
+    options = payload or GenerateInsightsRequest()
+    job = job_service.enqueue(
+        visit_id=str(visit_id),
+        stop_after=options.stop_after,
+        regenerate=options.regenerate,
+        model=options.model,
+    )
+    background.add_task(job_service.run_job, job.job_id)
+
+    prefix = get_settings().api_prefix
+    return JobAccepted(
+        job_id=job.job_id,
+        visit_id=job.visit_id,
+        status=job.status,
+        poll_url=f"{prefix}/jobs/{job.job_id}",
+        insights_url=f"{prefix}/visits/{visit_id}/insights",
+    )
+
+
+@router.get(
+    "/{visit_id}/insights",
+    response_model=InsightOut,
+    responses={404: {"model": ErrorResponse,
+                     "description": "Unknown visit, or no insights yet"}},
+    summary="Read a visit's insights",
+)
+def read_insights(
+    visit_id: UUID,
+    conn: psycopg.Connection = Depends(get_db),
+) -> InsightOut:
+    return InsightOut.model_validate(
+        insight_service.get_insights(conn, str(visit_id)))
+
+
+@router.get(
+    "/{visit_id}/job",
+    response_model=Optional[JobOut],
+    responses={404: {"model": ErrorResponse, "description": "Unknown visit"}},
+    summary="The latest insight job for a visit",
+)
+def latest_job(
+    visit_id: UUID,
+    response: Response,
+    conn: psycopg.Connection = Depends(get_db),
+):
+    """The most recent job for a visit, so a page reload can resume polling.
+
+    Returns 204 when the visit has never had a job — distinguishable from a 404
+    for an unknown visit, so the UI can tell "not generated yet" from "no such
+    visit".
+    """
+    visit_service.get_visit(conn, str(visit_id))  # 404 if unknown
+    job = jobs_repo.latest_for_visit(conn, str(visit_id))
+    if job is None:
+        response.status_code = status.HTTP_204_NO_CONTENT
+        return None
+    return JobOut.model_validate(job)

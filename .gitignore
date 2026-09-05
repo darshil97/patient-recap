@@ -1,0 +1,36 @@
+# Secrets — backend/.env holds live API keys and the database password
+.env
+.env.local
+*.env
+!.env.example
+
+# Patient data. Uploaded transcripts must never be committed. The synthetic
+# seed transcripts live in backend/archive/transcripts_json/ and are tracked,
+# so a fresh clone can rebuild these with `python -m cli.convert_transcripts`.
+backend/transcripts/*.txt
+
+# Generated output
+backend/output/
+backend/sample_*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / frontend
+node_modules/
+.next/
+dist/
+build/
+.turbo/
+
+# Editors and OS
+.DS_Store
+*.swp
+.idea/
