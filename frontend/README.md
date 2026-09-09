@@ -124,6 +124,68 @@ scheduling a visit for that patient, so schedule the visit instead.
 `mark_contacted: true` records the call without changing status, which is how
 "I phoned them, they're still deciding" is expressed.
 
+#### Dismissing is a first-class action in the queue
+
+Plenty of patients never come back — they feel better, or they simply decline. So
+**Dismiss** is a visible action on every row of the Follow-ups page, not something
+hidden in an overflow menu. Without it the queue silently fills with people who are
+never returning and stops being trustworthy.
+
+`dismissed_reason` is required by the API, so dismissal cannot be one click. Use a
+small dialog offering the common reasons as presets, plus optional free text:
+
+- Feeling better, no follow-up needed
+- Declined to return
+- Could not be reached
+- Moved away or transferred care
+- Other (free text)
+
+Dismissal is reversible: `PATCH` with `status: "open"` clears the dismissal fields.
+Offer **Undo** on the confirmation toast, and make `status=dismissed` a filter on
+the queue so a row can be reopened later.
+
+Three outcomes are therefore reachable from a queue row, and they are genuinely
+distinct — do not collapse them:
+
+| Doctor's situation | Action | Effect |
+| --- | --- | --- |
+| Patient is coming in | Schedule visit | follow-up auto-resolves on the new visit |
+| Spoke to them, still deciding | Mark contacted | stays `open`, records the call |
+| Not coming back | Dismiss + reason | leaves the queue, reversible |
+
+### Uploading a transcript starts generation automatically
+
+Product decision: the doctor should not have to press a second button. A
+successful upload is immediately followed by `POST /visits/{id}/insights`, and the
+UI moves straight into the progress state.
+
+The chaining lives in the **frontend**, not the upload endpoint, on purpose.
+Storing bytes always succeeds; generation costs money and hits a daily cap. Keeping
+them as two calls means a quota failure reads as "transcript saved, compiling later"
+rather than making a successful upload look like it failed.
+
+Two things this has to get right.
+
+**Pass `regenerate: true` when the visit already has insights.** Replacing a
+transcript (`replace: true`) does not clear `insights_generated`, so a plain
+generate call returns `409 conflict`. Send `regenerate: true` whenever
+`has_insights` was already true.
+
+**A stale brief is possible and must be surfaced.** Because a replace leaves the
+old insight row in place, a failed regeneration leaves a brief that was compiled
+from a *different* transcript, with nothing marking it as out of date. Detect it by
+comparing `transcript_uploaded_at` against the insight's `generated_at`: if the
+transcript is newer, show a warning on the brief and offer to recompile. This is a
+clinical-safety issue, not a cosmetic one — the brief would describe a consultation
+that is not the one on file.
+
+**Fallback.** If the generate step fails for any reason — quota, network, or the
+tab being closed between the two calls — the visit simply sits with a transcript
+and no insights. That state already appears in the Visit schedule queue with a
+**Generate insights** action, so the workflow is self-healing and no upload is ever
+lost. Nothing extra is needed for the failure path beyond making that action
+visible.
+
 ### Generation is asynchronous
 
 `POST /visits/{id}/insights` returns `202` immediately, not the result. The chain

@@ -34,3 +34,10 @@ build/
 .DS_Store
 *.swp
 .idea/
+
+# Project based
+design-history
+archive
+
+# run_local.sh state (pid files, logs)
+.run_local/

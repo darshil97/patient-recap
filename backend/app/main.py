@@ -73,12 +73,20 @@ def create_app() -> FastAPI:
 
     # Permissive by default for local UI development. Narrow CORS_ORIGINS before
     # this is exposed anywhere real.
+    #
+    # allow_credentials is off: auth is a plain X-API-Key header, which is not a
+    # CORS credential, and 'Allow-Credentials: true' alongside 'Allow-Origin: *'
+    # is rejected by browsers anyway.
+    #
+    # X-Total-Count has to be named in expose_headers or the browser hides it
+    # from JavaScript: only a short safelist of response headers is readable
+    # cross-origin by default, so paginated lists would arrive with no total.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
-        allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["X-Total-Count"],
     )
 
     register_error_handlers(app)
