@@ -1103,6 +1103,119 @@ If `BACKEND_API_KEY` and the backend's `API_KEY` disagree, every screen fails wi
 a 401 that looks like a session problem but is not. First thing to check when the
 UI is empty but the API works from curl.
 
+## 9.5 Deployment
+
+Deployed as two separate services, matching the local two-process shape: no
+shared runtime, HTTP only between them.
+
+| Service | Host | URL |
+| --- | --- | --- |
+| Frontend | Vercel | `https://patient-recap.vercel.app` |
+| Backend | Render (free tier) | `https://YOUR-SERVICE.onrender.com` |
+
+### Backend on Render
+
+Root Directory is `backend`, so `BASE_DIR` in `app/config.py` still resolves
+correctly (§5.1) — `prompts/` and `transcripts/` are found the same way they are
+locally. Build and start commands mirror the local invocation:
+
+```
+Build:  pip install -r requirements.txt
+Start:  uvicorn app.main:app --host 0.0.0.0 --port $PORT
+```
+
+`--host 0.0.0.0 --port $PORT` is required and does not match the local `--reload`
+invocation: Render assigns the port at runtime via `$PORT`, and the default
+`127.0.0.1` bind is unreachable from outside the container.
+
+**Health check path is `/api/v1/health`, not `/health`.** The route function
+itself is declared as `/health` in `app/api/v1/health.py`, but the router is
+mounted under the `/api/v1` prefix in `main.py` alongside every other router, so
+the path Render must poll is the full `/api/v1/health`. This tripped the first
+deploy: Render's health check 404'd against the bare `/health` path even though
+the service was running correctly.
+
+**List-typed settings need JSON syntax in Render's env var UI, not comma or bare
+values.** `cors_origins` is `List[str]` in `app/config.py`, and pydantic-settings
+parses list-typed env vars as JSON before falling back to anything else. Setting
+`CORS_ORIGINS=*` fails at startup with a `SettingsError` /
+`JSONDecodeError: Expecting value`, because `*` is not valid JSON. The working
+value is `CORS_ORIGINS=["*"]`. This applies to any other list-typed setting
+(e.g. a multi-key `GOOGLE_API_KEY` list, §8.8) — same fix pattern.
+
+**Free-tier constraints that interact with this project's design:**
+
+- No persistent disk. `backend/transcripts/` (the 18 kept-for-reference original
+  files, §11) does not survive a restart or redeploy on Render — this is fine
+  only because `TRANSCRIPT_STORAGE=neon_object_storage` is set for the
+  deployment, so no runtime read or write depends on that local directory.
+  Don't set `TRANSCRIPT_STORAGE=local` here.
+- Free instances spin down after ~15 minutes idle and cold-start (30–60s) on the
+  next request. Mitigated with UptimeRobot pinging
+  `https://YOUR-SERVICE.onrender.com/api/v1/health` every 12 minutes, which
+  keeps the instance warm and, as a side effect, keeps the Neon DB from
+  suspending too, since the health route runs `SELECT 1` against Postgres on
+  every call.
+- This does **not** fully protect the async job model (§8.9). Render can still
+  recycle a free instance independent of idle-based sleep (periodic restarts,
+  monthly hour caps), and a restart mid-job leaves an `insight_jobs` row that
+  `reap_orphans()` marks failed on the next boot rather than resuming it — that
+  row's 3 model calls are wasted against the 20/day/key quota (§11). Prefer
+  running `cli.load_insights` batch jobs from a local machine against the same
+  Neon database rather than triggering bulk generation through the deployed API
+  while on the free tier.
+
+### Frontend on Vercel
+
+Root Directory is `frontend`. Single service — the repo's `backend/` folder is
+deliberately **not** deployed to Vercel. FastAPI's background-task job model
+(§8.9) assumes a long-running process; Vercel's serverless functions are
+request-scoped and would not keep a job alive after the response returns, so
+deploying the backend there would silently break insight generation rather than
+just duplicate it.
+
+Environment variables (Production and Preview scopes) mirror the four local
+`.env.local` values from §9, with two changes for production:
+
+- `NEON_AUTH_COOKIE_SECRET` is a **separate** value from the local one, freshly
+  generated with `openssl rand -base64 32`, not reused across environments.
+- `BACKEND_URL` points at the Render URL above instead of `127.0.0.1:8000`.
+
+**Auto-deploy is scoped to `frontend/` only.** Since backend and frontend share
+one repo, an unscoped Vercel project would rebuild on every commit anywhere in
+the repo, including pure backend changes. Settings → Git → Ignored Build Step is
+set to:
+
+```
+git diff --quiet HEAD^ HEAD -- .
+```
+
+Because Root Directory is `frontend`, this diffs relative to that folder: exit
+0 (no diff) skips the build, exit 1 (diff found) proceeds — which is what
+`git diff --quiet`'s own exit codes already do, so no extra wrapping is needed.
+Confirmed by pushing a backend-only commit and a frontend-only commit and
+checking that only the second produced a real deployment rather than a Skipped
+one.
+
+**A build can fail during static generation, not just during compile or
+typecheck.** Next.js executes page-module top-level code while prerendering
+static pages (`app/main.py`'s deploy-log equivalent: "Generating static pages
+using 1 worker"), which is after `next build`'s compile and typecheck stages
+already report success. A malformed or missing auth-related env var (e.g. a
+mis-pasted `NEON_AUTH_COOKIE_SECRET` with stray whitespace) can surface here
+instead of at those earlier stages, so a green compile/typecheck does not by
+itself mean the deploy will succeed.
+
+**Neon Auth's trusted-domain allowlist did not need the Vercel domain added to
+work.** This is believed to be because the project is still on Neon Auth's
+*shared* Beta Google OAuth credentials (§11's "continue to neon.tech" consent
+screen), which appear to allow broader default origins than a project's own
+Google Cloud OAuth client would. This is a soft observation, not a documented
+guarantee — add the Vercel production domain in Neon Console → Auth →
+Configuration → trusted domains before or when migrating off the shared
+credentials (§11), since that migration is exactly the point at which strict
+allowlist enforcement is expected to start mattering.
+
 ## 10. Testing approach
 
 Six files, 295 tests, all offline — no API calls, no database, no object storage.
@@ -1241,9 +1354,7 @@ redirect URI `{NEON_AUTH_BASE_URL}/callback/google` — not the app's URL.
 Deliberately deferred; a new client also starts in Testing status where only listed
 test users can sign in.
 
-**`CORS_ORIGINS` still defaults to `*`.** It does not affect the app, whose traffic
-is same-origin through the BFF, but it must be narrowed before deployment: `*`
-cannot be combined with credentialed requests.
+**`CORS_ORIGINS` defaults to `*`** on local and **["https://patient-recap.vercel.app"]** on Render.
 
 **Corpus blind spot.** Every follow-up in the seeded transcripts is *relative*
 ("three weeks"), so the absolute-date branch of the resolver has unit-test coverage

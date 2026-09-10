@@ -379,3 +379,17 @@ database layer, the tenancy scoping, or the prompts.
 
 `frontend/README.md` is the API contract the UI is built against, plus the frontend
 gotchas (HTTPS dev, auth theming).
+
+## To Dos
+  **Frontend | Backend**
+  - [ ] Note it in the docs as a pre-launch task alongside narrowing CORS and JWT verification
+  - [ ] Add transcript audio functionality
+  - [ ] Add recording functionality
+  - [ ] Deploy frontend on Vercel
+  - [ ] Deploy backend
+  
+
+  **Data Science**
+  - [ ] Family history to be preserved
+  - [ ] Open-source LLM
+  - [ ] Tracing
