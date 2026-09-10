@@ -20,3 +20,8 @@ python-dotenv==1.2.2
 # Database
 psycopg==3.3.4
 psycopg-pool==3.2.7
+# Object storage. Neon Object Storage is S3-compatible, so this is the AWS SDK
+# pointed at a Neon branch endpoint — no AWS account involved. Needed only when
+# TRANSCRIPT_STORAGE=neon_object_storage; the local backend has no dependency, so
+# a checkout without credentials still runs and the test suite stays offline.
+boto3==1.43.91

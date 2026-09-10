@@ -8,8 +8,33 @@ from typing import Any, Dict, Optional
 
 
 @dataclass
+class DoctorRow:
+    """The owner of a set of patients. Tenancy anchor, not a user account.
+
+    Neon Auth owns login, sessions and passwords. This exists so patients can
+    foreign-key to an owner. `auth_user_id` is Neon Auth's subject id and is the
+    preferred resolution key because, unlike email, it never changes; it is
+    Optional because the seed migration creates the first doctor before that
+    doctor has ever signed in.
+    """
+
+    doctor_id: str
+    email: str
+    auth_user_id: Optional[str] = None
+    name: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+    @property
+    def display_name(self) -> str:
+        return self.name or self.email
+
+
+@dataclass
 class PatientRow:
     patient_id: str
+    # The owning doctor. Every other table in the schema reaches its tenant
+    # through this column; see app/db/tenancy.py.
+    doctor_id: str
     external_id: str
     first_name: str
     last_name: Optional[str]
@@ -54,6 +79,10 @@ class VisitRow:
     completed_at: Optional[datetime] = None
     cancelled_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # Joined from patients, not stored on visits. A visit's tenant is derived
+    # through its patient (§6), so this is read-only provenance: knowing which
+    # doctor a loaded visit belongs to without a second query.
+    doctor_id: Optional[str] = None
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     external_id: Optional[str] = None
@@ -138,6 +167,10 @@ class FollowUpRow:
     updated_at: Optional[datetime] = None
 
     # Joined for the queue, which is the most-read query in the application.
+    # doctor_id is joined from patients, NOT stored on follow_ups: see the module
+    # docstring in app/db/repositories/follow_ups.py for why patient_id is
+    # denormalised here but doctor_id deliberately is not.
+    doctor_id: Optional[str] = None
     external_id: Optional[str] = None
     first_name: Optional[str] = None
     last_name: Optional[str] = None

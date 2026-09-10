@@ -1,0 +1,208 @@
+/*
+ * Stylesheet order matters here.
+ *
+ * 1. Tailwind, for utility classes.
+ * 2. Neon Auth UI's Tailwind theme. Importing the *Tailwind* entrypoint rather
+ *    than the pre-built CSS bundle avoids shipping ~47KB of duplicate styles,
+ *    since our Tailwind build already generates the utilities it needs.
+ * 3. The approved clinical design system, last, so its rules win for our own
+ *    class names and its resets sit on top of Tailwind's preflight.
+ *
+ * design-system.css is a byte-for-byte port from the Vite app. The accent colour
+ * still lives in exactly one place: the --accent-* custom properties in its
+ * :root block.
+ */
+@import "tailwindcss";
+@import "@neondatabase/auth-ui/tailwind";
+@import "./design-system.css";
+
+/* ===========================================================================
+ * Neon Auth UI, dressed as the clinical design system.
+ *
+ * Why this exists: <AuthView> is a pre-built component tree we do not own, and
+ * out of the box it looks like a different product — shadcn's near-black primary
+ * button, its own greys, 14px radii, system font. Next to the teal, white,
+ * pill-shaped app it reads as a third-party page bolted on in front.
+ *
+ * Rather than fork the components or fight their utility classes, this maps the
+ * package's own theming API onto our tokens. auth-ui is shadcn-flavoured: every
+ * colour it paints resolves through a `--neon-*` custom property
+ * (see node_modules/@neondatabase/auth-ui/dist/theme.css), which Tailwind then
+ * exposes as --color-background, --color-primary and so on. Redefining the
+ * `--neon-*` layer therefore restyles the whole tree without naming a single one
+ * of its internal classes, and keeps working when those classes change — which
+ * matters for a package still on a beta version.
+ *
+ * Scoped to .neon-auth-ui (the wrapper NeonAuthUIProvider renders) so none of it
+ * leaks into the app's own surfaces, and so the <UserButton> in the shell picks
+ * up the same treatment for free.
+ *
+ * The accent still lives in exactly one place: design-system.css's :root. These
+ * are all var() references, so changing the accent there changes the sign-in
+ * screen too.
+ * ======================================================================== */
+
+.neon-auth-ui {
+  /* Surfaces */
+  --neon-background:           var(--bg);
+  --neon-foreground:           var(--ink);
+  --neon-card:                 var(--surface);
+  --neon-card-foreground:      var(--ink);
+  --neon-popover:              var(--surface);
+  --neon-popover-foreground:   var(--ink);
+
+  /* Primary action. The one that changes the screen's character most: shadcn's
+   * default primary is near-black, so the Login button read as generic. */
+  --neon-primary:              var(--accent);
+  --neon-primary-foreground:   #ffffff;
+
+  /* Secondary / muted / hover, mapped to the sunken surface the app uses for
+   * exactly these jobs (.btn:hover, .nav a:hover, table stripes). */
+  --neon-secondary:            var(--surface-sunken);
+  --neon-secondary-foreground: var(--ink);
+  --neon-muted:                var(--surface-sunken);
+  --neon-muted-foreground:     var(--ink-2);
+
+  /* DO NOT DELETE THESE TWO AS REDUNDANT. They fix a real collision.
+   *
+   * auth-ui declares `--neon-accent: var(--accent, <grey>)`, i.e. it reads a bare
+   * `--accent` if one happens to be defined. design-system.css defines `--accent`
+   * at :root — as the brand teal. But in shadcn's vocabulary `--accent` is a
+   * *muted hover surface*, drawn with `--accent-foreground` (near-black) text on
+   * top. So our teal was silently feeding a slot that expects a pale grey, and
+   * hover states rendered as solid teal blocks with dark text on them.
+   *
+   * Same shape of collision on `--border`, which happens to be harmless: our
+   * value is the one auth-ui would have wanted anyway. `--radius` collides too,
+   * and both sides say 10px. `--accent` is the only one that was actually wrong,
+   * which is exactly why it is worth a comment — the bug is invisible until you
+   * hover something. */
+  --neon-accent:               var(--surface-sunken);
+  --neon-accent-foreground:    var(--ink);
+
+  /* Lines. --border for dividers, --border-strong for input outlines, matching
+   * .card versus .input in the design system. */
+  --neon-border:               var(--border);
+  --neon-input:                var(--border-strong);
+  --neon-ring:                 var(--accent);
+
+  --neon-destructive:            var(--critical);
+  --neon-destructive-foreground: #ffffff;
+
+  --neon-radius:               var(--radius);
+
+  /* Inter, so the auth screen is not the only page in a different typeface. */
+  font-family: var(--sans);
+}
+
+/* --- shape and weight -----------------------------------------------------
+ * The token map handles colour; these three rules handle the parts of the
+ * design language that are geometric rather than chromatic. Targeted on
+ * data-slot, which the components emit as a stable hook, rather than on
+ * generated Tailwind class names.
+ * ------------------------------------------------------------------------ */
+
+/* Pills. Every actionable thing in this app is a pill: .btn, .nav a, .field. */
+.neon-auth-ui [data-slot="button"] {
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+/* Match .card exactly: our radius, our border, our shadow. auth-ui ships
+ * rounded-xl (radius + 4px), which is visibly softer than every other card. */
+.neon-auth-ui [data-slot="card"] {
+  border-radius: var(--radius);
+  border-color: var(--border);
+  box-shadow: var(--shadow);
+}
+
+/* Card titles here are a page heading, so they follow .page-title rather than
+ * .card-title (which is the small uppercase label used inside app cards). */
+.neon-auth-ui [data-slot="card-title"] {
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+
+.neon-auth-ui [data-slot="card-description"] {
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+/* Inputs: reuse .input's focus treatment verbatim, so tabbing through the
+ * sign-in form feels the same as tabbing through Register Patient. */
+.neon-auth-ui input {
+  border-radius: var(--radius-sm);
+  font-size: 13.5px;
+}
+
+.neon-auth-ui input:focus,
+.neon-auth-ui input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-color: var(--accent);
+  box-shadow: none;
+}
+
+/* Field labels, matching the app's form labels. */
+.neon-auth-ui [data-slot="form-label"] {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+
+/* Links (Forgot your password?, Sign Up) in the accent, like the rest of the app. */
+.neon-auth-ui a {
+  color: var(--accent-ink);
+  font-weight: 500;
+}
+
+.neon-auth-ui a:hover {
+  color: var(--accent);
+}
+
+/* ===========================================================================
+ * The sign-in page frame.
+ *
+ * app/auth/[path]/ sits outside the (app) route group, so it gets no shell, no
+ * nav and no brand mark — correct, since none of those work signed out, but it
+ * left the card floating on a bare white page with nothing identifying the
+ * product. These classes rebuild just the identifying parts: the same brand mark
+ * as the shell (.brand, reused so the gradient tile cannot drift) and the same
+ * standing disclaimer.
+ *
+ * Lives here rather than in design-system.css because that file is a
+ * byte-for-byte port of the approved Vite design and is not ours to edit.
+ * ======================================================================== */
+
+.auth {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px 16px 40px;
+  background: var(--surface-sunken);
+}
+
+.auth-panel {
+  width: 100%;
+  max-width: 400px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+}
+
+/* Centres the shell's brand row, which is left-aligned in the navbar. */
+.auth-panel .brand {
+  justify-content: center;
+}
+
+.auth-note {
+  margin: 0;
+  text-align: center;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--ink-3);
+}

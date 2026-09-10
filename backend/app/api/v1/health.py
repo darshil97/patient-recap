@@ -11,8 +11,15 @@ from app.llm.gemini import check_keys
 from app.schemas.common import HealthResponse, KeyHealth, KeyHealthResponse
 
 # GET /health is deliberately unauthenticated so a monitor can check liveness
-# without holding the shared secret. The key-health route below is protected,
-# because each call spends one request from every key's daily quota.
+# without holding the shared secret. It stays exempt from the doctor-identity gate
+# too: a liveness probe is not a doctor, and requiring it to be one would mean
+# monitoring could not distinguish "the service is down" from "my headers are
+# wrong".
+#
+# The key-health route below requires the API key, because each call spends one
+# request from every Gemini key's daily quota. It deliberately does *not* require
+# a doctor identity: it reports on the server's own credentials and touches no
+# patient data, so there is no tenant to scope it to.
 router = APIRouter(tags=["health"])
 
 

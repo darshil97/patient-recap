@@ -36,8 +36,18 @@ class VisitCreate(BaseModel):
 
     # Optional: a scheduled visit has no recording yet. Attach it later with
     # PATCH /visits/{visit_id}. Supplying it here loads historical data in one call.
+    #
+    # There is deliberately NO transcript_provider field. Which backend holds a
+    # transcript is a server-side storage decision (§8.22) and the client cannot
+    # know it: it is TRANSCRIPT_STORAGE for a fresh upload, and 'local' for a path
+    # supplied here, because verifying a pre-existing transcript means stat-ing a
+    # file. Accepting it from the client let a caller either override the
+    # configured backend or, worse, claim a provider that does not hold the bytes
+    # — which makes the transcript unreadable and the visit ungeneratable.
+    #
+    # Pydantic ignores unknown fields, so an older client still sending
+    # transcript_provider is silently and harmlessly ignored rather than 422'd.
     transcript_path: Optional[str] = None
-    transcript_provider: str = "local"
 
     @model_validator(mode="after")
     def _check_enums(self) -> "VisitCreate":
@@ -57,8 +67,8 @@ class VisitUpdate(BaseModel):
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
+    # No transcript_provider here either; see VisitCreate above.
     transcript_path: Optional[str] = None
-    transcript_provider: Optional[str] = None
     visit_status: Optional[str] = None
     visit_date: Optional[date] = None
     visit_time: Optional[time] = None

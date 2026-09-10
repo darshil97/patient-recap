@@ -28,6 +28,7 @@ from app.domain.transcripts import (  # noqa: E402
     resolve_within,
 )
 from app.services import transcript_service  # noqa: E402
+from app.storage import transcript_locator  # noqa: E402
 
 SAMPLE = "DOCTOR: How have you been?\nPATIENT: Much better, thank you."
 
@@ -210,8 +211,16 @@ class TestFilenameHandling(unittest.TestCase):
                                                SAMPLE.encode()), SAMPLE)
 
     def test_stored_path_is_derived_from_visit_id_only(self):
+        """§8.19, unchanged in intent: the client's filename never reaches the
+        address the transcript is stored at.
+
+        This used to call transcript_service._stored_path. That helper is gone —
+        building the address moved to app.storage.transcript_locator so that one
+        function defines it for every backend, rather than the filesystem and the
+        object store each having their own idea. Same assertion, new owner.
+        """
         visit_id = "22222222-2222-2222-2222-222222222222"
-        stored = transcript_service._stored_path(visit_id)
+        stored = transcript_locator(visit_id)
         self.assertEqual(stored, f"transcripts/{visit_id}.txt")
         self.assertNotIn("passwd", stored)
 

@@ -1,4 +1,11 @@
-"""Visit endpoints: scheduling, lifecycle, transcripts, and insight generation."""
+"""
+Visit endpoints: scheduling, lifecycle, transcripts, and insight generation.
+
+Every handler takes the current doctor from `require_doctor` and passes it down.
+`doctor_id` is never a body field or query parameter, so a client cannot claim to
+act as another doctor. Path-param lookups 404 rather than 403 when the row belongs
+to someone else (§8.12).
+"""
 
 from __future__ import annotations
 
@@ -19,7 +26,7 @@ from fastapi import (
     status,
 )
 
-from app.api.deps import get_db, require_auth
+from app.api.deps import CurrentDoctor, get_db, require_doctor
 from app.config import get_settings
 from app.db.repositories import jobs as jobs_repo
 from app.db.repositories import visits as visits_repo
@@ -40,8 +47,10 @@ from app.schemas.visits import (
 )
 from app.services import insight_service, job_service, transcript_service, visit_service
 
+# require_doctor depends on require_auth, so both gates apply to every route here
+# even if a handler forgets to name the dependency.
 router = APIRouter(prefix="/visits", tags=["visits"],
-                   dependencies=[Depends(require_auth)])
+                   dependencies=[Depends(require_doctor)])
 
 
 # --------------------------------------------------------------------------- #
@@ -60,8 +69,13 @@ router = APIRouter(prefix="/visits", tags=["visits"],
 def schedule_visit(
     payload: VisitCreate,
     conn: psycopg.Connection = Depends(get_db),
+    doctor: CurrentDoctor = Depends(require_doctor),
 ) -> VisitOut:
-    """Create a visit for an existing patient.
+    """Create a visit for one of the signed-in doctor's patients.
+
+    A `patient_id` belonging to another doctor is a 404, indistinguishable from a
+    patient_id that does not exist — so the body cannot be used to probe for other
+    practices' patient ids.
 
     `visit_number` is assigned sequentially when omitted. `transcript_path` is
     optional because a scheduled visit has no recording yet; upload it later.
@@ -71,6 +85,7 @@ def schedule_visit(
     """
     visit = visit_service.schedule_visit(
         conn,
+        doctor.doctor_id,
         patient_id=str(payload.patient_id),
         visit_date=payload.visit_date,
         visit_time=payload.visit_time,
@@ -78,7 +93,6 @@ def schedule_visit(
         visit_type=payload.visit_type,
         visit_status=payload.visit_status,
         transcript_path=payload.transcript_path,
-        transcript_provider=payload.transcript_provider,
     )
     return VisitOut.model_validate(visit)
 
@@ -102,8 +116,13 @@ def list_visits(
     limit: Optional[int] = Query(default=None, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     conn: psycopg.Connection = Depends(get_db),
+    doctor: CurrentDoctor = Depends(require_doctor),
 ) -> List[VisitOut]:
-    """Visits newest first by default, which is what a schedule queue needs."""
+    """The signed-in doctor's visits, newest first — what a schedule queue needs.
+
+    Filtering by another doctor's `patient_id` returns an empty list, which is
+    exactly what a patient with no visits returns, so a guessed id reveals nothing.
+    """
     kwargs = {
         "patient_id": str(patient_id) if patient_id else None,
         "statuses": status_filter,
@@ -112,9 +131,10 @@ def list_visits(
         "has_transcript": has_transcript,
         "pending_only": pending_only,
     }
-    rows = visits_repo.list_visits(conn, sort=sort, limit=limit, offset=offset,
-                                   **kwargs)
-    response.headers["X-Total-Count"] = str(visits_repo.count_visits(conn, **kwargs))
+    rows = visits_repo.list_visits(conn, doctor.doctor_id, sort=sort, limit=limit,
+                                   offset=offset, **kwargs)
+    response.headers["X-Total-Count"] = str(
+        visits_repo.count_visits(conn, doctor.doctor_id, **kwargs))
     return [VisitOut.model_validate(r) for r in rows]
 
 
@@ -127,8 +147,11 @@ def list_visits(
 def get_visit(
     visit_id: UUID,
     conn: psycopg.Connection = Depends(get_db),
+    doctor: CurrentDoctor = Depends(require_doctor),
 ) -> VisitOut:
-    return VisitOut.model_validate(visit_service.get_visit(conn, str(visit_id)))
+    """One visit. 404, not 403, for another doctor's visit."""
+    return VisitOut.model_validate(
+        visit_service.get_visit(conn, doctor.doctor_id, str(visit_id)))
 
 
 @router.patch(
@@ -142,6 +165,7 @@ def update_visit(
     visit_id: UUID,
     payload: VisitUpdate,
     conn: psycopg.Connection = Depends(get_db),
+    doctor: CurrentDoctor = Depends(require_doctor),
 ) -> VisitOut:
     """Patch a visit's details.
 
@@ -151,9 +175,9 @@ def update_visit(
     """
     visit = visit_service.update_visit(
         conn,
+        doctor.doctor_id,
         str(visit_id),
         transcript_path=payload.transcript_path,
-        transcript_provider=payload.transcript_provider,
         visit_status=payload.visit_status,
         visit_date=payload.visit_date,
         visit_time=payload.visit_time,
@@ -177,6 +201,7 @@ def complete_visit(
     visit_id: UUID,
     payload: Optional[VisitCompleteRequest] = None,
     conn: psycopg.Connection = Depends(get_db),
+    doctor: CurrentDoctor = Depends(require_doctor),
 ) -> VisitOut:
     """Complete a consultation, optionally correcting the actual date and time.
 
@@ -185,7 +210,7 @@ def complete_visit(
     """
     options = payload or VisitCompleteRequest()
     visit = visit_service.complete_visit(
-        conn, str(visit_id),
+        conn, doctor.doctor_id, str(visit_id),
         visit_date=options.visit_date,
         visit_time=options.visit_time,
     )
@@ -203,6 +228,7 @@ def cancel_visit(
     visit_id: UUID,
     payload: Optional[VisitCancelRequest] = None,
     conn: psycopg.Connection = Depends(get_db),
+    doctor: CurrentDoctor = Depends(require_doctor),
 ) -> VisitOut:
     """Cancel a visit and reopen any follow-up it had resolved.
 
@@ -210,7 +236,8 @@ def cancel_visit(
     to the queue; otherwise the patient would be silently dropped.
     """
     options = payload or VisitCancelRequest()
-    visit = visit_service.cancel_visit(conn, str(visit_id), reason=options.reason)
+    visit = visit_service.cancel_visit(conn, doctor.doctor_id, str(visit_id),
+                                       reason=options.reason)
     return VisitOut.model_validate(visit)
 
 
@@ -237,6 +264,7 @@ async def upload_transcript(
     replace: bool = Form(default=False,
                          description="Required to overwrite an existing transcript"),
     conn: psycopg.Connection = Depends(get_db),
+    doctor: CurrentDoctor = Depends(require_doctor),
 ) -> VisitOut:
     """Attach a transcript to a completed visit.
 
@@ -249,7 +277,8 @@ async def upload_transcript(
     """
     raw = await file.read()
     visit = transcript_service.store_transcript(
-        conn, str(visit_id), filename=file.filename, raw=raw, replace=replace)
+        conn, doctor.doctor_id, str(visit_id),
+        filename=file.filename, raw=raw, replace=replace)
     return VisitOut.model_validate(visit)
 
 
@@ -263,10 +292,14 @@ async def upload_transcript(
 def read_transcript(
     visit_id: UUID,
     conn: psycopg.Connection = Depends(get_db),
+    doctor: CurrentDoctor = Depends(require_doctor),
 ) -> TranscriptOut:
-    """The transcript text, so a brief can be checked against its source."""
+    """The transcript text, so a brief can be checked against its source.
+
+    Verbatim consultation content. 404 for another doctor's visit.
+    """
     return TranscriptOut.model_validate(
-        transcript_service.read_transcript(conn, str(visit_id)))
+        transcript_service.read_transcript(conn, doctor.doctor_id, str(visit_id)))
 
 
 @router.delete(
@@ -279,13 +312,14 @@ def read_transcript(
 def delete_transcript(
     visit_id: UUID,
     conn: psycopg.Connection = Depends(get_db),
+    doctor: CurrentDoctor = Depends(require_doctor),
 ) -> Response:
     """Remove the transcript file and clear its columns.
 
     Refused once insights exist: removing the source of a generated brief would
     leave a clinical record that cannot be audited.
     """
-    transcript_service.delete_transcript(conn, str(visit_id))
+    transcript_service.delete_transcript(conn, doctor.doctor_id, str(visit_id))
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -307,6 +341,7 @@ def generate_insights(
     visit_id: UUID,
     background: BackgroundTasks,
     payload: Optional[GenerateInsightsRequest] = None,
+    doctor: CurrentDoctor = Depends(require_doctor),
 ) -> JobAccepted:
     """Start the three-layer chain and return a job to poll.
 
@@ -322,6 +357,7 @@ def generate_insights(
     """
     options = payload or GenerateInsightsRequest()
     job = job_service.enqueue(
+        doctor.doctor_id,
         visit_id=str(visit_id),
         stop_after=options.stop_after,
         regenerate=options.regenerate,
@@ -349,9 +385,11 @@ def generate_insights(
 def read_insights(
     visit_id: UUID,
     conn: psycopg.Connection = Depends(get_db),
+    doctor: CurrentDoctor = Depends(require_doctor),
 ) -> InsightOut:
+    """The full generated brief. 404 for another doctor's visit."""
     return InsightOut.model_validate(
-        insight_service.get_insights(conn, str(visit_id)))
+        insight_service.get_insights(conn, doctor.doctor_id, str(visit_id)))
 
 
 @router.get(
@@ -364,6 +402,7 @@ def latest_job(
     visit_id: UUID,
     response: Response,
     conn: psycopg.Connection = Depends(get_db),
+    doctor: CurrentDoctor = Depends(require_doctor),
 ):
     """The most recent job for a visit, so a page reload can resume polling.
 
@@ -371,8 +410,8 @@ def latest_job(
     for an unknown visit, so the UI can tell "not generated yet" from "no such
     visit".
     """
-    visit_service.get_visit(conn, str(visit_id))  # 404 if unknown
-    job = jobs_repo.latest_for_visit(conn, str(visit_id))
+    visit_service.get_visit(conn, doctor.doctor_id, str(visit_id))  # 404 if unknown
+    job = jobs_repo.latest_for_visit(conn, doctor.doctor_id, str(visit_id))
     if job is None:
         response.status_code = status.HTTP_204_NO_CONTENT
         return None

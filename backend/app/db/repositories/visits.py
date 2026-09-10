@@ -1,4 +1,17 @@
-"""Visit reads and writes."""
+"""
+Visit reads and writes.
+
+Visits carry no `doctor_id` of their own: they reach their tenant through
+`visits.patient_id -> patients.doctor_id`. The `JOIN patients p` that every read
+here already needed for the patient's name and date of birth is the same join
+that enforces tenancy, so scoping costs nothing extra.
+
+Writes are the part to be careful with. Each one carries the doctor filter in its
+own `WHERE` via a correlated subquery on patients, rather than checking ownership
+first and then updating: a check-then-write leaves a window, and more importantly
+it leaves two places that must both be right. An UPDATE whose WHERE cannot match
+another doctor's row is safe even if a caller forgets to look first.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +21,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import psycopg
 
 from app.db.models import VisitRow
+from app.db.tenancy import DoctorScope, clause, is_scoped
 
 # age_at_visit is computed from date_of_birth as at visit_date, so historical
 # visits keep the right age instead of drifting as the patient gets older.
@@ -27,6 +41,7 @@ _SELECT = """
            v.completed_at,
            v.cancelled_at,
            v.updated_at,
+           p.doctor_id::text,
            p.first_name,
            p.last_name,
            p.external_id,
@@ -45,24 +60,62 @@ SORTS = {
     "patient": "p.first_name, v.visit_number",
 }
 
+# Confines a write to visits whose patient belongs to the scoped doctor. Used in
+# the UPDATE statements, which have no `patients` join to hang a filter on.
+_OWNED_BY_SCOPE = """
+    EXISTS (SELECT 1 FROM patients p
+            WHERE p.patient_id = visits.patient_id
+              AND p.doctor_id = %(scope_doctor_id)s)
+"""
+
 
 def _row(record: Optional[Dict[str, Any]]) -> Optional[VisitRow]:
     return VisitRow(**record) if record else None
 
 
-def get(conn: psycopg.Connection, visit_id: str) -> Optional[VisitRow]:
+def _write_conditions(scope: DoctorScope, visit_id: str) -> tuple:
+    """`WHERE` conditions and named params for a scoped single-visit write."""
+    conditions = ["visit_id = %(visit_id)s"]
+    params: Dict[str, Any] = {"visit_id": visit_id}
+    if is_scoped(scope):
+        conditions.append(_OWNED_BY_SCOPE)
+        params["scope_doctor_id"] = str(scope)
+    return conditions, params
+
+
+def get(conn: psycopg.Connection, scope: DoctorScope,
+        visit_id: str) -> Optional[VisitRow]:
+    """One visit, or None when unknown *or* owned by another doctor.
+
+    Indistinguishable on purpose: the caller raises 404 for both, so a visit id
+    from another doctor's practice cannot be confirmed to exist.
+    """
+    clauses, params = clause(scope)
+    clauses = [*clauses, "v.visit_id = %s"]
     with conn.cursor() as cur:
-        cur.execute(f"{_SELECT} WHERE v.visit_id = %s", (visit_id,))
+        cur.execute(f"{_SELECT} WHERE {' AND '.join(clauses)}",
+                    [*params, visit_id])
         return _row(cur.fetchone())
 
 
-def get_by_transcript_path(conn: psycopg.Connection, path: str) -> Optional[VisitRow]:
+def get_by_transcript_path(conn: psycopg.Connection, scope: DoctorScope,
+                           path: str) -> Optional[VisitRow]:
+    """Find a visit by the transcript it points at.
+
+    Scoped even though the path is server-generated from a visit id: an unscoped
+    lookup here would let `--transcript` reach across doctors, and the CLI has to
+    ask for that explicitly with ALL_DOCTORS rather than getting it by default.
+    """
+    clauses, params = clause(scope)
+    clauses = [*clauses, "v.transcript_path = %s"]
     with conn.cursor() as cur:
-        cur.execute(f"{_SELECT} WHERE v.transcript_path = %s", (path,))
+        cur.execute(f"{_SELECT} WHERE {' AND '.join(clauses)}",
+                    [*params, path])
         return _row(cur.fetchone())
 
 
 def _filters(
+    scope: DoctorScope,
     patient_id: Optional[str],
     statuses: Optional[Sequence[str]],
     date_from: Optional[date],
@@ -70,8 +123,15 @@ def _filters(
     has_transcript: Optional[bool],
     pending_only: bool,
 ) -> tuple:
-    clauses: List[str] = []
-    params: List[Any] = []
+    """Tenancy first, then the caller's filters.
+
+    Tenancy is prepended here rather than added by each caller so that
+    list_visits and count_visits cannot drift apart — a count that was scoped
+    differently from its list would report a total the doctor cannot see.
+    """
+    clauses, params = clause(scope)
+    clauses = list(clauses)
+    params = list(params)
 
     if patient_id:
         clauses.append("v.patient_id = %s")
@@ -102,6 +162,7 @@ def _filters(
 
 def list_visits(
     conn: psycopg.Connection,
+    scope: DoctorScope,
     patient_id: Optional[str] = None,
     pending_only: bool = False,
     statuses: Optional[Sequence[str]] = None,
@@ -112,9 +173,14 @@ def list_visits(
     limit: Optional[int] = None,
     offset: int = 0,
 ) -> List[VisitRow]:
-    """List visits, newest first by default."""
-    clauses, params = _filters(patient_id, statuses, date_from, date_to,
-                              has_transcript, pending_only)
+    """List one doctor's visits, newest first by default.
+
+    A `patient_id` belonging to another doctor yields an empty list rather than
+    an error, which is the same thing the doctor would see for a patient with no
+    visits — so filtering by a guessed id reveals nothing.
+    """
+    clauses, params = _filters(scope, patient_id, statuses, date_from, date_to,
+                               has_transcript, pending_only)
 
     sql = _SELECT
     if clauses:
@@ -134,6 +200,7 @@ def list_visits(
 
 def count_visits(
     conn: psycopg.Connection,
+    scope: DoctorScope,
     patient_id: Optional[str] = None,
     pending_only: bool = False,
     statuses: Optional[Sequence[str]] = None,
@@ -142,8 +209,8 @@ def count_visits(
     has_transcript: Optional[bool] = None,
 ) -> int:
     """Total matching the same filters, for X-Total-Count."""
-    clauses, params = _filters(patient_id, statuses, date_from, date_to,
-                              has_transcript, pending_only)
+    clauses, params = _filters(scope, patient_id, statuses, date_from, date_to,
+                               has_transcript, pending_only)
     sql = ("SELECT count(*)::int AS n FROM visits v "
            "JOIN patients p USING (patient_id)")
     if clauses:
@@ -153,19 +220,29 @@ def count_visits(
         return int(cur.fetchone()["n"])
 
 
-def next_visit_number(conn: psycopg.Connection, patient_id: str) -> int:
-    """The next sequential visit number, so callers needn't track it."""
+def next_visit_number(conn: psycopg.Connection, scope: DoctorScope,
+                      patient_id: str) -> int:
+    """The next sequential visit number, so callers needn't track it.
+
+    Scoped so the count cannot be read for a patient the caller does not own —
+    otherwise a doctor could learn how many consultations another practice has
+    recorded for a given patient id.
+    """
+    clauses, params = clause(scope)
+    conditions = ["v.patient_id = %s", *clauses]
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT coalesce(max(visit_number), 0) + 1 AS next FROM visits "
-            "WHERE patient_id = %s",
-            (patient_id,),
+            f"""SELECT coalesce(max(v.visit_number), 0) + 1 AS next
+                FROM visits v JOIN patients p USING (patient_id)
+                WHERE {' AND '.join(conditions)}""",
+            [patient_id, *params],
         )
         return int(cur.fetchone()["next"])
 
 
 def create(
     conn: psycopg.Connection,
+    scope: DoctorScope,
     patient_id: str,
     visit_number: int,
     visit_date: date,
@@ -175,36 +252,59 @@ def create(
     transcript_path: Optional[str] = None,
     transcript_provider: Optional[str] = None,
     transcript_filename: Optional[str] = None,
-) -> VisitRow:
+) -> Optional[VisitRow]:
+    """Schedule a visit against a patient the scoped doctor owns.
+
+    The INSERT selects its `patient_id` from `patients` under the doctor filter
+    rather than taking the caller's value directly, so a patient id belonging to
+    another doctor inserts nothing at all and this returns None. The caller turns
+    that into a 404. Validating in the statement means there is no version of
+    this function that writes a visit into someone else's records.
+    """
+    tenancy, tenancy_params = clause(scope, "p.doctor_id")
+    owner_conditions = ["p.patient_id = %(patient_id)s", *tenancy]
+
+    params: Dict[str, Any] = {
+        "patient_id": patient_id, "visit_number": visit_number,
+        "visit_date": visit_date, "visit_time": visit_time,
+        "visit_type": visit_type, "visit_status": visit_status,
+        "transcript_path": transcript_path,
+        "transcript_provider": transcript_provider,
+        "transcript_filename": transcript_filename,
+    }
+    if tenancy_params:
+        params["scope_doctor_id"] = tenancy_params[0]
+        owner_conditions[-1] = "p.doctor_id = %(scope_doctor_id)s"
+
     with conn.cursor() as cur:
         # transcript_path is cast explicitly: without a type Postgres cannot
         # infer the parameter inside the CASE and raises IndeterminateDatatype.
         cur.execute(
-            """INSERT INTO visits (patient_id, visit_number, visit_date, visit_time,
-                                   visit_type, visit_status, transcript_path,
-                                   transcript_provider, transcript_filename,
-                                   transcript_uploaded_at, updated_at)
-               VALUES (%(patient_id)s, %(visit_number)s, %(visit_date)s,
+            f"""INSERT INTO visits (patient_id, visit_number, visit_date, visit_time,
+                                    visit_type, visit_status, transcript_path,
+                                    transcript_provider, transcript_filename,
+                                    transcript_uploaded_at, updated_at)
+                SELECT p.patient_id, %(visit_number)s, %(visit_date)s,
                        %(visit_time)s, %(visit_type)s, %(visit_status)s,
                        %(transcript_path)s, %(transcript_provider)s,
                        %(transcript_filename)s,
                        CASE WHEN %(transcript_path)s::text IS NULL
                             THEN NULL ELSE now() END,
-                       now())
-               RETURNING visit_id::text""",
-            {"patient_id": patient_id, "visit_number": visit_number,
-             "visit_date": visit_date, "visit_time": visit_time,
-             "visit_type": visit_type, "visit_status": visit_status,
-             "transcript_path": transcript_path,
-             "transcript_provider": transcript_provider,
-             "transcript_filename": transcript_filename},
+                       now()
+                FROM patients p
+                WHERE {' AND '.join(owner_conditions)}
+                RETURNING visit_id::text""",
+            params,
         )
-        visit_id = cur.fetchone()["visit_id"]
-    return get(conn, visit_id)  # type: ignore[return-value]
+        record = cur.fetchone()
+    if record is None:
+        return None
+    return get(conn, scope, record["visit_id"])
 
 
 def update(
     conn: psycopg.Connection,
+    scope: DoctorScope,
     visit_id: str,
     changes: Dict[str, Any],
 ) -> Optional[VisitRow]:
@@ -212,62 +312,114 @@ def update(
 
     Deliberately does not touch visit_status: status transitions go through
     mark_completed() and mark_cancelled() so each one records its own timestamp.
+
+    `patient_id` is not in the whitelist, so a visit cannot be moved to another
+    patient — which would otherwise be a way to move it to another doctor.
     """
     allowed = {"visit_date", "visit_time", "visit_type", "visit_status",
                "transcript_path", "transcript_provider", "transcript_filename"}
     updates = {k: v for k, v in changes.items() if k in allowed}
     if not updates:
-        return get(conn, visit_id)
+        return get(conn, scope, visit_id)
 
+    conditions, params = _write_conditions(scope, visit_id)
+    params.update(updates)
     assignments = ", ".join(f"{col} = %({col})s" for col in updates)
     with conn.cursor() as cur:
         cur.execute(
             f"UPDATE visits SET {assignments}, updated_at = now() "
-            f"WHERE visit_id = %(visit_id)s",
-            {**updates, "visit_id": visit_id},
+            f"WHERE {' AND '.join(conditions)}",
+            params,
         )
-    return get(conn, visit_id)
+    return get(conn, scope, visit_id)
 
 
 def set_transcript(
     conn: psycopg.Connection,
+    scope: DoctorScope,
     visit_id: str,
     transcript_path: str,
     transcript_filename: Optional[str],
     transcript_provider: str = "local",
 ) -> Optional[VisitRow]:
-    """Attach a transcript, stamping the upload time from the database clock."""
+    """Attach a transcript, stamping the upload time from the database clock.
+
+    Use this only when a doctor has supplied new content. `transcript_uploaded_at`
+    is read by the UI as "the transcript changed at this moment": it compares it
+    against `visit_insights.generated_at` and warns that a brief is out of date.
+    So bumping it is a claim that the words changed, and anything that moves bytes
+    without changing them must use `set_transcript_provider` instead.
+    """
+    conditions, params = _write_conditions(scope, visit_id)
+    params.update({"transcript_path": transcript_path,
+                   "transcript_filename": transcript_filename,
+                   "transcript_provider": transcript_provider})
     with conn.cursor() as cur:
         cur.execute(
-            """UPDATE visits
-               SET transcript_path        = %s,
-                   transcript_filename    = %s,
-                   transcript_provider    = %s,
-                   transcript_uploaded_at = now(),
-                   updated_at             = now()
-               WHERE visit_id = %s""",
-            (transcript_path, transcript_filename, transcript_provider, visit_id),
+            f"""UPDATE visits
+                SET transcript_path        = %(transcript_path)s,
+                    transcript_filename    = %(transcript_filename)s,
+                    transcript_provider    = %(transcript_provider)s,
+                    transcript_uploaded_at = now(),
+                    updated_at             = now()
+                WHERE {' AND '.join(conditions)}""",
+            params,
         )
-    return get(conn, visit_id)
+    return get(conn, scope, visit_id)
 
 
-def clear_transcript(conn: psycopg.Connection, visit_id: str) -> Optional[VisitRow]:
+def set_transcript_provider(
+    conn: psycopg.Connection,
+    scope: DoctorScope,
+    visit_id: str,
+    transcript_provider: str,
+) -> Optional[VisitRow]:
+    """Record that a transcript moved storage backend. Content unchanged.
+
+    Exists because reusing `set_transcript` for a storage migration was a bug: it
+    stamps `transcript_uploaded_at = now()`, which the UI reads as "the transcript
+    was replaced", so migrating all 18 transcripts to object storage put a
+    clinical-safety warning on every brief in the application and advised
+    regenerating them — 54 model calls against a 20/day quota, to rebuild briefs
+    from byte-identical input.
+
+    Moving bytes is not an upload. This touches `transcript_provider` and
+    `updated_at` only, and deliberately leaves `transcript_path`,
+    `transcript_filename` and `transcript_uploaded_at` alone.
+    """
+    conditions, params = _write_conditions(scope, visit_id)
+    params["transcript_provider"] = transcript_provider
     with conn.cursor() as cur:
         cur.execute(
-            """UPDATE visits
-               SET transcript_path        = NULL,
-                   transcript_filename    = NULL,
-                   transcript_provider    = NULL,
-                   transcript_uploaded_at = NULL,
-                   updated_at             = now()
-               WHERE visit_id = %s""",
-            (visit_id,),
+            f"""UPDATE visits
+                SET transcript_provider = %(transcript_provider)s,
+                    updated_at          = now()
+                WHERE {' AND '.join(conditions)}""",
+            params,
         )
-    return get(conn, visit_id)
+    return get(conn, scope, visit_id)
+
+
+def clear_transcript(conn: psycopg.Connection, scope: DoctorScope,
+                     visit_id: str) -> Optional[VisitRow]:
+    conditions, params = _write_conditions(scope, visit_id)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""UPDATE visits
+                SET transcript_path        = NULL,
+                    transcript_filename    = NULL,
+                    transcript_provider    = NULL,
+                    transcript_uploaded_at = NULL,
+                    updated_at             = now()
+                WHERE {' AND '.join(conditions)}""",
+            params,
+        )
+    return get(conn, scope, visit_id)
 
 
 def mark_completed(
     conn: psycopg.Connection,
+    scope: DoctorScope,
     visit_id: str,
     visit_date: Optional[date] = None,
     visit_time: Optional[time] = None,
@@ -277,61 +429,73 @@ def mark_completed(
     completed_at is only set on the first transition, so completing twice is
     idempotent and the UI need not guard a double click.
     """
+    conditions, params = _write_conditions(scope, visit_id)
+    params.update({"visit_date": visit_date, "visit_time": visit_time})
     with conn.cursor() as cur:
         cur.execute(
-            """UPDATE visits
-               SET visit_status  = 'completed',
-                   completed_at  = coalesce(completed_at, now()),
-                   cancelled_at  = NULL,
-                   visit_date    = coalesce(%s, visit_date),
-                   visit_time    = coalesce(%s, visit_time),
-                   updated_at    = now()
-               WHERE visit_id = %s""",
-            (visit_date, visit_time, visit_id),
+            f"""UPDATE visits
+                SET visit_status  = 'completed',
+                    completed_at  = coalesce(completed_at, now()),
+                    cancelled_at  = NULL,
+                    visit_date    = coalesce(%(visit_date)s, visit_date),
+                    visit_time    = coalesce(%(visit_time)s, visit_time),
+                    updated_at    = now()
+                WHERE {' AND '.join(conditions)}""",
+            params,
         )
-    return get(conn, visit_id)
+    return get(conn, scope, visit_id)
 
 
-def mark_cancelled(conn: psycopg.Connection, visit_id: str) -> Optional[VisitRow]:
+def mark_cancelled(conn: psycopg.Connection, scope: DoctorScope,
+                   visit_id: str) -> Optional[VisitRow]:
+    conditions, params = _write_conditions(scope, visit_id)
     with conn.cursor() as cur:
         cur.execute(
-            """UPDATE visits
-               SET visit_status = 'cancelled',
-                   cancelled_at = coalesce(cancelled_at, now()),
-                   updated_at   = now()
-               WHERE visit_id = %s""",
-            (visit_id,),
+            f"""UPDATE visits
+                SET visit_status = 'cancelled',
+                    cancelled_at = coalesce(cancelled_at, now()),
+                    updated_at   = now()
+                WHERE {' AND '.join(conditions)}""",
+            params,
         )
-    return get(conn, visit_id)
+    return get(conn, scope, visit_id)
 
 
-def counts(conn: psycopg.Connection) -> Dict[str, int]:
-    """Visit counts for the home screen.
+def counts(conn: psycopg.Connection, scope: DoctorScope) -> Dict[str, int]:
+    """Visit counts for the home screen, for one doctor.
 
     awaiting_transcript and awaiting_insights are the two states that need
     doctor action, so they are computed here rather than in the frontend.
+
+    Scoped through the patients join: unscoped counters were the quietest leak of
+    the lot, since a number on a dashboard does not look like someone else's data
+    until you notice it counting visits the doctor cannot open.
     """
+    clauses, params = clause(scope)
+    sql = """SELECT count(*)::int AS total,
+                    count(*) FILTER (WHERE v.visit_status = 'scheduled')::int
+                        AS scheduled,
+                    count(*) FILTER (WHERE v.visit_status = 'in_progress')::int
+                        AS in_progress,
+                    count(*) FILTER (WHERE v.visit_status = 'completed')::int
+                        AS completed,
+                    count(*) FILTER (WHERE v.visit_status = 'cancelled')::int
+                        AS cancelled,
+                    count(*) FILTER (WHERE v.insights_generated)::int
+                        AS with_insights,
+                    count(*) FILTER (WHERE v.visit_status = 'completed'
+                                       AND v.transcript_path IS NULL)::int
+                        AS awaiting_transcript,
+                    count(*) FILTER (WHERE v.transcript_path IS NOT NULL
+                                       AND NOT v.insights_generated)::int
+                        AS awaiting_insights
+             FROM visits v
+             JOIN patients p USING (patient_id)"""
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+
     with conn.cursor() as cur:
-        cur.execute(
-            """SELECT count(*)::int AS total,
-                      count(*) FILTER (WHERE visit_status = 'scheduled')::int
-                          AS scheduled,
-                      count(*) FILTER (WHERE visit_status = 'in_progress')::int
-                          AS in_progress,
-                      count(*) FILTER (WHERE visit_status = 'completed')::int
-                          AS completed,
-                      count(*) FILTER (WHERE visit_status = 'cancelled')::int
-                          AS cancelled,
-                      count(*) FILTER (WHERE insights_generated)::int
-                          AS with_insights,
-                      count(*) FILTER (WHERE visit_status = 'completed'
-                                         AND transcript_path IS NULL)::int
-                          AS awaiting_transcript,
-                      count(*) FILTER (WHERE transcript_path IS NOT NULL
-                                         AND NOT insights_generated)::int
-                          AS awaiting_insights
-               FROM visits"""
-        )
+        cur.execute(sql, params)
         row = cur.fetchone()
     result = {k: int(v) for k, v in row.items()}
     result["pending"] = result["total"] - result["with_insights"]

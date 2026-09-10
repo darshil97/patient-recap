@@ -20,8 +20,10 @@ from app.db.models import InsightRow, VisitRow
 from app.db.repositories import insights as insights_repo
 from app.db.repositories import visits as visits_repo
 from app.db.repositories.insights import SaveResult
+from app.db.tenancy import DoctorScope
 from app.domain.follow_up.models import SCHEDULED, ResolvedFollowUp
-from app.domain.transcripts import Transcript, load_transcript
+from app.domain.transcripts import Transcript
+from app.storage import store_for_visit
 from app.llm.errors import AllKeysExhausted, is_quota_failure
 from app.llm.gemini import ChatClient, build_llm
 from app.pipeline.layers import LAYERS
@@ -131,14 +133,39 @@ def build_insight_row(
 # --------------------------------------------------------------------------- #
 
 def load_visit_transcript(visit: VisitRow) -> Transcript:
-    """Load the transcript a visit points at, guarding the path."""
+    """Load the transcript a visit points at, from whichever backend holds it.
+
+    Routed on `visit.transcript_provider`, not on the configured default, so a
+    visit whose transcript predates a change of backend still generates. That is
+    the property that lets the migration run in batches over live data: at any
+    moment some visits are on disk and some are in the bucket, and both are
+    readable.
+
+    Called twice per generation on purpose — once by job_service.enqueue as a
+    cheap pre-flight so a missing transcript is a 409 at request time rather than
+    a job that fails a second later, and once here at generation time. Two reads
+    of a 3-5 KB object is a fair price for that error message.
+    """
     if not visit.transcript_path:
         raise ConflictError(
             f"Visit {visit.visit_id} has no transcript attached. "
-            f"PATCH the visit with a transcript_path first.",
+            f"Upload one before generating insights.",
             details={"visit_id": visit.visit_id},
         )
-    return load_transcript(visit.transcript_path, get_settings().transcripts_dir)
+
+    stored = store_for_visit(visit).read(visit.transcript_path)
+    text = stored.text.strip()
+    if not text:
+        # The upload path rejects empty transcripts, so this means the stored copy
+        # was truncated or emptied after the fact. Refuse rather than send an empty
+        # prompt to the model, which would produce a confident, contentless brief.
+        raise ConflictError(
+            f"The stored transcript for visit {visit.visit_id} is empty.",
+            details={"visit_id": visit.visit_id,
+                     "transcript_path": visit.transcript_path,
+                     "provider": stored.provider},
+        )
+    return Transcript.from_text(relative_path=stored.locator, text=text)
 
 
 def patient_context(visit: VisitRow) -> PatientContext:
@@ -157,6 +184,7 @@ def patient_context(visit: VisitRow) -> PatientContext:
 
 def generate_for_visit(
     conn: psycopg.Connection,
+    scope: DoctorScope,
     visit: VisitRow,
     llm: Optional[ChatClient] = None,
     model: Optional[str] = None,
@@ -171,6 +199,14 @@ def generate_for_visit(
     QuotaExhaustedError when every API key is rate limited. Nothing is written
     unless all requested layers succeed, so a mid-chain failure leaves
     visits.insights_generated FALSE and the visit still pending.
+
+    `visit` is expected to have been loaded under `scope` already; the scope is
+    passed separately because the write path re-checks ownership inside its own
+    transaction rather than trusting the row it was handed (see insights_repo.save).
+    That redundancy is deliberate here and nowhere else: this function is entered
+    from three directions — the HTTP route, the background job worker and the CLI —
+    and it is the one that spends three model calls before writing a clinical
+    brief.
     """
     if visit.insights_generated and not regenerate:
         raise ConflictError(
@@ -208,9 +244,9 @@ def generate_for_visit(
     # The follow-up row is written inside the insight save transaction, so a
     # brief can never exist without its queue entry, or vice versa.
     def write_follow_up(active: psycopg.Connection) -> None:
-        follow_up_service.sync_from_insights(active, visit, result.follow_up)
+        follow_up_service.sync_from_insights(active, scope, visit, result.follow_up)
 
-    saved = insights_repo.save(conn, row, on_saved=write_follow_up)
+    saved = insights_repo.save(conn, scope, row, on_saved=write_follow_up)
 
     logger.info("%s insights for %s (%s tokens)",
                 saved.verb, visit.label, result.total_usage().get("total_tokens"))
@@ -239,10 +275,20 @@ class GenerationOutcome:
 # Reads
 # --------------------------------------------------------------------------- #
 
-def get_insights(conn: psycopg.Connection, visit_id: str) -> InsightRow:
-    if visits_repo.get(conn, visit_id) is None:
+def get_insights(conn: psycopg.Connection, scope: DoctorScope,
+                 visit_id: str) -> InsightRow:
+    """One visit's full brief.
+
+    Two 404s with different messages, and the distinction is only safe because
+    both reads are scoped: "no visit" fires for an unknown visit *and* for another
+    doctor's visit, so the more specific "no insights yet" can never be reached
+    for a visit the caller does not own. Had the visit check been unscoped, the
+    difference between the two messages would have told a caller that a visit id
+    exists somewhere in the system.
+    """
+    if visits_repo.get(conn, scope, visit_id) is None:
         raise NotFoundError(f"No visit with id {visit_id}.")
-    row = insights_repo.get_for_visit(conn, visit_id)
+    row = insights_repo.get_for_visit(conn, scope, visit_id)
     if row is None:
         raise NotFoundError(f"No insights generated for visit {visit_id} yet.")
     return row
@@ -250,6 +296,7 @@ def get_insights(conn: psycopg.Connection, visit_id: str) -> InsightRow:
 
 def check_against_next_visit(
     conn: psycopg.Connection,
+    scope: DoctorScope,
     visit: VisitRow,
     due: Optional[str],
 ) -> str:
@@ -260,7 +307,8 @@ def check_against_next_visit(
     the extraction or the seed data is wrong, which makes this the most useful
     single signal that the pipeline is behaving.
     """
-    later = [v for v in visits_repo.list_visits(conn, patient_id=visit.patient_id)
+    later = [v for v in visits_repo.list_visits(conn, scope,
+                                                patient_id=visit.patient_id)
              if v.visit_number == visit.visit_number + 1]
     if not later:
         return "no later visit on record (last in series)"

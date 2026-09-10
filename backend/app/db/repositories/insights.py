@@ -1,4 +1,15 @@
-"""Insight persistence."""
+"""
+Insight persistence.
+
+`visit_insights` has no `doctor_id` column and does not need one: it reaches its
+tenant through `visit_id -> visits.patient_id -> patients.doctor_id`. The scoping
+is expressed as an EXISTS predicate rather than a join so the SELECT column list
+and the upsert stay exactly as they were.
+
+This is the table holding the actual clinical content — the extraction, the
+remedy reasoning, the care plan. An unscoped read here is not a listing bug, it
+is one doctor reading another's consultation notes.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +20,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from app.db.models import InsightRow
+from app.db.tenancy import DoctorScope, is_scoped
 
 _COLUMNS = """
     insight_id::text, visit_id::text, clinical_summary, chief_issue,
@@ -19,6 +31,16 @@ _COLUMNS = """
     model_name, model_version, prompt_version, extraction_version,
     input_tokens, output_tokens, total_tokens,
     generated_at, created_at
+"""
+
+# The tenancy predicate, correlated against whichever visit_id the outer query
+# is looking at. Written as a subquery on visits+patients so it can be dropped
+# into any statement without touching its shape.
+_OWNED_BY_SCOPE = """
+    EXISTS (SELECT 1 FROM visits v
+            JOIN patients p ON p.patient_id = v.patient_id
+            WHERE v.visit_id = visit_insights.visit_id
+              AND p.doctor_id = %s)
 """
 
 # created_at is deliberately absent from the DO UPDATE list: it records when a
@@ -78,29 +100,54 @@ class SaveResult:
         return "updated" if self.was_update else "inserted"
 
 
-def get_for_visit(conn: psycopg.Connection, visit_id: str) -> Optional[InsightRow]:
+def get_for_visit(conn: psycopg.Connection, scope: DoctorScope,
+                  visit_id: str) -> Optional[InsightRow]:
+    """One visit's insights, or None when unknown or another doctor's."""
+    conditions = ["visit_id = %s"]
+    params: List[Any] = [visit_id]
+    if is_scoped(scope):
+        conditions.append(_OWNED_BY_SCOPE)
+        params.append(str(scope))
+
     with conn.cursor() as cur:
-        cur.execute(f"SELECT {_COLUMNS} FROM visit_insights WHERE visit_id = %s",
-                    (visit_id,))
+        cur.execute(
+            f"SELECT {_COLUMNS} FROM visit_insights "
+            f"WHERE {' AND '.join(conditions)}",
+            params,
+        )
         record = cur.fetchone()
     return InsightRow(**record) if record else None
 
 
-def list_for_visits(conn: psycopg.Connection,
+def list_for_visits(conn: psycopg.Connection, scope: DoctorScope,
                     visit_ids: List[str]) -> List[InsightRow]:
-    """Insights for several visits at once, so a timeline is one query not N."""
+    """Insights for several visits at once, so a timeline is one query not N.
+
+    Scoped even though the caller normally derives `visit_ids` from an
+    already-scoped visit list: the filter has to hold on its own, because "the
+    caller already checked" is exactly the assumption that stops being true after
+    a refactor.
+    """
     if not visit_ids:
         return []
+    conditions = ["visit_id = ANY(%s)"]
+    params: List[Any] = [list(visit_ids)]
+    if is_scoped(scope):
+        conditions.append(_OWNED_BY_SCOPE)
+        params.append(str(scope))
+
     with conn.cursor() as cur:
         cur.execute(
-            f"SELECT {_COLUMNS} FROM visit_insights WHERE visit_id = ANY(%s)",
-            (list(visit_ids),),
+            f"SELECT {_COLUMNS} FROM visit_insights "
+            f"WHERE {' AND '.join(conditions)}",
+            params,
         )
         return [InsightRow(**r) for r in cur.fetchall()]
 
 
 def save(
     conn: psycopg.Connection,
+    scope: DoctorScope,
     row: Dict[str, Any],
     on_saved: Optional[Callable[[psycopg.Connection], None]] = None,
 ) -> SaveResult:
@@ -116,17 +163,37 @@ def save(
 
     Callers must only reach here after every layer has succeeded; a failure
     part-way through the chain raises earlier, leaving the flag FALSE.
+
+    Ownership is re-checked at the top of the transaction rather than trusted
+    from the caller. This write is reached from three directions — the HTTP
+    route, the background job worker, and the CLI — and generation is expensive
+    enough that a visit id arriving from the wrong place would otherwise burn
+    three model calls before writing a brief into another doctor's record.
     """
     payload = dict(row)
     payload["insights_json"] = Jsonb(payload["insights_json"])
+    visit_id = payload["visit_id"]
 
     with conn.transaction():
+        if is_scoped(scope):
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT 1 FROM visits v
+                       JOIN patients p ON p.patient_id = v.patient_id
+                       WHERE v.visit_id = %s AND p.doctor_id = %s""",
+                    (visit_id, str(scope)),
+                )
+                if cur.fetchone() is None:
+                    from app.core.errors import NotFoundError
+
+                    raise NotFoundError(f"No visit with id {visit_id}.")
+
         with conn.cursor() as cur:
             cur.execute(_UPSERT, payload)
             written = cur.fetchone()
             cur.execute(
                 "UPDATE visits SET insights_generated = TRUE WHERE visit_id = %s",
-                (payload["visit_id"],),
+                (visit_id,),
             )
         if on_saved is not None:
             on_saved(conn)

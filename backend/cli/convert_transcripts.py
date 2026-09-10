@@ -15,6 +15,15 @@ Reads the JSON with `json.load` directly rather than through
 
 Each visit is converted in its own transaction, so an interrupt cannot leave a
 row pointing at a file that was never written.
+
+TENANCY: this script is cross-doctor and stays that way. It predates
+multi-tenancy, has already been run against the only data it was written for (the
+16 seeded visits, all now owned by the first doctor), and touches nothing but
+`transcript_path` / `transcript_filename` — no patient or clinical content. It
+talks to Postgres in raw SQL rather than through the repositories, so it is
+untouched by the scoping change; if it is ever run again on a multi-doctor
+database, note that it would rewrite transcript paths for every doctor at once.
+See §8.20 for why CLI tooling is privileged by design.
 """
 
 from __future__ import annotations

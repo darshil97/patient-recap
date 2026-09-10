@@ -1,5 +1,5 @@
 """
-Follow-up lifecycle rules.
+Follow-up lifecycle rules, scoped to one doctor.
 
 A follow-up moves between three states:
 
@@ -10,6 +10,11 @@ A follow-up moves between three states:
 
 `last_contacted_at` is independent of status, so "I phoned them and they are
 still deciding" stays open while recording that the call happened.
+
+The follow-up queue is the screen a doctor works from, and every row on it
+carries a patient's name and telephone number. It is the most sensitive list in
+the application, which is why the scope travels through every function here
+rather than being applied once at the route.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ import psycopg
 from app.core.errors import NotFoundError, ValidationError
 from app.db.models import FollowUpRow, VisitRow
 from app.db.repositories import follow_ups as follow_ups_repo
+from app.db.tenancy import DoctorScope
 from app.domain.follow_up.models import SCHEDULED, ResolvedFollowUp
 
 logger = logging.getLogger(__name__)
@@ -35,6 +41,7 @@ SETTABLE_STATUSES = ("open", "dismissed")
 
 def sync_from_insights(
     conn: psycopg.Connection,
+    scope: DoctorScope,
     visit: VisitRow,
     follow_up: Optional[ResolvedFollowUp],
 ) -> Optional[str]:
@@ -50,7 +57,7 @@ def sync_from_insights(
     does not leave a stale one in the queue.
     """
     if follow_up is None or follow_up.type != SCHEDULED or not follow_up.due_earliest:
-        removed = follow_ups_repo.delete_for_visit(conn, visit.visit_id)
+        removed = follow_ups_repo.delete_for_visit(conn, scope, visit.visit_id)
         if removed:
             logger.info("Removed stale follow-up for %s (now %s)",
                         visit.label, follow_up.type if follow_up else "none")
@@ -58,6 +65,7 @@ def sync_from_insights(
 
     follow_up_id = follow_ups_repo.upsert(
         conn,
+        scope,
         source_visit_id=visit.visit_id,
         patient_id=visit.patient_id,
         due_earliest=follow_up.due_earliest,
@@ -66,6 +74,16 @@ def sync_from_insights(
         stated=follow_up.stated,
         purpose=follow_up.purpose,
     )
+    if follow_up_id is None:
+        # The upsert resolves patient_id through the doctor filter, so None means
+        # the visit's patient is not this doctor's. Reachable only through a bug,
+        # never through a request — but it must not pass silently: the caller is
+        # inside the insight transaction, and swallowing this would commit a brief
+        # whose queue entry was quietly dropped.
+        raise NotFoundError(
+            f"No patient with id {visit.patient_id}.",
+            details={"visit_id": visit.visit_id})
+
     logger.info("Follow-up %s for %s due %s",
                 follow_up_id, visit.label, follow_up.due_earliest)
     return follow_up_id
@@ -73,30 +91,34 @@ def sync_from_insights(
 
 def resolve_for_new_visit(
     conn: psycopg.Connection,
+    scope: DoctorScope,
     patient_id: str,
     new_visit_id: str,
     new_visit_date: date,
 ) -> List[str]:
     """Close open follow-ups answered by a newly scheduled visit."""
     resolved = follow_ups_repo.resolve_open_for_patient(
-        conn, patient_id, new_visit_id, new_visit_date)
+        conn, scope, patient_id, new_visit_id, new_visit_date)
     if resolved:
         logger.info("Scheduling %s resolved %d follow-up(s): %s",
                     new_visit_id, len(resolved), ", ".join(resolved))
     return resolved
 
 
-def reopen_for_cancelled_visit(conn: psycopg.Connection, visit_id: str) -> List[str]:
+def reopen_for_cancelled_visit(conn: psycopg.Connection, scope: DoctorScope,
+                               visit_id: str) -> List[str]:
     """Reopen follow-ups whose resolving visit has been cancelled."""
-    reopened = follow_ups_repo.reopen_resolved_by_visit(conn, visit_id)
+    reopened = follow_ups_repo.reopen_resolved_by_visit(conn, scope, visit_id)
     if reopened:
         logger.info("Cancelling %s reopened %d follow-up(s): %s",
                     visit_id, len(reopened), ", ".join(reopened))
     return reopened
 
 
-def get_follow_up(conn: psycopg.Connection, follow_up_id: str) -> FollowUpRow:
-    row = follow_ups_repo.get(conn, follow_up_id)
+def get_follow_up(conn: psycopg.Connection, scope: DoctorScope,
+                  follow_up_id: str) -> FollowUpRow:
+    """One of the scoped doctor's follow-ups. 404 for another doctor's."""
+    row = follow_ups_repo.get(conn, scope, follow_up_id)
     if row is None:
         raise NotFoundError(f"No follow-up with id {follow_up_id}.")
     return row
@@ -104,6 +126,7 @@ def get_follow_up(conn: psycopg.Connection, follow_up_id: str) -> FollowUpRow:
 
 def update_follow_up(
     conn: psycopg.Connection,
+    scope: DoctorScope,
     follow_up_id: str,
     status: Optional[str] = None,
     dismissed_reason: Optional[str] = None,
@@ -111,7 +134,7 @@ def update_follow_up(
     mark_contacted: bool = False,
 ) -> FollowUpRow:
     """Record the outcome of contacting a patient."""
-    get_follow_up(conn, follow_up_id)  # 404 if unknown
+    get_follow_up(conn, scope, follow_up_id)  # 404 if unknown or another doctor's
 
     if status is not None:
         if status == "resolved":
@@ -128,7 +151,7 @@ def update_follow_up(
                 "dismissed_reason is required when dismissing a follow-up.")
 
     updated = follow_ups_repo.apply_update(
-        conn, follow_up_id,
+        conn, scope, follow_up_id,
         status=status,
         dismissed_reason=(dismissed_reason or "").strip() or None,
         note=note,

@@ -9,11 +9,36 @@ Batch runner: generate insights for every visit that still needs them.
     python -m cli.load_insights --visit <visit_id>
     python -m cli.load_insights --transcript transcripts/riya_2.json
     python -m cli.load_insights --all --regenerate --log-file run.log
+    python -m cli.load_insights --all --doctor me@example.com
 
 Goes through the same service layer as the API, so the two cannot drift apart.
 Each visit is three model calls and commits in its own transaction, so Ctrl-C
 between visits never leaves half-written data. Press Ctrl-C once to stop after
 the visit in flight, twice to abandon it immediately.
+
+TENANCY: THIS TOOL IS PRIVILEGED BY DEFAULT (§8.20)
+
+With no `--doctor`, this runs across **every doctor's** visits. That is a decision,
+not an oversight, and the reasoning is worth stating because it is the opposite of
+the rule the HTTP API follows.
+
+A `--doctor` flag would not be a security boundary here. The CLI is invoked from a
+shell that already holds `CONNSTR`, so whoever runs it can reach every row in the
+database with `psql` regardless of what this argument parser accepts. Requiring the
+flag would buy the appearance of a boundary without the substance.
+
+What it *is* good for is safety and cost, so it exists as an optional narrowing:
+
+  --doctor <email|uuid>   process only that doctor's pending visits
+
+and the run header always prints which doctors are in scope, so an unscoped run
+across a multi-doctor database is visible rather than assumed. Given that each
+visit costs three model calls against a 20-request daily quota, "how much of this
+is mine" is a question worth answering before starting, not after.
+
+The API has no equivalent escape hatch: nothing under app/api/ may pass
+ALL_DOCTORS. An operator at a terminal and an HTTP request are different trust
+positions, and this is the seam where that difference is expressed.
 """
 
 from __future__ import annotations
@@ -30,7 +55,9 @@ from app.core.errors import AppError, ConflictError, QuotaExhaustedError
 from app.core.logging import configure_logging
 from app.db.models import VisitRow
 from app.db.pool import close_pool, connection
+from app.db.repositories import doctors as doctors_repo
 from app.db.repositories import visits as visits_repo
+from app.db.tenancy import ALL_DOCTORS, DoctorScope
 from app.llm.gemini import build_llm
 from app.services import insight_service
 
@@ -102,31 +129,78 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true",
                         help="List the work and exit without calling the model")
     parser.add_argument("--log-file", help="Append all progress output to this file")
+    parser.add_argument(
+        "--doctor", default=None, metavar="EMAIL_OR_ID",
+        help="Only process this doctor's visits (email or doctor_id). Omit to run "
+             "across every doctor: this tool is privileged by design, see §8.20.")
     return parser.parse_args(argv)
 
 
-def show_status(conn, report: Reporter) -> int:
+def resolve_scope(conn, requested: Optional[str], report: "Reporter") -> Optional[DoctorScope]:
+    """Turn --doctor into a DoctorScope, or ALL_DOCTORS when it was omitted.
+
+    Returns None when the argument named a doctor who does not exist, which the
+    caller turns into a non-zero exit. Failing is important: silently falling back
+    to every doctor after a typo in an email address is the one way this flag could
+    do harm.
+    """
+    if requested is None:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*)::int AS n FROM doctors")
+            total = int(cur.fetchone()["n"])
+        if total > 1:
+            report.line(f"scope: ALL {total} DOCTORS (no --doctor given). Every "
+                        f"pending visit in the database is in scope.")
+        else:
+            report.line("scope: all doctors (1 in the database)")
+        return ALL_DOCTORS
+
+    doctor = (doctors_repo.get_by_email(conn, requested)
+              if "@" in requested else doctors_repo.get(conn, requested))
+    if doctor is None:
+        report.line(f"No doctor matched {requested!r}. Nothing was processed.")
+        report.line("List them with: SELECT doctor_id, email FROM doctors;")
+        return None
+
+    report.line(f"scope: {doctor.email} ({doctor.doctor_id})")
+    return doctor.doctor_id
+
+
+def show_status(conn, scope: DoctorScope, report: Reporter) -> int:
+    """Per-visit status. Includes the owning doctor when running unscoped, so a
+    multi-doctor listing is readable rather than a puzzling mix of names."""
+    show_owner = scope is ALL_DOCTORS
+    where, params = ([], [])
+    if not show_owner:
+        where, params = ["p.doctor_id = %s"], [str(scope)]
+
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT p.first_name, v.visit_number, v.visit_date, v.visit_status,
+        cur.execute(f"""
+            SELECT d.email AS doctor_email, p.first_name, v.visit_number,
+                   v.visit_date, v.visit_status,
                    v.transcript_path IS NOT NULL AS has_transcript,
                    v.insights_generated,
                    (i.insight_id IS NOT NULL) AS has_row,
                    i.follow_up_type, i.follow_up_date, i.total_tokens
             FROM visits v
             JOIN patients p USING (patient_id)
+            JOIN doctors d ON d.doctor_id = p.doctor_id
             LEFT JOIN visit_insights i ON i.visit_id = v.visit_id
-            ORDER BY p.first_name, v.visit_number
-        """)
+            {"WHERE " + " AND ".join(where) if where else ""}
+            ORDER BY d.email, p.first_name, v.visit_number
+        """, params)
         rows = cur.fetchall()
 
-    report.line(f"{'patient':<9}{'#':<3}{'visit date':<13}{'transcript':<12}"
-                f"{'generated':<11}{'follow-up':<18}{'due':<13}tokens")
-    report.line("-" * 90)
+    owner_col = f"{'doctor':<24}" if show_owner else ""
+    report.line(f"{owner_col}{'patient':<9}{'#':<3}{'visit date':<13}"
+                f"{'transcript':<12}{'generated':<11}{'follow-up':<18}"
+                f"{'due':<13}tokens")
+    report.line("-" * (90 + len(owner_col)))
     drift = []
     for r in rows:
         report.line(
-            f"{r['first_name']:<9}{r['visit_number']:<3}{str(r['visit_date']):<13}"
+            (f"{r['doctor_email'][:23]:<24}" if show_owner else "")
+            + f"{r['first_name']:<9}{r['visit_number']:<3}{str(r['visit_date']):<13}"
             f"{('yes' if r['has_transcript'] else 'MISSING'):<12}"
             f"{('yes' if r['insights_generated'] else 'PENDING'):<11}"
             f"{str(r['follow_up_type'] or '-'):<18}"
@@ -139,7 +213,7 @@ def show_status(conn, report: Reporter) -> int:
 
     done = sum(1 for r in rows if r["insights_generated"])
     total = sum(r["total_tokens"] or 0 for r in rows)
-    report.line("-" * 90)
+    report.line("-" * (90 + len(owner_col)))
     report.line(f"{done}/{len(rows)} visits generated | {len(rows) - done} pending "
                 f"| {_tokens(total)} tokens used so far")
     if drift:
@@ -169,9 +243,17 @@ def make_progress(report: Reporter):
     return on_event
 
 
-def select_visits(conn, args: argparse.Namespace) -> List[VisitRow]:
+def select_visits(conn, scope: DoctorScope,
+                  args: argparse.Namespace) -> List[VisitRow]:
+    """Which visits this run will process, within the resolved scope.
+
+    Passing `scope` through rather than querying unscoped means `--doctor` narrows
+    every selection mode, not just `--all`: `--visit <id>` for another doctor's
+    visit finds nothing when a doctor is named, which is the behaviour you want if
+    you are using the flag to avoid spending quota on the wrong records.
+    """
     if args.visit:
-        visit = visits_repo.get(conn, args.visit)
+        visit = visits_repo.get(conn, scope, args.visit)
         return [visit] if visit else []
     if args.transcript:
         from app.config import get_settings
@@ -179,9 +261,9 @@ def select_visits(conn, args: argparse.Namespace) -> List[VisitRow]:
 
         path = normalise_path(Path(args.transcript),
                               get_settings().transcripts_dir.parent)
-        visit = visits_repo.get_by_transcript_path(conn, path)
+        visit = visits_repo.get_by_transcript_path(conn, scope, path)
         return [visit] if visit else []
-    return visits_repo.list_visits(conn, pending_only=not args.regenerate)
+    return visits_repo.list_visits(conn, scope, pending_only=not args.regenerate)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -193,10 +275,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         with connection() as conn:
-            if args.list:
-                return show_status(conn, report)
+            scope = resolve_scope(conn, args.doctor, report)
+            if scope is None:
+                return 1
+            report.line()
 
-            visits = select_visits(conn, args)
+            if args.list:
+                return show_status(conn, scope, report)
+
+            visits = select_visits(conn, scope, args)
             visits = [v for v in visits if v is not None]
 
             if not visits:
@@ -252,8 +339,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
                 started = time.monotonic()
                 try:
+                    # The visit's own doctor, not the run-wide scope. An
+                    # ALL_DOCTORS run still writes each brief under its real
+                    # owner, so the privileged path cannot produce a row whose
+                    # tenancy is ambiguous.
+                    visit_scope: DoctorScope = visit.doctor_id or scope
                     outcome = insight_service.generate_for_visit(
-                        conn, visit,
+                        conn, visit_scope, visit,
                         llm=llm,
                         stop_after=args.stop_after,
                         regenerate=True,  # selection already decided what to run
@@ -261,7 +353,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     )
                     due = outcome.follow_up.due_earliest if outcome.follow_up else None
                     report.line("        check: " + insight_service
-                                .check_against_next_visit(conn, visit, due))
+                                .check_against_next_visit(conn, visit_scope,
+                                                          visit, due))
                     tokens_total += outcome.total_tokens or 0
                     report.line(f"        {outcome.saved.verb}: "
                                 f"{outcome.saved.insight_id}  "

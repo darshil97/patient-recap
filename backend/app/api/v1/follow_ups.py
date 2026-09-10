@@ -1,4 +1,13 @@
-"""Follow-up queue endpoints."""
+"""
+Follow-up queue endpoints.
+
+The queue is the screen the doctor works from, and every row on it carries a
+patient's name and telephone number — so this list is the highest-value leak
+surface in the API. It is scoped through `follow_ups.patient_id ->
+patients.doctor_id`; follow_ups has no doctor_id column of its own, and
+deliberately so (see app/db/repositories/follow_ups.py for why the patient_id
+denormalisation does not justify a second one).
+"""
 
 from __future__ import annotations
 
@@ -9,14 +18,14 @@ from uuid import UUID
 import psycopg
 from fastapi import APIRouter, Depends, Query, Response
 
-from app.api.deps import get_db, require_auth
+from app.api.deps import CurrentDoctor, get_db, require_doctor
 from app.db.repositories import follow_ups as follow_ups_repo
 from app.schemas.common import ErrorResponse
 from app.schemas.follow_ups import FollowUpOut, FollowUpUpdate
 from app.services import follow_up_service
 
 router = APIRouter(prefix="/follow-ups", tags=["follow-ups"],
-                   dependencies=[Depends(require_auth)])
+                   dependencies=[Depends(require_doctor)])
 
 
 @router.get(
@@ -37,8 +46,9 @@ def list_follow_ups(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     conn: psycopg.Connection = Depends(get_db),
+    doctor: CurrentDoctor = Depends(require_doctor),
 ) -> List[FollowUpOut]:
-    """Open follow-ups in due-date order by default.
+    """The signed-in doctor's open follow-ups, in due-date order by default.
 
     Each row carries everything the queue needs, including the patient's phone
     number, because the action on this screen is to telephone them.
@@ -54,10 +64,10 @@ def list_follow_ups(
         "needs_confirmation": needs_confirmation,
         "patient_id": str(patient_id) if patient_id else None,
     }
-    rows = follow_ups_repo.list_follow_ups(conn, sort=sort, limit=limit,
-                                           offset=offset, **kwargs)
+    rows = follow_ups_repo.list_follow_ups(conn, doctor.doctor_id, sort=sort,
+                                           limit=limit, offset=offset, **kwargs)
     response.headers["X-Total-Count"] = str(
-        follow_ups_repo.count_follow_ups(conn, **kwargs))
+        follow_ups_repo.count_follow_ups(conn, doctor.doctor_id, **kwargs))
     return [FollowUpOut.model_validate(r) for r in rows]
 
 
@@ -70,9 +80,11 @@ def list_follow_ups(
 def get_follow_up(
     follow_up_id: UUID,
     conn: psycopg.Connection = Depends(get_db),
+    doctor: CurrentDoctor = Depends(require_doctor),
 ) -> FollowUpOut:
+    """One follow-up. 404, not 403, for another doctor's."""
     return FollowUpOut.model_validate(
-        follow_up_service.get_follow_up(conn, str(follow_up_id)))
+        follow_up_service.get_follow_up(conn, doctor.doctor_id, str(follow_up_id)))
 
 
 @router.patch(
@@ -87,6 +99,7 @@ def update_follow_up(
     follow_up_id: UUID,
     payload: FollowUpUpdate,
     conn: psycopg.Connection = Depends(get_db),
+    doctor: CurrentDoctor = Depends(require_doctor),
 ) -> FollowUpOut:
     """Dismiss, reopen, note, or record that the patient was contacted.
 
@@ -96,9 +109,14 @@ def update_follow_up(
 
     `mark_contacted` is independent of status, so "I called and they are still
     deciding" leaves the row open while recording the call.
+
+    Scoped in the UPDATE itself, not only checked first. Dismissing another
+    doctor's follow-up would not surface as an error anywhere — the patient simply
+    drops off a queue nobody is watching.
     """
     updated = follow_up_service.update_follow_up(
         conn,
+        doctor.doctor_id,
         str(follow_up_id),
         status=payload.status,
         dismissed_reason=payload.dismissed_reason,

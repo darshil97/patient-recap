@@ -58,7 +58,60 @@ class Settings(BaseSettings):
 
     # Transcript paths arrive from API payloads, so reads are confined to this
     # directory. See app/domain/transcripts.py for the traversal guard.
+    #
+    # Still used when TRANSCRIPT_STORAGE=local, and still the home of the
+    # already-migrated originals, so it does not go away when object storage is
+    # switched on.
     transcripts_dir: Path = BASE_DIR / "transcripts"
+
+    # -- transcript storage ------------------------------------------------ #
+    # Which backend *new* uploads go to. Existing rows are unaffected: each visit
+    # records its own provider in visits.transcript_provider and is read back
+    # through whichever one it names, so flipping this does not orphan anything
+    # already stored. Moving old rows across is an explicit, verified step
+    # (cli/migrate_transcripts.py), never a side effect of changing a setting.
+    #
+    # Defaults to local so a fresh checkout with no credentials still works and
+    # the test suite stays offline.
+    transcript_storage: str = Field(default="local", alias="TRANSCRIPT_STORAGE")
+
+    transcript_bucket: str = Field(default="consultation-transcripts",
+                                   alias="TRANSCRIPT_BUCKET")
+
+    # AWS-standard names on purpose: `neon env pull` writes exactly these, and
+    # boto3 would pick them up from the environment anyway, so there is one set of
+    # names rather than a Neon-specific alias layer to keep in sync.
+    s3_endpoint_url: Optional[str] = Field(default=None, alias="AWS_ENDPOINT_URL_S3")
+    s3_access_key_id: Optional[str] = Field(default=None, alias="AWS_ACCESS_KEY_ID")
+    s3_secret_access_key: Optional[str] = Field(default=None,
+                                                alias="AWS_SECRET_ACCESS_KEY")
+    s3_region: str = Field(default="us-east-2", alias="AWS_REGION")
+
+    @field_validator("transcript_storage", mode="after")
+    @classmethod
+    def _known_storage(cls, value: str) -> str:
+        """Fail at startup on a typo rather than at the first upload.
+
+        A mistyped provider would otherwise fall through to whatever the store
+        factory treats as a default, and the first sign of trouble would be a
+        transcript written somewhere nobody expected.
+        """
+        allowed = ("local", "neon_object_storage")
+        cleaned = (value or "").strip().lower()
+        if cleaned not in allowed:
+            raise ValueError(
+                f"TRANSCRIPT_STORAGE must be one of {allowed}, got {value!r}")
+        return cleaned
+
+    @property
+    def object_storage_configured(self) -> bool:
+        """Whether there is enough configuration to reach the bucket.
+
+        Checked before use so a missing credential is a clear error naming the
+        variable, instead of a boto3 NoCredentialsError from three frames deep.
+        """
+        return bool(self.s3_endpoint_url and self.s3_access_key_id
+                    and self.s3_secret_access_key and self.transcript_bucket)
 
     # -- api --------------------------------------------------------------- #
     api_prefix: str = "/api/v1"

@@ -1,44 +1,86 @@
 # Frontend
 
-Not built yet. This file is the contract to build against, so a session working
-here needs no knowledge of the Python backend beyond what is below.
+This is the API contract the UI is built against, plus the frontend-specific
+gotchas. A session working here needs no knowledge of the Python backend beyond
+what is below.
 
-## Suggested layout
+## What is here
 
-Framework is an open choice. Whatever it is, keep this shape so the boundary
-stays obvious:
+A Next.js 16 App Router app (TypeScript `strict`, Tailwind v4), with a
+server-side BFF proxy in front of the FastAPI backend.
 
 ```
 frontend/
-├── src/
-│   ├── api/            generated client + thin wrappers (see below)
-│   ├── components/     presentational
-│   ├── features/       patients/, visits/, insights/ — one folder per workflow
-│   ├── hooks/          e.g. useInsightJob (polling lives here, once)
-│   ├── pages/ (routes/)
-│   └── types/          generated from the OpenAPI schema
-├── public/
-├── .env.local          VITE_API_BASE_URL=http://127.0.0.1:8000/api/v1
-├── package.json
-└── README.md
+├── app/
+│   ├── (app)/              authenticated area, wrapped in the clinical shell
+│   │   ├── page.tsx        "/" -> the follow-up queue
+│   │   ├── follow-ups/     same queue under its own name
+│   │   ├── schedule/       visit schedule
+│   │   ├── patients/       list, and [patientId] detail/timeline
+│   │   └── visits/         [visitId]: transcript upload, generation, brief
+│   ├── auth/[path]/        Neon Auth views, deliberately outside (app)
+│   ├── api/
+│   │   ├── auth/[...path]/ Neon Auth handler
+│   │   └── [...path]/      the BFF proxy to FastAPI  ← all backend traffic
+│   ├── globals.css         Tailwind + auth-ui theme + design-system.css
+│   └── design-system.css   the approved clinical design (accent tokens in :root)
+├── views/                  the six page components
+├── features/  components/  hooks/
+├── lib/
+│   ├── api/                openapi-fetch wrappers, same-origin only
+│   ├── auth/               server.ts (secrets) and client.ts (browser)
+│   └── types/api.d.ts      generated — do not hand-edit
+├── certificates/           self-signed dev cert, gitignored (see HTTPS below)
+├── proxy.ts                route protection (middleware.ts on Next < 16)
+├── legacy-vite/            the previous Vite SPA, reference only
+└── design-history/         mockups and design alternatives
 ```
+
+**Nothing in the browser talks to FastAPI.** The backend's address and API key are
+server-only (`BACKEND_URL`, `BACKEND_API_KEY`) — there are no `NEXT_PUBLIC_`
+variables at all, by design. The browser calls same-origin `/api/v1/...`, and
+`app/api/[...path]/route.ts` verifies the Neon Auth session and forwards with the
+secrets attached.
+
+Three details in that proxy are load-bearing:
+
+- multipart bodies are forwarded as **raw bytes** with the incoming `Content-Type`
+  copied verbatim — re-encoding would mint a boundary that no longer matches the
+  body, breaking transcript upload
+- `X-Total-Count` is copied onto the response, or paginated lists lose their totals
+- `204`/`205`/`304` are returned without a body, because constructing one throws
 
 ## Generate the client, don't hand-write it
 
-The backend publishes an OpenAPI schema at `/openapi.json`, and every request and
-response model is fully typed. Generating from it means the types cannot drift
-from the API:
+The backend publishes OpenAPI at `/openapi.json` and every request and response
+model is fully typed, so generating from it means the types cannot drift:
 
 ```bash
-# with the backend running
-npx openapi-typescript http://127.0.0.1:8000/openapi.json -o src/types/api.d.ts
+npm run gen:api        # needs the backend running
 ```
 
-Browse the same schema interactively at http://127.0.0.1:8000/docs.
+`lib/types/api.d.ts` is committed, so it can fall behind without anything failing
+loudly — a stale copy still typechecks, it just describes an API that no longer
+exists. Regenerate in the same piece of work as any backend model change. Browse
+the schema interactively at http://127.0.0.1:8000/docs.
+
+## The data is per-doctor
+
+The backend is multi-tenant. Every response contains only the signed-in doctor's
+patients, visits, insights and follow-ups — there is no way to ask for anyone
+else's, and no endpoint accepts a doctor id. Two consequences for the UI:
+
+- **Ids are only meaningful inside one account.** A patient or visit id from another
+  doctor returns `404`, not `403` (see [404, not 403](#404-not-403)). Don't build
+  deep links or copy-paste flows that assume an id is globally addressable.
+- **A new account sees a completely empty app** — no patients, no visits, an empty
+  queue, all counters zero. Nothing distinguishes that from a broken backend, so
+  empty states carry real weight.
 
 ## The workflow
 
-Base URL: `http://127.0.0.1:8000/api/v1`
+Base URL: **`/api/v1`, same-origin.** Paths below are written without that
+prefix. The browser never uses `http://127.0.0.1:8000` — the BFF does.
 
 ```
 GET    /stats                          home-screen counters
@@ -99,8 +141,10 @@ required to overwrite). Server-side validation: extension must be `.txt`, max
 | 413 | over 256 KB (`transcript_too_large`) |
 | 422 | wrong extension, not UTF-8, or empty |
 
-The file is stored server-side as `transcripts/{visit_id}.txt`; the name you send
-is kept only for display in `transcript_filename`.
+The file is stored server-side as `transcripts/{visit_id}.txt` — currently an
+object in a Neon Object Storage bucket, though that is opaque to the UI and the
+address is the same either way. The name you send is kept only for display in
+`transcript_filename`; it never reaches the stored address.
 
 `GET /visits/{id}/transcript` returns the text with a `character_count`, so a
 brief can be shown next to its source.
@@ -313,20 +357,183 @@ computed date so the clinician can audit the interpretation.
 
 ## CORS
 
-Defaults to all origins, so local development works with no setup. Set
-`CORS_ORIGINS=http://localhost:3000` in `backend/.env` for development and the
-real origin in production. `*` cannot be combined with credentialed requests, so
-narrow this **before** enabling the API key, not after.
+**It does not affect this app.** All backend traffic is server-to-server
+through the BFF, so the browser never makes a cross-origin request and CORS is
+never consulted. `CORS_ORIGINS` still defaults to `*` in `backend/.env`, which is
+fine for that reason — but it must be narrowed before deployment, since `*`
+cannot be combined with credentialed requests.
 
-## Authentication
+## Running the dev server — HTTPS, not HTTP
 
-Off by default. Setting `API_KEY` in `backend/.env` makes every route except
-`GET /health` require a matching `X-API-Key` header, returning `401`
-`unauthorized` on mismatch.
+```bash
+npm run dev          # https://localhost:3000
+```
 
-Route all requests through a single API client module so adding the header is a
-one-file change. **The key must never reach the browser bundle** — proxy calls
-through a server-side route handler and read the key from a server-only env var.
+**Note the `s`.** Neon Auth's session-challenge cookie is `__Secure-` prefixed
+with the `Secure` flag, and Safari refuses to store `Secure` cookies over plain
+HTTP even on localhost. Chrome and Firefox make an exception for local
+development; Safari does not. Over `http://` the cookie is dropped and Google
+sign-in fails in the most confusing way available: you authenticate successfully,
+come back with a session verifier, `/api/auth/get-session` returns
+`400 SESSION_CHALLENGE_COOKIE_NOT_FOUND`, and you land on the sign-in screen with
+**no visible error and nothing in the backend log** — the backend is never
+called.
+
+The SDK's `SessionCookieConfig` exposes `secret`, `sessionDataTtl`, `domain` and
+`sameSite` only, so the flag cannot be turned off. The origin has to be secure.
+
+The cert in `certificates/` is self-signed and gitignored, so the browser warns
+once per origin: **Show Details → visit this website**. Alternatives:
+
+| script | what it does |
+| --- | --- |
+| `dev` | HTTPS with the checked-in self-signed cert. Warns once. |
+| `dev:mkcert` | HTTPS with a trusted local CA. No warning, needs sudo. |
+| `dev:http` | Plain HTTP. Fine for Chrome and for `gen:api`. |
+
+Regenerating the cert, if it expires or goes missing, is in `package.json` under
+`//dev-regen-certs`.
+
+One thing to remember when changing the dev URL: Neon Auth's trusted-domain
+allowlist is per **origin**, and `https://localhost:3000` is a different origin
+from `http://localhost:3000`.
+
+## Theming the auth screens
+
+`<AuthView>` is a pre-built component tree, and out of the box it looks like a
+different product — shadcn's near-black primary button, its own greys, softer
+radii, system font.
+
+It is restyled by mapping its own theming API onto the design system rather than
+by forking components or overriding utility classes. auth-ui is
+shadcn-flavoured: every colour resolves through a `--neon-*` custom property, so
+`app/globals.css` redefines that layer against `design-system.css` tokens, scoped
+to `.neon-auth-ui`. That survives internal class changes, which matters for a
+package on `0.3.0-beta`, and keeps the accent in one place.
+
+Two things there are load-bearing and should not be "cleaned up":
+
+- **`defaultTheme="light"` on `NeonAuthUIProvider`.** auth-ui defaults to
+  `"system"`, so on a dark-mode machine the auth card rendered dark while the
+  app — which is light-only — stayed light.
+- **`--neon-accent` and `--neon-accent-foreground`.** auth-ui reads a bare
+  `--accent` if one exists, and `design-system.css` defines `--accent` as the
+  brand teal. In shadcn's vocabulary `--accent` is a muted *hover surface* with
+  near-black text on it, so the teal was being painted into hover states. That
+  override fixes a real bug, invisible until you hover something.
+
+`suppressHydrationWarning` on `<html>` in `app/layout.tsx` is also required, not a
+patch over a bug: auth-ui bundles next-themes, which sets `class` and
+`color-scheme` on `<html>` from a blocking script before React hydrates.
+
+## Authentication — two headers, not one
+
+**The backend is multi-tenant.** Every endpoint returns only the signed-in
+doctor's patients, visits, insights and follow-ups. `GET /health` is the only
+route that needs nothing.
+
+Two separate things have to be true for a request to succeed, and they answer
+different questions:
+
+| Header | Question it answers | Value |
+| --- | --- | --- |
+| `X-API-Key` | may this caller reach the API at all? | `API_KEY` from `backend/.env` |
+| `X-Doctor-Auth-Id` | whose data is this about? | `session.user.id` |
+| `X-Doctor-Email` | ...and who is that, if we have not seen them before? | `session.user.email` |
+
+Missing either gate is `401` with `{"code": "unauthorized", ...}`. A valid key
+with no doctor identity is **also** 401 — the backend will not serve patient data
+without knowing whose it is, rather than falling back to a default account.
+
+`X-Doctor-Name` (`session.user.name`) is optional and display-only.
+
+**Why two identity headers.** The backend resolves on the id and falls back to the
+email. The id is the stable key — Better Auth never changes it — whereas email is
+mutable, so keying on email alone would turn a doctor who changed their address
+into a brand-new doctor with an empty patient list. The email is still needed: it
+is what creates the doctor record on first sign-in, and what matches the row
+seeded by `backend/sql/7_multi_tenancy.sql` before anyone has signed in.
+
+**All three are set server-side in `app/api/[...path]/route.ts`, from the Neon
+Auth session.** Never from the browser, and never from an incoming header. The
+proxy's `FORWARD_REQUEST_HEADERS` allowlist is what makes that safe: a client
+sending its own `X-Doctor-Auth-Id` has it dropped, so it cannot be used to read
+another doctor's records. If you ever widen that allowlist, this is the thing you
+are putting at risk.
+
+They do **not** appear in `lib/types/api.d.ts`, and should not. The backend
+declares them as OpenAPI security schemes rather than per-endpoint parameters, so
+`npm run gen:api` leaves every path's `header?: never` alone. Declared as ordinary
+parameters they would regenerate as *required* headers on every operation and
+break every call site in `lib/api/`, none of which can supply them — they are
+injected server-side. Same arrangement `X-API-Key` already had.
+
+**The key must never reach the browser bundle.** Anything in `NEXT_PUBLIC_*` or
+imported into client code is shipped to every visitor. Read it from a server-only
+env var and proxy through a route handler:
+
+```ts
+// app/api/[...path]/route.ts — server-side only
+const res = await fetch(`${process.env.BACKEND_URL}/${path}`, {
+  headers: {
+    "X-API-Key": process.env.BACKEND_API_KEY!,   // no NEXT_PUBLIC_ prefix
+    "X-Doctor-Auth-Id": session.user.id,          // from the server session
+    "X-Doctor-Email": session.user.email,
+  },
+  ...init,
+});
+```
+
+The browser then calls your own `/api/...` routes and never sees the secret. That
+also means CORS stops mattering for those calls, since they are server-to-server.
+
+`GET /openapi.json` and `/docs` are deliberately left open so you can generate
+types without the key.
+
+Over plain HTTP the key is readable in transit. Fine on localhost; a real
+deployment needs TLS. Note the key now carries more weight than it used to:
+because FastAPI trusts the identity headers that accompany it, anyone holding
+`API_KEY` can act as any doctor. It is a tenancy-bearing secret, not just a gate.
+
+**Not yet implemented, deliberately:** FastAPI does not verify the Neon Auth token
+itself. It trusts this proxy's assertion of who is signed in, which is sound only
+because the browser cannot reach FastAPI directly, cannot obtain `API_KEY`, and
+this route re-checks the session on every request. Verifying the JWT against
+Neon Auth's JWKS endpoint is a later increment and changes nothing here.
+
+### The stale-brief warning is currently noisy
+
+`InsightBrief.tsx` warns "This brief may be out of date" when
+`visit.transcript_uploaded_at > insight.generated_at`. **15 of the 18 seeded visits
+trip it, and all 15 are false positives** — `transcript_uploaded_at` records when
+the transcript *columns* were last written, and a format migration bumped it after
+those briefs were generated without changing a word. The stored text has been
+verified byte-identical to the archived originals.
+
+Known and accepted for now. Don't remove the warning — a genuinely replaced
+transcript *should* invalidate a brief — and don't "fix" the data by recompiling,
+which costs 3 model calls per visit against a 20/day quota to rebuild briefs from
+identical input.
+
+The fix, when it happens, is backend-side: compare a content hash instead of a
+timestamp. The UI change would be to prefer `insight.transcript_sha256` over the
+timestamp comparison once that field exists.
+
+### 404, not 403
+
+A patient, visit, follow-up or job id that belongs to **another** doctor returns
+`404`, not `403`. That is intentional: a 403 would confirm the id exists and leak
+that some other doctor holds a record under it, so "unknown id" and "not yours"
+are made deliberately indistinguishable.
+
+Two consequences for the UI:
+
+- A 404 on a detail page is now a routine outcome, not necessarily a bug — a link
+  shared from a different account produces one. `PatientDetailPage` distinguishes
+  it ("This patient is not in your records.") from a genuine failure, and new
+  detail pages should do the same rather than showing a generic "could not load".
+- Do not treat ids as globally addressable in UI copy or deep links. They are only
+  meaningful within one doctor's account.
 
 ## Other endpoints
 

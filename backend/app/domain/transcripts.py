@@ -1,18 +1,28 @@
 """
-Reading transcript files.
+Transcript text, and reading it off a filesystem.
 
-Transcripts are plain UTF-8 text, one file per visit, named by visit id.
+Transcripts are plain UTF-8 text, one per visit, named by visit id.
 
-Transcript paths arrive from API payloads, so every read is confined to the
-configured transcripts directory. Without that guard a payload of
-`../../etc/passwd` would be honoured, and there is no auth in front of this API.
+Two things live here and they are worth separating:
+
+  * `Transcript`, `decode_transcript_bytes` — pure, I/O-free, and used by **every**
+    storage backend. Whatever holds the bytes, they are decoded by the same
+    function and handed to the pipeline in the same shape.
+  * `resolve_within`, `load_transcript`, `normalise_path` — filesystem-only, used
+    by the local backend and by the client-supplied-path check in visit_service.
+
+Transcript paths can arrive from API payloads, so every filesystem read is
+confined to the configured transcripts directory. Without that guard a payload of
+`../../etc/passwd` would be honoured. Object storage has no parent directory to be
+confined to, so its equivalent guard is a strict key pattern — see
+app/storage/base.py.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 from app.core.errors import TranscriptError
 
@@ -21,21 +31,39 @@ TRANSCRIPT_SUFFIX = ".txt"
 
 @dataclass
 class Transcript:
-    """A loaded consultation transcript.
+    """A loaded consultation transcript, ready for the pipeline.
 
     Text only. The seeded JSON files also carried `patient_name` and `disease`,
     but neither is needed: the pipeline renders the name from the database
     (`PatientContext.name`), and `disease` was only ever a prop for generating
     the synthetic transcripts and must not reach the doctor.
+
+    `relative_path` is the transcript's address as stored on the visit —
+    `transcripts/<visit_id>.txt` — and is recorded in the pipeline's provenance.
+    It is a filesystem path for the local backend and an object key for object
+    storage; both use the identical string, which is what makes provenance
+    comparable across a migration.
+
+    `path` is the resolved absolute filesystem path, and is therefore **None for
+    any backend that is not a filesystem**. Nothing outside the local loader reads
+    it; the pipeline uses `text` and `relative_path` only.
     """
 
-    path: Path
     relative_path: str
     text: str
+    path: Optional[Path] = None
 
     @property
     def character_count(self) -> int:
         return len(self.text)
+
+    @classmethod
+    def from_text(cls, relative_path: str, text: str) -> "Transcript":
+        """Build one from bytes that never came off a disk.
+
+        Used by the object-storage backend, which has a key rather than a path.
+        """
+        return cls(relative_path=relative_path, text=text, path=None)
 
 
 def normalise_path(path: Union[str, Path], base_dir: Path) -> str:
@@ -130,7 +158,7 @@ def load_transcript(path: Union[str, Path], allowed_dir: Path) -> Transcript:
         raise TranscriptError(f"{resolved.name}: file is empty")
 
     return Transcript(
-        path=resolved,
         relative_path=normalise_path(resolved, allowed_dir.resolve().parent),
         text=text,
+        path=resolved,
     )
