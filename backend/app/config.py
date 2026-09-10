@@ -9,10 +9,10 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Annotated, Any, List, Optional
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -119,7 +119,15 @@ class Settings(BaseSettings):
     # Permissive by default so local UI development needs no setup. Narrow this
     # before deployment: "*" cannot be combined with credentialed requests, so it
     # has to be fixed before enabling api_key rather than after.
-    cors_origins: List[str] = Field(default=["*"], alias="CORS_ORIGINS")
+    #
+    # NoDecode is load-bearing. pydantic-settings treats List[str] as a complex
+    # field and runs json.loads() on the raw env value inside the settings
+    # source, which happens *before* field validators. Without NoDecode,
+    # CORS_ORIGINS=https://app.example.com raises SettingsError and the process
+    # will not start -- only JSON syntax would work. NoDecode hands the raw
+    # string to _split_origins below instead.
+    cors_origins: Annotated[List[str], NoDecode] = Field(
+        default=["*"], alias="CORS_ORIGINS")
 
     # Shared secret for a single practice. When set, every route except
     # GET /health requires an X-API-Key header. When unset the API stays open,
@@ -134,13 +142,38 @@ class Settings(BaseSettings):
     @field_validator("cors_origins", mode="before")
     @classmethod
     def _split_origins(cls, value: Any) -> Any:
-        """Accept a comma-separated CORS_ORIGINS, which is how env vars carry lists."""
-        if isinstance(value, str):
-            stripped = value.strip()
-            if stripped.startswith("["):
-                return value  # let pydantic parse JSON form
-            return [part.strip() for part in stripped.split(",") if part.strip()]
-        return value
+        """Parse CORS_ORIGINS, which arrives as a raw string thanks to NoDecode.
+
+        Accepts a comma-separated list (`a,b`), a bare single origin (`*` or one
+        URL), or JSON (`["a","b"]`). A trailing slash is stripped because an
+        origin is scheme+host+port only -- `https://app.example.com/` would never
+        match a browser's Origin header and the mismatch is invisible in a log.
+
+        Falls back to the default when the value is blank, so an empty
+        CORS_ORIGINS= in a .env cannot silently block every origin.
+        """
+        if not isinstance(value, str):
+            return value
+
+        stripped = value.strip()
+        if not stripped:
+            return ["*"]
+
+        if stripped.startswith("["):
+            import json
+
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"CORS_ORIGINS looks like JSON but could not be parsed: {exc}"
+                ) from exc
+            items = parsed if isinstance(parsed, list) else [parsed]
+        else:
+            items = stripped.split(",")
+
+        origins = [str(item).strip().rstrip("/") for item in items]
+        return [origin for origin in origins if origin] or ["*"]
 
     @field_validator("prompts_dir", "transcripts_dir", mode="after")
     @classmethod
