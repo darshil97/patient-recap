@@ -555,4 +555,4 @@ for an unknown visit.
 Never poll `GET /health/api-keys`: each call spends one request from every key's
 daily quota.
 
-Vercel Deployment: https://patient-recap.vercel.app
+**Vercel Deployment:** https://patient-recap.vercel.app
