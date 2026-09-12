@@ -1214,6 +1214,23 @@ requirement is "every change under `frontend/` must deploy, predictably," switch
 to that command (Settings → Git → Ignored Build Step) and turn this toggle off;
 do not run both.
 
+**The Ignored Build Step "Behavior" must be "Automatic", not "Only build if there
+are changes in a folder".** The folder helper *overrides* the Skip-deployments
+toggle, so the toggle silently stops governing. It had been set to that folder
+behaviour, which generated `git diff HEAD^ HEAD --quiet -- ./frontend` and
+cancelled **every** deployment: Vercel runs the Ignored Build Step *from the Root
+Directory* (already `frontend/`), so `./frontend` resolved to `frontend/frontend`,
+matched nothing, and `--quiet` exited 0 — and exit 0 means skip. The two features
+stack: Root Directory `frontend` and a folder filter of `./frontend` both assume
+the same directory. The build log showed `Running "git diff HEAD^ HEAD --quiet --
+./frontend"` then `canceled because the Ignored Build Step command returned exit
+code 0` on a commit that genuinely changed frontend source. Setting Behavior to
+Automatic hands control back to the toggle, which understands `frontend` without
+nesting. If you ever want the folder filter instead of the toggle, its folder must
+be `.` (not `frontend`), because the command already runs inside the root — but
+then the toggle is moot, and note `HEAD^ HEAD` diffs only the latest commit, so a
+multi-commit push can miss earlier changes.
+
 To verify auto-deploy actually works, push a change to a real frontend **source**
 file (a page or component), not the README, and confirm it produces a build. A
 build that does not appear is then a Git-integration problem (Settings → Git:

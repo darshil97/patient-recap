@@ -134,7 +134,7 @@ button { font-family: inherit; }
 }
 /* After .active in source order (and not on .active itself) so hovering the
    current page's pill still lightens rather than colliding teal-on-teal with
-   text at the same lightness as its background. */
+   text at the same lightness as its background.  */
 .nav a:hover:not(.active) { background: var(--surface-sunken); color: var(--ink); text-decoration: none; }
 .nav a.active:hover { background: var(--accent-ink); color: #fff; text-decoration: none; }
 .nav .count {
