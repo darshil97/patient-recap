@@ -1183,19 +1183,41 @@ Environment variables (Production and Preview scopes) mirror the four local
 
 **Auto-deploy is scoped to `frontend/` only.** Since backend and frontend share
 one repo, an unscoped Vercel project would rebuild on every commit anywhere in
-the repo, including pure backend changes. Settings → Git → Ignored Build Step is
-set to:
+the repo, including pure backend changes. This is handled by Vercel's built-in
+**"Skip deployments when there are no changes to the root directory or its
+dependencies"** toggle (Settings → Build and Deployment → Root Directory,
+Enabled), *not* by a custom Ignored Build Step. "Include files outside the root
+directory in the Build Step" is also Enabled.
 
-```
-git diff --quiet HEAD^ HEAD -- .
-```
+With Root Directory `frontend`, the toggle skips any commit whose changed files
+are all outside `frontend/` — backend-only, docs-only, or root-file-only commits
+never deploy the frontend. A commit that changes frontend source builds.
 
-Because Root Directory is `frontend`, this diffs relative to that folder: exit
-0 (no diff) skips the build, exit 1 (diff found) proceeds — which is what
-`git diff --quiet`'s own exit codes already do, so no extra wrapping is needed.
-Confirmed by pushing a backend-only commit and a frontend-only commit and
-checking that only the second produced a real deployment rather than a Skipped
-one.
+Two properties of this toggle are worth knowing, because they are Vercel
+heuristics rather than a rule we control:
+
+- It is **not a plain folder diff.** Vercel does affected-file analysis ("or its
+  dependencies"), so a change inside `frontend/` that does not affect the build —
+  a README-only edit is the likely case — may be treated as non-affecting and
+  skipped. That is acceptable: a README does not change the built app. It does
+  mean a doc-only frontend commit is not a valid test of auto-deploy.
+- The diff baseline is the **last deployment's** commit (`VERCEL_GIT_PREVIOUS_SHA`),
+  not the pushed commit's parent. After a manual redeploy of an older commit, the
+  "changed files" set is computed from that older base, which can make a single
+  push's skip/build decision surprising.
+
+We chose this over the deterministic alternative — a custom Ignored Build Step of
+`git diff --quiet HEAD^ HEAD -- .`, which builds on *any* change under `frontend/`
+including non-code files — because it needs no configuration to maintain and
+skipping a README-only redeploy is desirable, not a problem. If a future
+requirement is "every change under `frontend/` must deploy, predictably," switch
+to that command (Settings → Git → Ignored Build Step) and turn this toggle off;
+do not run both.
+
+To verify auto-deploy actually works, push a change to a real frontend **source**
+file (a page or component), not the README, and confirm it produces a build. A
+build that does not appear is then a Git-integration problem (Settings → Git:
+repository connected, production branch `main`), not this toggle.
 
 **A build can fail during static generation, not just during compile or
 typecheck.** Next.js executes page-module top-level code while prerendering

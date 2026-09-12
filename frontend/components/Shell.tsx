@@ -25,8 +25,12 @@ export function Shell({ children }: { children: React.ReactNode }) {
     (stats?.visits.scheduled ?? 0);
   const patientCount = stats?.patients;
 
-  // "/" and "/follow-ups" render the same queue, so treat them as one tab.
-  const isToday = pathname === "/" || pathname === "/follow-ups";
+  // "/" and "/follow-ups" render the same queue page, but they are still two
+  // distinct nav links — each highlights only when it is the current route.
+  // (Previously both used one shared flag, which marked Follow-ups active
+  // whenever you were on "/", giving it a permanently solid teal pill.)
+  const isTodayActive = pathname === "/";
+  const isFollowUpsActive = pathname === "/follow-ups";
 
   return (
     <div className="app">
@@ -40,7 +44,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
           </div>
         </div>
         <nav className="nav" aria-label="Main">
-          <Link href="/" className={isToday ? "active" : ""}>
+          <Link href="/" className={isTodayActive ? "active" : ""}>
             Today
             {needsAction !== undefined && <span className="count">{needsAction}</span>}
           </Link>
@@ -61,7 +65,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
               <span className="count">{stats.visits.scheduled}</span>
             )}
           </Link>
-          <Link href="/follow-ups" className={isToday ? "active" : ""}>
+          <Link href="/follow-ups" className={isFollowUpsActive ? "active" : ""}>
             Follow-ups
             {openFollowUps !== undefined && <span className="count">{openFollowUps}</span>}
           </Link>
