@@ -28,8 +28,6 @@ from fastapi import (
 
 from app.api.deps import CurrentDoctor, get_db, require_doctor
 from app.config import get_settings
-from app.db.repositories import jobs as jobs_repo
-from app.db.repositories import visits as visits_repo
 from app.schemas.common import ErrorResponse
 from app.schemas.insights import (
     GenerateInsightsRequest,
@@ -46,6 +44,7 @@ from app.schemas.visits import (
     VisitUpdate,
 )
 from app.services import insight_service, job_service, transcript_service, visit_service
+from app.services.pagination import MAX_PAGE_SIZE
 
 # require_doctor depends on require_auth, so both gates apply to every route here
 # even if a handler forgets to name the dependency.
@@ -62,8 +61,7 @@ router = APIRouter(prefix="/visits", tags=["visits"],
     response_model=VisitOut,
     status_code=status.HTTP_201_CREATED,
     responses={404: {"model": ErrorResponse, "description": "Unknown patient"},
-               409: {"model": ErrorResponse, "description": "Visit number taken"},
-               422: {"model": ErrorResponse, "description": "Bad transcript path"}},
+               409: {"model": ErrorResponse, "description": "Visit number taken"}},
     summary="Schedule a visit",
 )
 def schedule_visit(
@@ -77,8 +75,9 @@ def schedule_visit(
     patient_id that does not exist — so the body cannot be used to probe for other
     practices' patient ids.
 
-    `visit_number` is assigned sequentially when omitted. `transcript_path` is
-    optional because a scheduled visit has no recording yet; upload it later.
+    `visit_number` is assigned sequentially when omitted. A visit starts with no
+    transcript; upload one with `POST /visits/{visit_id}/transcript` once the
+    consultation is complete.
 
     Scheduling also closes any open follow-up from an earlier visit for this
     patient, in the same transaction.
@@ -92,7 +91,6 @@ def schedule_visit(
         visit_number=payload.visit_number,
         visit_type=payload.visit_type,
         visit_status=payload.visit_status,
-        transcript_path=payload.transcript_path,
     )
     return VisitOut.model_validate(visit)
 
@@ -113,7 +111,7 @@ def list_visits(
                                description="Only visits without insights"),
     sort: str = Query(default="date_desc",
                       pattern="^(date_desc|date_asc|patient)$"),
-    limit: Optional[int] = Query(default=None, ge=1, le=500),
+    limit: Optional[int] = Query(default=None, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(default=0, ge=0),
     conn: psycopg.Connection = Depends(get_db),
     doctor: CurrentDoctor = Depends(require_doctor),
@@ -123,19 +121,21 @@ def list_visits(
     Filtering by another doctor's `patient_id` returns an empty list, which is
     exactly what a patient with no visits returns, so a guessed id reveals nothing.
     """
-    kwargs = {
-        "patient_id": str(patient_id) if patient_id else None,
-        "statuses": status_filter,
-        "date_from": date_from,
-        "date_to": date_to,
-        "has_transcript": has_transcript,
-        "pending_only": pending_only,
-    }
-    rows = visits_repo.list_visits(conn, doctor.doctor_id, sort=sort, limit=limit,
-                                   offset=offset, **kwargs)
-    response.headers["X-Total-Count"] = str(
-        visits_repo.count_visits(conn, doctor.doctor_id, **kwargs))
-    return [VisitOut.model_validate(r) for r in rows]
+    page = visit_service.list_visits(
+        conn,
+        doctor.doctor_id,
+        patient_id=str(patient_id) if patient_id else None,
+        statuses=status_filter,
+        date_from=date_from,
+        date_to=date_to,
+        has_transcript=has_transcript,
+        pending_only=pending_only,
+        sort=sort,
+        limit=limit,
+        offset=offset,
+    )
+    response.headers["X-Total-Count"] = str(page.total)
+    return [VisitOut.model_validate(r) for r in page.items]
 
 
 @router.get(
@@ -157,9 +157,8 @@ def get_visit(
 @router.patch(
     "/{visit_id}",
     response_model=VisitOut,
-    responses={404: {"model": ErrorResponse},
-               422: {"model": ErrorResponse, "description": "Bad transcript path"}},
-    summary="Update a visit's details",
+    responses={404: {"model": ErrorResponse}},
+    summary="Correct a visit's details",
 )
 def update_visit(
     visit_id: UUID,
@@ -167,18 +166,19 @@ def update_visit(
     conn: psycopg.Connection = Depends(get_db),
     doctor: CurrentDoctor = Depends(require_doctor),
 ) -> VisitOut:
-    """Patch a visit's details.
+    """Correct a visit's date, time or type.
 
-    Attaching a transcript here does **not** complete the visit: completion is an
-    explicit transition via `/complete`, so the status never changes as a side
-    effect of an unrelated action.
+    This cannot change `visit_status` and cannot touch the transcript.
+    Completion and cancellation are explicit transitions via `/complete` and
+    `/cancel`, which record their own timestamps and — for `/cancel` — reopen the
+    follow-ups that visit had resolved (§8.17). A transcript is attached by
+    uploading it to `/transcript`, which derives its storage address from the
+    visit id (§8.19).
     """
     visit = visit_service.update_visit(
         conn,
         doctor.doctor_id,
         str(visit_id),
-        transcript_path=payload.transcript_path,
-        visit_status=payload.visit_status,
         visit_date=payload.visit_date,
         visit_time=payload.visit_time,
         visit_type=payload.visit_type,
@@ -348,6 +348,9 @@ def generate_insights(
     202 rather than the finished insight because the chain is three sequential
     model calls, roughly a minute, which is past common proxy timeouts.
 
+    All three layers always run. A partial run produces a brief with no care plan
+    — the doctor-facing part — so there is no `stop_after` to ask for one.
+
     `poll_url` and `insights_url` are **root-relative and already include the
     `/api/v1` prefix**. Join them against the server origin, not against a base
     URL that already ends in `/api/v1`.
@@ -359,7 +362,6 @@ def generate_insights(
     job = job_service.enqueue(
         doctor.doctor_id,
         visit_id=str(visit_id),
-        stop_after=options.stop_after,
         regenerate=options.regenerate,
         model=options.model,
     )
@@ -410,8 +412,7 @@ def latest_job(
     for an unknown visit, so the UI can tell "not generated yet" from "no such
     visit".
     """
-    visit_service.get_visit(conn, doctor.doctor_id, str(visit_id))  # 404 if unknown
-    job = jobs_repo.latest_for_visit(conn, doctor.doctor_id, str(visit_id))
+    job = visit_service.latest_job(conn, doctor.doctor_id, str(visit_id))
     if job is None:
         response.status_code = status.HTTP_204_NO_CONTENT
         return None

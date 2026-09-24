@@ -66,7 +66,6 @@ export function VisitLifecycle({
       onVisitChanged();
       try {
         const accepted = await generateInsights(updated.visit_id, {
-          stop_after: 3,
           regenerate: updated.has_insights,
         });
         onGenerationStarted(accepted.job_id);
@@ -91,7 +90,6 @@ export function VisitLifecycle({
     setBusy(true);
     try {
       const accepted = await generateInsights(visit.visit_id, {
-        stop_after: 3,
         regenerate: visit.has_insights,
       });
       onGenerationStarted(accepted.job_id);

@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { QueueTabs } from "../components/Tabs";
 import { DueBadge } from "../components/DueBadge";
 import { Menu } from "../components/Menu";
@@ -21,11 +22,16 @@ import { ApiError } from "@/lib/api/client";
 
 type StatusFilter = "open" | "resolved" | "dismissed" | "all";
 
+/** Matches the backend's default page size (app/services/pagination.py). */
+const PAGE_SIZE = 100;
+
 export function TodayPage() {
   const { stats, reload: reloadStats } = useStatsContext();
   const { showToast } = useToast();
+  const router = useRouter();
 
   const [followUps, setFollowUps] = useState<FollowUp[]>([]);
+  const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
@@ -41,8 +47,13 @@ export function TodayPage() {
     setLoading(true);
     setError(null);
     try {
-      const { items } = await listFollowUps({ status: statusFilter, sort });
+      const { items, total: matched } = await listFollowUps({
+        status: statusFilter,
+        sort,
+        limit: PAGE_SIZE,
+      });
       setFollowUps(items);
+      setTotal(matched);
     } catch {
       setError("Could not load the follow-ups queue.");
     } finally {
@@ -55,7 +66,12 @@ export function TodayPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [statusFilter, sort]);
 
-  const asOf = stats ? parseDateOnly(stats.as_of) : new Date();
+  // Memoised: a fresh Date on every render made it a changing dependency of the
+  // grouping useMemo below, which then recomputed every time.
+  const asOf = useMemo(
+    () => (stats ? parseDateOnly(stats.as_of) : new Date()),
+    [stats],
+  );
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -179,7 +195,12 @@ export function TodayPage() {
         </button>
       </div>
 
-      <div className="stat-row" aria-hidden="true">
+      {/* Not aria-hidden. These numbers are the reason the screen exists, and
+          hiding them left a screen reader with no summary at all. Plain divs
+          rather than a <dl>: the design puts the number above its label, and a
+          <dl> would need the <dt> first to be valid, which inverts the reading
+          order to fix markup nobody was reading. */}
+      <div className="stat-row">
         <div className="stat-chip">
           <div className="stat-num">{stats?.follow_ups.open ?? "—"}</div>
           <div className="stat-label">Open follow-ups</div>
@@ -248,12 +269,18 @@ export function TodayPage() {
             </select>
           </div>
           <div className="spacer" />
-          {statusFilter === "open" && (
-            <span className="muted" style={{ fontSize: 12.5 }}>
-              {followUps.length} open &middot; {overdueCount} overdue &middot;{" "}
-              {needsConfirmationCount} needs confirmation
-            </span>
-          )}
+          <span className="muted" style={{ fontSize: 12.5 }}>
+            {statusFilter === "open" ? (
+              <>
+                {total} open &middot; {overdueCount} overdue &middot;{" "}
+                {needsConfirmationCount} needs confirmation
+              </>
+            ) : (
+              <>Showing {filtered.length} of {total}</>
+            )}
+            {followUps.length < total && " \u2014 showing the first " +
+              followUps.length}
+          </span>
         </div>
 
         {error && <div className="error-banner">{error}</div>}
@@ -304,6 +331,7 @@ export function TodayPage() {
                     onMarkContacted={markContacted}
                     onDismiss={setDismissFor}
                     onReopen={reopen}
+                    onOpenRecord={(f) => router.push(`/patients/${f.patient_id}`)}
                   />
                 ))}
               </tbody>
@@ -360,6 +388,7 @@ function FollowUpGroup({
   onMarkContacted,
   onDismiss,
   onReopen,
+  onOpenRecord,
 }: {
   label: string | null;
   items: FollowUp[];
@@ -369,6 +398,7 @@ function FollowUpGroup({
   onMarkContacted: (f: FollowUp) => void;
   onDismiss: (f: FollowUp) => void;
   onReopen: (f: FollowUp) => void;
+  onOpenRecord: (f: FollowUp) => void;
 }) {
   return (
     <>
@@ -434,9 +464,7 @@ function FollowUpGroup({
                     },
                     {
                       label: "Open record",
-                      onClick: () => {
-                        window.location.href = `/patients/${f.patient_id}`;
-                      },
+                      onClick: () => onOpenRecord(f),
                     },
                   ]}
                 />

@@ -40,6 +40,7 @@ _SELECT = """
            v.insights_generated,
            v.completed_at,
            v.cancelled_at,
+           v.cancelled_reason,
            v.updated_at,
            p.doctor_id::text,
            p.first_name,
@@ -310,14 +311,20 @@ def update(
 ) -> Optional[VisitRow]:
     """Patch a visit. Only whitelisted columns may be changed.
 
-    Deliberately does not touch visit_status: status transitions go through
-    mark_completed() and mark_cancelled() so each one records its own timestamp.
+    `visit_status` is not in the whitelist, and that is the point: status
+    transitions go through mark_completed() and mark_cancelled() so each records
+    its own timestamp, and so cancelling goes through the service that reopens
+    the follow-ups it had resolved. It used to be here, which made the docstring
+    above it false and gave PATCH a way past all of that (§8.17).
+
+    The transcript columns are not here either. They are written by
+    set_transcript() and set_transcript_provider(), which are the only two
+    callers that know whether the bytes moved or only the row did.
 
     `patient_id` is not in the whitelist, so a visit cannot be moved to another
     patient — which would otherwise be a way to move it to another doctor.
     """
-    allowed = {"visit_date", "visit_time", "visit_type", "visit_status",
-               "transcript_path", "transcript_provider", "transcript_filename"}
+    allowed = {"visit_date", "visit_time", "visit_type"}
     updates = {k: v for k, v in changes.items() if k in allowed}
     if not updates:
         return get(conn, scope, visit_id)
@@ -446,15 +453,23 @@ def mark_completed(
     return get(conn, scope, visit_id)
 
 
-def mark_cancelled(conn: psycopg.Connection, scope: DoctorScope,
-                   visit_id: str) -> Optional[VisitRow]:
+def mark_cancelled(conn: psycopg.Connection, scope: DoctorScope, visit_id: str,
+                   reason: Optional[str] = None) -> Optional[VisitRow]:
+    """Cancel a visit, recording why if the doctor said.
+
+    `cancelled_at` uses coalesce so re-cancelling keeps the original time, but
+    `cancelled_reason` is overwritten: a second cancel with a better reason is a
+    correction, and the first one was never shown to anybody.
+    """
     conditions, params = _write_conditions(scope, visit_id)
+    params["cancelled_reason"] = reason
     with conn.cursor() as cur:
         cur.execute(
             f"""UPDATE visits
-                SET visit_status = 'cancelled',
-                    cancelled_at = coalesce(cancelled_at, now()),
-                    updated_at   = now()
+                SET visit_status     = 'cancelled',
+                    cancelled_at     = coalesce(cancelled_at, now()),
+                    cancelled_reason = %(cancelled_reason)s,
+                    updated_at       = now()
                 WHERE {' AND '.join(conditions)}""",
             params,
         )

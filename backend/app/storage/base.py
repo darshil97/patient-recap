@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Optional, Protocol, runtime_checkable
 
 from app.core.errors import TranscriptError
+from app.domain.transcripts import TRANSCRIPT_SUFFIX
 
 # transcripts/<uuid>.txt and nothing else.
 #
@@ -33,7 +34,15 @@ TRANSCRIPT_KEY_PATTERN = re.compile(
 )
 
 TRANSCRIPT_PREFIX = "transcripts"
-TRANSCRIPT_SUFFIX = ".txt"
+
+# TRANSCRIPT_SUFFIX is imported from app.domain.transcripts rather than declared
+# again here. It was defined in both, which is one definition too many for a
+# value that decides what the upload endpoint accepts *and* what both storage
+# backends will write: the two could disagree, and the failure would be a
+# transcript accepted by validation and then refused by the store. The direction
+# of the import is the one the layering allows — storage may depend on domain,
+# never the reverse (§7). Re-exported by the import above, so callers that
+# already read it from here are unaffected.
 
 
 class StorageError(TranscriptError):

@@ -4,6 +4,7 @@ import { useState } from "react";
 import { Modal, ModalBody, ModalFoot } from "../../components/Modal";
 import { createPatient, type Patient } from "@/lib/api/patients";
 import { ApiError } from "@/lib/api/client";
+import { useStatsContext } from "../../hooks/StatsContext";
 
 interface DuplicateInfo {
   message: string;
@@ -33,6 +34,12 @@ export function NewPatientModal({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [duplicate, setDuplicate] = useState<DuplicateInfo | null>(null);
+  const { stats } = useStatsContext();
+
+  // The server's date, via /stats. `new Date().toISOString()` is UTC, so east of
+  // Greenwich it returns yesterday for the first hours of every local day.
+  // Here it decided whether a baby born today could be registered at all.
+  const today = stats?.as_of ?? new Date().toISOString().slice(0, 10);
 
   const canSubmit = firstName.trim().length > 0 && dob.length > 0;
 
@@ -123,7 +130,7 @@ export function NewPatientModal({
               className="input"
               value={dob}
               onChange={(e) => setDob(e.target.value)}
-              max={new Date().toISOString().slice(0, 10)}
+              max={today}
             />
           </div>
           <div className="form-group">

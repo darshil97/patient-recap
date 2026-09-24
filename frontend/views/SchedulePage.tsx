@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { QueueTabs } from "../components/Tabs";
 import { Menu } from "../components/Menu";
@@ -16,6 +16,9 @@ import { Modal, ModalBody } from "../components/Modal";
 
 type NeedsAction = "needs_action" | "scheduled_only" | "all";
 
+/** Matches the backend's default page size (app/services/pagination.py). */
+const PAGE_SIZE = 100;
+
 export function SchedulePage() {
   const { stats, reload: reloadStats } = useStatsContext();
   const { showToast } = useToast();
@@ -26,51 +29,63 @@ export function SchedulePage() {
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<NeedsAction>("needs_action");
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [total, setTotal] = useState(0);
   const [uploadFor, setUploadFor] = useState<Visit | null>(null);
 
-  async function load() {
+  // "Needs action" is three states: scheduled but not held, completed without a
+  // transcript, and transcript present without a brief. The first is a status
+  // filter; the other two are exactly what `pending_only` means server-side. So
+  // the whole filter is expressible in query params.
+  //
+  // It used to fetch 200 rows and filter them in the browser, which quietly made
+  // the schedule wrong above 200 visits: rows that needed action were dropped
+  // before the filter ever saw them, and nothing said so.
+  const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const { items } = await listVisits({
-        status: filter === "scheduled_only" ? ["scheduled"] : undefined,
+      const page = await listVisits({
+        status:
+          filter === "scheduled_only"
+            ? ["scheduled"]
+            : filter === "needs_action"
+              ? ["scheduled", "completed"]
+              : undefined,
+        pendingOnly: filter === "needs_action" ? true : undefined,
         sort: "date_asc",
-        limit: 200,
+        limit: PAGE_SIZE,
       });
-      setVisits(items);
+      setVisits(page.items);
+      setTotal(page.total);
     } catch {
       setError("Could not load the visit schedule.");
     } finally {
       setLoading(false);
     }
-  }
+  }, [filter]);
 
   useEffect(() => {
     load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filter]);
+  }, [load]);
 
+  // Search stays client-side: /visits has no `q`, and adding one would need a
+  // backend change this does not justify. It searches the loaded page only,
+  // which the count below makes visible rather than silent.
   const filtered = useMemo(() => {
-    let base = visits;
-    if (filter === "needs_action") {
-      base = base.filter(
-        (v) =>
-          v.visit_status === "scheduled" ||
-          (v.visit_status === "completed" && !v.transcript_path) ||
-          (v.visit_status === "completed" && v.transcript_path && !v.has_insights),
-      );
-    }
     const q = search.trim().toLowerCase();
-    if (!q) return base;
-    return base.filter(
+    if (!q) return visits;
+    return visits.filter(
       (v) =>
         v.patient_name.toLowerCase().includes(q) ||
         (v.external_id ?? "").toLowerCase().includes(q),
     );
-  }, [visits, search, filter]);
+  }, [visits, search]);
 
   const groups = useMemo(() => {
-    const today = new Date().toISOString().slice(0, 10);
+    // The server's date, not the browser's. toISOString() is UTC, so east of
+    // Greenwich it reports yesterday for the first hours of every local day and
+    // a visit awaiting action would not be grouped as overdue until mid-morning.
+    const today = stats?.as_of ?? new Date().toISOString().slice(0, 10);
     const overdue: Visit[] = [];
     const byDate = new Map<string, Visit[]>();
     for (const v of filtered) {
@@ -91,7 +106,7 @@ export function SchedulePage() {
     if (overdue.length) result.push({ label: "Overdue action", items: overdue });
     result.push(...dateGroups);
     return result;
-  }, [filtered]);
+  }, [filtered, stats?.as_of]);
 
   async function handleComplete(visit: Visit) {
     setBusyId(visit.visit_id);
@@ -129,7 +144,6 @@ export function SchedulePage() {
     setBusyId(visit.visit_id);
     try {
       await generateInsights(visit.visit_id, {
-        stop_after: 3,
         regenerate: visit.has_insights,
       });
       showToast(`Compiling the brief for ${visit.patient_name}…`);
@@ -153,7 +167,6 @@ export function SchedulePage() {
       setUploadFor(null);
       try {
         await generateInsights(updated.visit_id, {
-          stop_after: 3,
           regenerate: updated.has_insights,
         });
       } catch (genErr) {
@@ -186,12 +199,17 @@ export function SchedulePage() {
     <div className="page">
       <div className="page-head">
         <div>
-          <h1 className="page-title">Today</h1>
+          <h1 className="page-title">Visit schedule</h1>
           <p className="page-sub">{formatDate(stats?.as_of)}</p>
         </div>
       </div>
 
-      <div className="stat-row" aria-hidden="true">
+      {/* Not aria-hidden. These numbers are the reason the screen exists, and
+          hiding them left a screen reader with no summary at all. Plain divs
+          rather than a <dl>: the design puts the number above its label, and a
+          <dl> would need the <dt> first to be valid, which inverts the reading
+          order to fix markup nobody was reading. */}
+      <div className="stat-row">
         <div className="stat-chip stat-chip--critical">
           <div className="stat-num">{scheduledCount}</div>
           <div className="stat-label">Scheduled, not yet held</div>
@@ -242,6 +260,10 @@ export function SchedulePage() {
             </select>
           </div>
           <div className="spacer" />
+          <span className="muted" style={{ fontSize: 12.5 }}>
+            Showing {filtered.length} of {total}
+            {visits.length < total && " — narrow the filter to see the rest"}
+          </span>
         </div>
 
         {error && <div className="error-banner">{error}</div>}
@@ -270,7 +292,7 @@ export function SchedulePage() {
               <p className="empty-title">No visits scheduled</p>
               <p className="empty-text">
                 When a patient confirms they are coming in, schedule the visit from a
-                patient's page. It will appear here until the consultation is completed
+                patient&rsquo;s page. It will appear here until the consultation is completed
                 and its transcript is in.
               </p>
             </div>

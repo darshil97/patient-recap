@@ -327,7 +327,7 @@ regression there is a real patient data leak, not a cosmetic bug.
 | `GOOGLE_API_KEY` | fallback if no numbered keys are set |
 | `GEMINI_MODEL` | model id, default `gemini-3.7-flash` |
 | `API_KEY` | shared secret for the API; unset leaves it open |
-| `CORS_ORIGINS` | comma-separated allowed origins, default `*` |
+| `CORS_ORIGINS` | allowed origins, default `*`. Accepts a bare value, a comma-separated list, or JSON |
 | `MAX_TRANSCRIPT_BYTES` | upload ceiling, default 262144 (256 KB) |
 | `TRANSCRIPT_STORAGE` | `local` or `neon_object_storage`; governs new uploads only |
 | `TRANSCRIPT_BUCKET` | bucket name, default `consultation-transcripts` |
@@ -359,14 +359,20 @@ so a client can generate types. Over plain HTTP the key travels in clear text, s
 real deployment needs TLS.
 
 **Transcript addresses are always derived from the visit id**, never from the
-client's filename, which is attacker-controlled. On disk that is enforced by
+client's filename and never from the request body. On disk that is enforced by
 resolving paths against the transcripts directory; in object storage there is no
 parent directory to be confined to, so a strict `transcripts/<uuid>.txt` pattern is
-checked on every read, write and delete.
+checked on every read, write and delete. `transcript_path` is not a request field
+on any endpoint — uploading is the only way a transcript is attached (§8.19).
 
-**`CORS_ORIGINS` still defaults to `*`.** It does not affect the app, whose traffic
-is same-origin through the BFF, but it must be narrowed before deployment — `*`
-cannot be combined with credentialed requests.
+**Status is a transition, not a field.** `PATCH /visits/{id}` corrects date, time
+and type only. `/complete` and `/cancel` are the only ways `visit_status` changes,
+because each does more than set a column — `/cancel` reopens the follow-ups that
+visit had resolved, and refuses once insights exist (§8.17).
+
+**`CORS_ORIGINS` defaults to `*` locally** and is narrowed to the Vercel origin on
+Render. It does not affect the app, whose traffic is same-origin through the BFF —
+`*` cannot be combined with credentialed requests in any case.
 
 ---
 
@@ -382,7 +388,15 @@ gotchas (HTTPS dev, auth theming).
 
 ## To Dos
   **Frontend | Backend**
-  - [ ] Note it in the docs as a pre-launch task alongside narrowing CORS and JWT verification
+  - [ ] Verify the Neon Auth JWT against the JWKS endpoint and take `doctor_id`
+        from the verified `sub`, so `API_KEY` stops being tenancy-bearing (§8.12).
+        The seam is `require_doctor` and nothing else.
+  - [ ] Validate `insights_json` against a schema at the write, so the frontend's
+        hand-written types stop being an unenforced assertion (§11)
+  - [ ] Move data loading off fetch-on-mount (Suspense + `use()`, or a query
+        library). Seven `react-hooks/set-state-in-effect` warnings track this.
+  - [ ] `visit_insights.transcript_sha256`, so the stale-brief warning compares
+        content rather than timestamps (§11)
   - [ ] Add transcript audio functionality
   - [ ] Add recording functionality
   - [ ] Deploy frontend on Vercel

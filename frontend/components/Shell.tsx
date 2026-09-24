@@ -18,8 +18,13 @@ export function Shell({ children }: { children: React.ReactNode }) {
   const { stats } = useStatsContext();
   const pathname = usePathname();
 
+  // "Today" renders the follow-up queue, so it badges the follow-up count. It
+  // used to badge a *visit* count -- scheduled plus awaiting transcript plus
+  // awaiting insights -- which is the Visit schedule tab's number, on a link
+  // that opens a different list. Two nav items claiming to be the same screen is
+  // confusing enough without the counts disagreeing about which one you are on.
   const openFollowUps = stats?.follow_ups.open;
-  const needsAction =
+  const scheduleNeedsAction =
     (stats?.visits.awaiting_transcript ?? 0) +
     (stats?.visits.awaiting_insights ?? 0) +
     (stats?.visits.scheduled ?? 0);
@@ -46,7 +51,9 @@ export function Shell({ children }: { children: React.ReactNode }) {
         <nav className="nav" aria-label="Main">
           <Link href="/" className={isTodayActive ? "active" : ""}>
             Today
-            {needsAction !== undefined && <span className="count">{needsAction}</span>}
+            {openFollowUps !== undefined && (
+              <span className="count">{openFollowUps}</span>
+            )}
           </Link>
           <Link
             href="/patients"
@@ -61,8 +68,8 @@ export function Shell({ children }: { children: React.ReactNode }) {
             className={pathname.startsWith("/schedule") ? "active" : ""}
           >
             Visit schedule
-            {stats?.visits.scheduled !== undefined && (
-              <span className="count">{stats.visits.scheduled}</span>
+            {stats?.visits !== undefined && (
+              <span className="count">{scheduleNeedsAction}</span>
             )}
           </Link>
           <Link href="/follow-ups" className={isFollowUpsActive ? "active" : ""}>

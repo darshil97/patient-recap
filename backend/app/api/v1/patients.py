@@ -16,12 +16,12 @@ import psycopg
 from fastapi import APIRouter, Depends, Query, Response, status
 
 from app.api.deps import CurrentDoctor, get_db, require_doctor
-from app.db.repositories import patients as patients_repo
 from app.schemas.common import ErrorResponse
 from app.schemas.follow_ups import FollowUpSummary
 from app.schemas.insights import InsightSummary
 from app.schemas.patients import PatientCreate, PatientOut, PatientUpdate
 from app.schemas.timeline import TimelineOut, TimelineVisit
+from app.services.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from app.schemas.visits import VisitOut
 from app.services import patient_service
 
@@ -76,7 +76,7 @@ def list_patients(
     q: Optional[str] = Query(default=None,
                              description="Match on name, clinic number or phone"),
     sort: str = Query(default="name", pattern="^(name|created_desc)$"),
-    limit: int = Query(default=100, ge=1, le=500),
+    limit: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(default=0, ge=0),
     conn: psycopg.Connection = Depends(get_db),
     doctor: CurrentDoctor = Depends(require_doctor),
@@ -85,14 +85,14 @@ def list_patients(
 
     The total is returned in `X-Total-Count` rather than wrapping the array in an
     envelope, because the header is additive and changing the body shape would
-    break existing callers. The count is scoped the same way as the list, so it
-    reports what this doctor can actually see.
+    break existing callers. It counts the same filters as the list and is scoped
+    identically, so `X-Total-Count` larger than the array means there are more
+    pages — not that the doctor is seeing someone else's patients.
     """
-    rows = patients_repo.list_all(conn, doctor.doctor_id, q=q, sort=sort,
-                                 limit=limit, offset=offset)
-    response.headers["X-Total-Count"] = str(
-        patients_repo.count_all(conn, doctor.doctor_id, q=q))
-    return [PatientOut.model_validate(r) for r in rows]
+    page = patient_service.list_patients(conn, doctor.doctor_id, q=q, sort=sort,
+                                         limit=limit, offset=offset)
+    response.headers["X-Total-Count"] = str(page.total)
+    return [PatientOut.model_validate(r) for r in page.items]
 
 
 @router.get(

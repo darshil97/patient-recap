@@ -19,10 +19,10 @@ import psycopg
 from fastapi import APIRouter, Depends, Query, Response
 
 from app.api.deps import CurrentDoctor, get_db, require_doctor
-from app.db.repositories import follow_ups as follow_ups_repo
 from app.schemas.common import ErrorResponse
 from app.schemas.follow_ups import FollowUpOut, FollowUpUpdate
 from app.services import follow_up_service
+from app.services.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 
 router = APIRouter(prefix="/follow-ups", tags=["follow-ups"],
                    dependencies=[Depends(require_doctor)])
@@ -43,7 +43,7 @@ def list_follow_ups(
     needs_confirmation: Optional[bool] = Query(default=None),
     patient_id: Optional[UUID] = Query(default=None),
     sort: str = Query(default="due_asc", pattern="^(due_asc|due_desc)$"),
-    limit: int = Query(default=100, ge=1, le=500),
+    limit: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(default=0, ge=0),
     conn: psycopg.Connection = Depends(get_db),
     doctor: CurrentDoctor = Depends(require_doctor),
@@ -57,18 +57,20 @@ def list_follow_ups(
     would go stale in a cached response, so it is derived client-side from
     `due_earliest`.
     """
-    kwargs = {
-        "status": status,
-        "due_before": due_before,
-        "due_after": due_after,
-        "needs_confirmation": needs_confirmation,
-        "patient_id": str(patient_id) if patient_id else None,
-    }
-    rows = follow_ups_repo.list_follow_ups(conn, doctor.doctor_id, sort=sort,
-                                           limit=limit, offset=offset, **kwargs)
-    response.headers["X-Total-Count"] = str(
-        follow_ups_repo.count_follow_ups(conn, doctor.doctor_id, **kwargs))
-    return [FollowUpOut.model_validate(r) for r in rows]
+    page = follow_up_service.list_follow_ups(
+        conn,
+        doctor.doctor_id,
+        status=status,
+        due_before=due_before,
+        due_after=due_after,
+        needs_confirmation=needs_confirmation,
+        patient_id=str(patient_id) if patient_id else None,
+        sort=sort,
+        limit=limit,
+        offset=offset,
+    )
+    response.headers["X-Total-Count"] = str(page.total)
+    return [FollowUpOut.model_validate(r) for r in page.items]
 
 
 @router.get(

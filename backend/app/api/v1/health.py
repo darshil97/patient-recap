@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-import psycopg
+import logging
+
 from fastapi import APIRouter, Depends
 
-from app.api.deps import get_db, require_auth
+from app.api.deps import require_auth
 from app.config import get_settings
+from app.db.pool import connection
 from app.llm.gemini import check_keys
 from app.schemas.common import HealthResponse, KeyHealth, KeyHealthResponse
+
+logger = logging.getLogger(__name__)
 
 # GET /health is deliberately unauthenticated so a monitor can check liveness
 # without holding the shared secret. It stays exempt from the doctor-identity gate
@@ -24,14 +28,33 @@ router = APIRouter(tags=["health"])
 
 
 @router.get("/health", response_model=HealthResponse, summary="Service health")
-def health(conn: psycopg.Connection = Depends(get_db)) -> HealthResponse:
+def health() -> HealthResponse:
+    """Liveness, plus one `SELECT 1` so a passing check means the DB is reachable.
+
+    The connection is borrowed *inside* the handler rather than through
+    `Depends(get_db)`. As a dependency it was acquired before the body ran, so
+    the one failure this route exists to report — the database being unreachable
+    — raised out of the dependency and returned a bare 500. The `degraded` branch
+    below could only ever fire for a database that accepted a connection and then
+    failed a `SELECT 1`, which is close to nothing.
+
+    The exception is logged, never returned. This route is deliberately
+    unauthenticated so a monitor can use it without holding the shared secret,
+    and psycopg's connection errors carry the host, user and database name.
+
+    Still 200 when degraded. UptimeRobot polls this every 12 minutes, which is
+    what keeps the Render instance warm *and* the Neon branch from suspending
+    (§9.5); a non-2xx here would turn every cold start into a page.
+    """
     settings = get_settings()
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1")
+        with connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
         database = "ok"
-    except Exception as exc:  # pragma: no cover
-        database = f"error: {exc}"
+    except Exception:
+        logger.exception("Health check could not reach the database")
+        database = "error"
 
     return HealthResponse(
         status="ok" if database == "ok" else "degraded",

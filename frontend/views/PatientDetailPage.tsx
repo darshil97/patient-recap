@@ -12,6 +12,9 @@ import { DismissDialog } from "../features/followUps/DismissDialog";
 import { formatDate, dueUrgency, parseDateOnly } from "../lib/dates";
 import { ApiError } from "@/lib/api/client";
 
+/** The three the backend accepts, plus "not specified". */
+type Gender = "male" | "female" | "others" | "";
+
 /** `patientId` arrives as a prop from app/patients/[patientId]/page.tsx, which
  *  awaits the route params on the server. */
 export function PatientDetailPage({ patientId }: { patientId: string }) {
@@ -402,8 +405,16 @@ function EditPatientModal({
   const [lastName, setLastName] = useState(patient.last_name ?? "");
   const [phone, setPhone] = useState(patient.phone ?? "");
   const [dob, setDob] = useState(patient.date_of_birth ?? "");
+  const [gender, setGender] = useState<Gender>(
+    (patient.gender as Gender) ?? "",
+  );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const { stats } = useStatsContext();
+
+  // The server's date. `new Date().toISOString()` is UTC, so east of Greenwich
+  // it reports yesterday for the first hours of every local day.
+  const today = stats?.as_of ?? new Date().toISOString().slice(0, 10);
 
   async function save() {
     setSaving(true);
@@ -414,6 +425,7 @@ function EditPatientModal({
         last_name: lastName || undefined,
         phone: phone || undefined,
         date_of_birth: dob || undefined,
+        gender: gender || undefined,
       });
       onSaved();
     } catch (err) {
@@ -456,7 +468,7 @@ function EditPatientModal({
                 className="input"
                 value={dob}
                 onChange={(e) => setDob(e.target.value)}
-                max={new Date().toISOString().slice(0, 10)}
+                max={today}
               />
             </div>
             <div className="form-group">
@@ -465,6 +477,30 @@ function EditPatientModal({
               </label>
               <input id="ep-phone" className="input" value={phone} onChange={(e) => setPhone(e.target.value)} />
             </div>
+          </div>
+          <div className="form-row">
+            <div className="form-group">
+              <label className="form-label" htmlFor="ep-gender">
+                Gender
+              </label>
+              {/* A dropdown, matching registration. This form had no gender
+                  field at all, so a value mistyped at registration could not be
+                  corrected here — and the backend accepted free text on PATCH
+                  while POST allowed only these three, so the one route that
+                  could write it was the one with no validation. */}
+              <select
+                id="ep-gender"
+                className="select"
+                value={gender}
+                onChange={(e) => setGender(e.target.value as Gender)}
+              >
+                <option value="">Not specified</option>
+                <option value="male">Male</option>
+                <option value="female">Female</option>
+                <option value="others">Other</option>
+              </select>
+            </div>
+            <div className="form-group" />
           </div>
         </div>
         <div className="modal-foot">

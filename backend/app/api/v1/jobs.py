@@ -20,7 +20,6 @@ import psycopg
 from fastapi import APIRouter, Depends, Query
 
 from app.api.deps import CurrentDoctor, get_db, require_doctor
-from app.db.repositories import jobs as jobs_repo
 from app.schemas.common import ErrorResponse
 from app.schemas.insights import JobOut
 from app.services import job_service
@@ -64,4 +63,4 @@ def list_jobs(
     previously returned every doctor's generation history in one response.
     """
     return [JobOut.model_validate(j)
-            for j in jobs_repo.list_recent(conn, doctor.doctor_id, limit=limit)]
+            for j in job_service.list_jobs(conn, doctor.doctor_id, limit=limit)]

@@ -30,6 +30,7 @@ from app.db.models import FollowUpRow, VisitRow
 from app.db.repositories import follow_ups as follow_ups_repo
 from app.db.tenancy import DoctorScope
 from app.domain.follow_up.models import SCHEDULED, ResolvedFollowUp
+from app.services.pagination import Page, clamp_limit
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,41 @@ def reopen_for_cancelled_visit(conn: psycopg.Connection, scope: DoctorScope,
         logger.info("Cancelling %s reopened %d follow-up(s): %s",
                     visit_id, len(reopened), ", ".join(reopened))
     return reopened
+
+
+def list_follow_ups(
+    conn: psycopg.Connection,
+    scope: DoctorScope,
+    status: Optional[str] = "open",
+    due_before: Optional[date] = None,
+    due_after: Optional[date] = None,
+    needs_confirmation: Optional[bool] = None,
+    patient_id: Optional[str] = None,
+    sort: str = "due_asc",
+    limit: Optional[int] = None,
+    offset: int = 0,
+) -> Page[FollowUpRow]:
+    """One page of the queue, with the matching total.
+
+    Every row here carries a patient's name and telephone number, so the count
+    beside it has to be scoped identically or the number itself says something
+    about another practice. Taking both from one set of arguments is what makes
+    that structural rather than a thing to remember.
+    """
+    limit = clamp_limit(limit)
+    filters = {
+        "status": status,
+        "due_before": due_before,
+        "due_after": due_after,
+        "needs_confirmation": needs_confirmation,
+        "patient_id": patient_id,
+    }
+    return Page(
+        items=follow_ups_repo.list_follow_ups(conn, scope, sort=sort,
+                                              limit=limit, offset=offset,
+                                              **filters),
+        total=follow_ups_repo.count_follow_ups(conn, scope, **filters),
+    )
 
 
 def get_follow_up(conn: psycopg.Connection, scope: DoctorScope,

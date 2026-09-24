@@ -62,7 +62,7 @@ GET    /api/v1/patients/{patient_id}/timeline whole record in one request
 POST   /api/v1/visits                         schedule a consultation
 GET    /api/v1/visits                         list (status/date filters, sort)
 GET    /api/v1/visits/{visit_id}              single visit
-PATCH  /api/v1/visits/{visit_id}              correct details
+PATCH  /api/v1/visits/{visit_id}              correct date/time/type only (§8.17)
 POST   /api/v1/visits/{visit_id}/complete     mark the consultation done
 POST   /api/v1/visits/{visit_id}/cancel       cancel, reopening its follow-ups
 
@@ -84,6 +84,15 @@ A visit is created *before* the consultation, so it starts with no transcript an
 `visit_status: scheduled`. Completion is explicit: uploading a transcript
 deliberately does **not** complete a visit (§8.17), and a transcript can only be
 attached to a visit that is already `completed`.
+
+`PATCH /visits/{id}` corrects a visit's own details — date, time, type — and
+**cannot** change `visit_status` or touch the transcript. `/complete` and
+`/cancel` are the only status transitions (§8.17); `POST /transcript` is the only
+way a transcript is attached (§8.19).
+
+Every list endpoint returns the total in `X-Total-Count`, and it counts the same
+filters as the list (§7). A total larger than the array means there are more
+pages, not that something is missing.
 
 Interactive docs at `/docs` once the server is running.
 
@@ -274,6 +283,8 @@ frontend/
 │   ├── api/
 │   │   ├── auth/[...path]/ Neon Auth handler
 │   │   └── [...path]/      the BFF proxy to FastAPI
+│   ├── error.tsx           route-level error boundary
+│   ├── global-error.tsx    for a throw in the root layout itself
 │   ├── globals.css         Tailwind + auth-ui theme + design-system.css
 │   └── design-system.css   the approved clinical design (accent tokens in :root)
 ├── views/                  the six page components, ported from the Vite app
@@ -282,6 +293,9 @@ frontend/
 │   ├── api/                openapi-fetch wrappers, same-origin only
 │   ├── auth/               server.ts (secrets) and client.ts (browser)
 │   └── types/api.d.ts      generated from /openapi.json
+├── tests/                  Vitest: dates, the polling hook, the BFF proxy
+├── eslint.config.mjs       Next's rule set; `npm run lint`
+├── vitest.config.ts
 ├── proxy.ts                route protection (middleware.ts on Next < 16)
 ├── legacy-vite/            the previous Vite SPA, kept for reference
 ├── design-history/         mockups and the design alternatives
@@ -306,11 +320,13 @@ protects every route except `/auth/*` and `/api/auth/*`; the BFF repeats the
 session check for its own requests, since middleware guards navigation and says
 nothing about a later fetch.
 
-Two things this depends on staying true: the OpenAPI schema at `/openapi.json` is
-the source of truth for types (`npm run gen:api`, don't hand-write), and
-`cors_origins` in `app/config.py` still allows everything. CORS no longer matters
-for the app itself now that traffic is same-origin through the BFF, but it must
-still be narrowed before deployment.
+One thing this depends on staying true: the OpenAPI schema at `/openapi.json` is
+the source of truth for types (`npm run gen:api`, don't hand-write).
+
+`cors_origins` still defaults to `*` for local development, but the deployment
+narrows it to the Vercel origin (§9.5). CORS does not matter for the app itself
+— traffic is same-origin through the BFF — so this is defence for the browser
+path nothing currently uses, not something the app relies on.
 
 `legacy-vite/` is the previous Vite SPA. It is kept only for reference and is
 excluded from the Next build and typecheck. It cannot reach the API any more,
@@ -433,7 +449,8 @@ One row per consultation, i.e. per transcript file.
 | `visit_date` | **Anchors all follow-up resolution.** Must be the real date. |
 | `visit_status` | scheduled / in_progress / completed / cancelled |
 | `transcript_path` | always `transcripts/<visit_id>.txt`; null until attached |
-| `insights_generated` | TRUE only after all layers succeed *and* the row is written |
+| `insights_generated` | TRUE only after all *three* layers succeed *and* the row is written |
+| `cancelled_reason` | why, in the doctor's words. NULL means not recorded, which is every visit cancelled before `sql/8_cancellation_reason.sql` |
 
 ### visit_insights
 One row per visit, `UNIQUE(visit_id)`. Promoted scalar columns for querying,
@@ -493,6 +510,22 @@ cli  ->  services
 `storage` are the edges that touch the outside world. `services` is the only place
 they meet — which is why the HTTP API and the batch CLI cannot drift apart in
 behaviour: they call the same functions.
+
+**That rule now holds for reads as well as writes.** Every list endpoint used to
+import its repository and call it directly, doing its own `count` for
+`X-Total-Count` alongside. Nothing was leaking — the repositories are scoped
+either way — but it left the page size, the cap, and the pairing of a list with
+its count written out once per endpoint and held together by nothing, which is
+how three screens each ended up choosing their own limit and filtering the
+remainder in the browser. Lists go through `services` now and return a `Page`
+(`app/services/pagination.py`): the rows, and the total for the *same* filters.
+`tests/test_api.py::test_routers_go_through_services_not_repositories` greps for
+regressions.
+
+`app/api/deps.py` is the one module under `api` that may touch a repository, and
+it is not a route: `require_doctor` is what *establishes* the scope every service
+below it takes as an argument, so it has to reach `doctors` before any service
+exists to ask.
 
 A `doctor_id` travels down that whole chain as an ordinary argument. `api`
 extracts it from the authenticated request context, `services` pass it through,
@@ -659,6 +692,21 @@ a real queue.
 `failed_quota` is a distinct status from `failed` because it is worth retrying
 unchanged once the daily limit resets, rather than investigating.
 
+**The API always runs all three layers.** `GenerateInsightsRequest` has no
+`stop_after`, and `insight_service.require_complete_brief()` refuses to persist a
+run that did not reach Layer 3. Both are needed and they guard different things.
+
+Layer 3 is the doctor-facing part and the frontend renders it straight out of
+`insights_json`, so a partial run wrote a row with no `layer_3` while
+`insights_repo.save` set `visits.insights_generated` TRUE in the same transaction
+(§8.7) — a visit that *claimed* to have a brief, and blanked the page when
+opened. Removing the request field closes the route a client could take; the
+guard at the write is what makes it true for the CLI too, which still has
+`--stop-after` and should, because iterating on an early prompt without paying
+for the whole chain is exactly what it is for. A partial CLI run now fails with
+`layer_output_error` and writes nothing, which is the honest outcome — the layer
+output is still printed as it goes.
+
 ### 8.10 Patient uniqueness is layered, and each layer has a different scope
 
 | Layer | Rule | Scope |
@@ -741,6 +789,18 @@ sign-in, which is what let `sql/7_multi_tenancy.sql` seed the first doctor. So:
 resolve by `auth_user_id`, fall back to email, and stamp the auth id onto the row
 the first time the two meet (§6).
 
+**The email fallback is one-way, and that matters more than it looks.** It may
+*claim* an unclaimed row; it may not serve a row already bound to a different
+`auth_user_id`. Without the second half, the fallback quietly inverted the whole
+preference order: a request presenting auth id B with doctor A's email resolved
+as doctor A, so anyone naming the right address got the tenant regardless of
+which account they were signed in as, and `auth_user_id` was decorative. `claim()`
+had `AND auth_user_id IS NULL` and so refused to re-*point* a claimed row — but
+nothing stopped that row being *read*. A mismatch is now `None`, which the
+dependency turns into 401, and is logged at warning: it means either an address
+moved between accounts or someone is presenting an email that is not theirs, and
+both need a human.
+
 Neither is ever accepted as a body or query param — `doctor_id` appears in no
 request schema, and a structural test asserts that.
 
@@ -818,12 +878,34 @@ This gives a free end-to-end correctness check: a visit's resolved
 
 ---
 
-### 8.17 Attaching a transcript does not complete a visit
+### 8.17 Status is a transition, not a field
 
 `PATCH /visits/{id}` used to force `visit_status = 'completed'` as a side effect
 of setting `transcript_path`. That contradicts an explicit Complete button and
 makes the real state depend on the order of two unrelated actions, so it was
 removed. Status changes go through `/complete` and `/cancel` only.
+
+**`visit_status` itself stayed settable through PATCH long after that, which
+undid most of the above.** `VisitUpdate` accepted it, the service forwarded it,
+and the repository's whitelist included it — directly under a docstring saying it
+deliberately did not. So `{"visit_status": "cancelled"}` reached the column while
+skipping everything `/cancel` exists to do: the refusal once insights exist, the
+reopening of the follow-ups that visit had resolved, and `cancelled_at`. A
+patient who still needed calling dropped off the queue with no error anywhere.
+`{"visit_status": "completed"}` left `completed_at` NULL and could revive a
+cancelled visit that `/complete` would have refused.
+
+It is gone from all three places. `VisitUpdate` is `visit_date`, `visit_time` and
+`visit_type`, and is the **one model in the API with `extra="forbid"`**: every
+field removed from it was previously *honoured*, so silently ignoring one would
+answer 200 to "cancel this visit" and do nothing. Elsewhere an unknown field is
+still ignored, which is right where it was never honoured (`transcript_provider`
+on `VisitCreate`).
+
+The test that should have caught this mocked `visit_service.update_visit`
+wholesale, so it only ever proved the *route* did not invent a status.
+`TestVisitLifecycleIsTransitionsOnly` asserts on the service, the schema, the
+OpenAPI document and the repository's whitelist source.
 
 The dependency runs the other way instead: **upload requires
 `visit_status = 'completed'`**, which is what makes an Add Transcript button
@@ -870,6 +952,22 @@ later as an opaque pipeline error.
 The file is written to `transcripts/{visit_id}.txt` and **never** under the
 client's filename, which is attacker controlled. Deriving the path from the visit
 id removes the whole class of problem rather than trying to sanitise it.
+
+**And the address is no longer client-supplied at all.** `VisitCreate` and
+`VisitUpdate` both used to accept a `transcript_path`, checked by resolving it
+inside the transcripts directory and stat-ing the file. That proves a file
+exists; it does not prove it is *yours*. The locator is
+`transcripts/<visit-uuid>.txt` with no `doctor_id` in it, deliberately (§8.22),
+so every valid visit uuid passes the check — including another doctor's. Pointing
+your own visit at their locator and reading it back through
+`GET /visits/{id}/transcript` returned their verbatim consultation.
+
+It was not reachable in the deployed configuration: object storage is the
+provider there and the local transcripts directory does not survive a Render
+restart, so the `is_file()` check failed. But that is an accident of deployment,
+not a boundary, and it would come back the first time a second doctor used
+`TRANSCRIPT_STORAGE=local`. Both fields are removed. Uploading is the only way a
+transcript is attached, and it derives the key from the visit id.
 
 One subtlety in the decoder: `utf-8-sig` is tried **before** `utf-8`. A byte-order
 mark is itself valid UTF-8, so plain `utf-8` succeeds and silently leaves a
@@ -1041,7 +1139,7 @@ daily quota bucket), `--stop-after`, `--stop-on-error`.
 Ctrl-C once stops after the visit in flight; twice abandons it immediately. Either
 way nothing partial is written and re-running skips completed visits.
 
-Schema is applied in numeric order, and migrations 1 through 7 are all applied
+Schema is applied in numeric order, and migrations 1 through 8 are all applied
 to the current database. `sql/7_multi_tenancy.sql` seeds the first doctor from an email set at the
 top of its section 2 and aborts on the placeholder, so a fresh database needs that
 line edited before running.
@@ -1058,6 +1156,8 @@ npm install
 npm run dev          # https://localhost:3000  — note the s
 npm run build        # production build
 npm run typecheck    # tsc --noEmit
+npm run lint         # eslint
+npm test             # vitest run
 npm run gen:api      # regenerate lib/types/api.d.ts from the live schema
 ```
 
@@ -1135,13 +1235,23 @@ the path Render must poll is the full `/api/v1/health`. This tripped the first
 deploy: Render's health check 404'd against the bare `/health` path even though
 the service was running correctly.
 
-**List-typed settings need JSON syntax in Render's env var UI, not comma or bare
-values.** `cors_origins` is `List[str]` in `app/config.py`, and pydantic-settings
-parses list-typed env vars as JSON before falling back to anything else. Setting
-`CORS_ORIGINS=*` fails at startup with a `SettingsError` /
-`JSONDecodeError: Expecting value`, because `*` is not valid JSON. The working
-value is `CORS_ORIGINS=["*"]`. This applies to any other list-typed setting
-(e.g. a multi-key `GOOGLE_API_KEY` list, §8.8) — same fix pattern.
+**List-typed settings used to need JSON syntax in Render's env var UI, and no
+longer do — but the reason is worth keeping.** pydantic-settings treats a
+`List[str]` field as complex and runs `json.loads()` on the raw environment value
+*inside the settings source*, which happens before any field validator. So
+`CORS_ORIGINS=*` failed at startup with `SettingsError` / `JSONDecodeError:
+Expecting value`, because `*` is not valid JSON, and only `CORS_ORIGINS=["*"]`
+worked.
+
+`cors_origins` is now `Annotated[List[str], NoDecode]` with a `_split_origins`
+validator (`app/config.py`), so it accepts a bare value (`*`), a comma-separated
+list (`a,b`) and JSON (`["a","b"]`) alike, and strips trailing slashes. Set it
+however reads best.
+
+**The original trap still applies to any *other* list-typed setting** that has
+not been given `NoDecode` — a multi-key `GOOGLE_API_KEY` list (§8.8), say. If a
+new one fails at startup with `JSONDecodeError`, this is why, and `NoDecode` plus
+a `mode="before"` validator is the fix.
 
 **Free-tier constraints that interact with this project's design:**
 
@@ -1257,7 +1367,9 @@ allowlist enforcement is expected to start mattering.
 
 ## 10. Testing approach
 
-Six files, 295 tests, all offline — no API calls, no database, no object storage.
+### Backend
+
+Six files, 348 tests, all offline — no API calls, no database, no object storage.
 
 `test_transcripts.py` covers the loader, the traversal guard, and upload
 validation, including the BOM case and that the client filename never reaches a
@@ -1301,7 +1413,48 @@ auth/tenancy suites, which are structured so they fail for the right reasons:
 - **`TestScopedRepositorySql`** — the other half of that boundary, asserting the
   queries themselves carry a doctor filter, so a refactor that keeps the argument
   but drops it from the `WHERE` fails here. Sources are read with whitespace
-  collapsed, because these helpers are called across line breaks.
+  collapsed, because these helpers are called across line breaks. It also holds
+  `test_routers_go_through_services_not_repositories` (§7).
+
+Four suites were added with the review fixes, each pinning a failure that had
+already happened rather than a hypothetical one:
+
+- **`TestVisitLifecycleIsTransitionsOnly`** — §8.17. Asserts on the service, the
+  schema, the OpenAPI document and the repository whitelist, because the test it
+  replaces mocked the service out and therefore could not see the bug.
+- **`TestTranscriptLocationIsServerDecided`** — §8.19 and §8.22 together: neither
+  `transcript_path` nor `transcript_provider` is a request field.
+- **`TestPartialBriefIsNotPersisted`** — §8.9. Includes an ordering assertion
+  that the guard runs before the upsert, since it is useless after it.
+- **`TestDoctorResolutionPrefersTheStableId`** — §8.12, both directions: an
+  unclaimed row is still claimed, a row claimed by another account is refused.
+
+Plus `TestCancellationReasonIsStored` and `TestHealthDoesNotLeakOrLie`.
+
+### Frontend
+
+Three files, 33 tests, `npm test` (Vitest + jsdom). There were none before, which
+is why every bug the review found here was found by reading.
+
+Deliberately narrow — these three modules hold logic rather than markup, and
+logic is what regresses silently:
+
+- `tests/dates.test.ts` — the overdue boundaries and the local-vs-UTC parsing
+  that decides whether the queue says "overdue".
+- `tests/useInsightJob.test.tsx` — that polling stops: on a terminal status, on
+  unmount (including when a request resolves *after* unmount, which is the actual
+  regression), after repeated failures, and immediately on a 401.
+- `tests/bffProxy.test.ts` — the header allowlist above all: that a
+  browser-supplied `X-Doctor-*` is dropped and the session's own values are what
+  reach FastAPI. Plus `X-Total-Count`, the verbatim multipart Content-Type, the
+  bodiless 204, and 504-vs-502.
+
+`npm run lint` is ESLint with Next's config. It reports seven warnings, all
+`react-hooks/set-state-in-effect` and all the same shape — fetch on mount, then
+setState — which is how all six views load their data. The rule is right; fixing
+it means moving to Suspense with `use()` or a query library, which is a change to
+every view and not one to make in passing. Downgraded to a warning with that
+reasoning in `eslint.config.mjs` rather than silenced per line.
 
 Conventions:
 
@@ -1336,6 +1489,16 @@ from "backend is broken", so the empty states matter more than they did when the
 only user had every patient.
 
 **`API_KEY` is tenancy-bearing** (§8.12). Rotating it is no longer just hygiene.
+
+**`insights_json` has no runtime validation anywhere, and the frontend now
+assumes that.** It is `Dict[str, Any]` in Pydantic, `Record<string, never>` out
+of openapi-typescript, and hand-typed in `frontend/lib/types/insightsJson.ts`
+from a real row. Every field in that file is optional on purpose: declaring them
+required did not make them present, it only stopped the compiler asking, and one
+absent key threw on first render and blanked the page. Prompts are data (§12), so
+editing one is enough to change what arrives. `InsightBrief` is additionally
+wrapped in an error boundary, so a payload it cannot render degrades to a card
+instead of taking the visit page — and its transcript — down with it.
 
 **Object storage is per-branch, and so is its credential.**
 `AWS_ENDPOINT_URL_S3` differs per branch, and a credential minted on the default
@@ -1393,7 +1556,9 @@ redirect URI `{NEON_AUTH_BASE_URL}/callback/google` — not the app's URL.
 Deliberately deferred; a new client also starts in Testing status where only listed
 test users can sign in.
 
-**`CORS_ORIGINS` defaults to `*`** on local and **["https://patient-recap.vercel.app"]** on Render.
+**`CORS_ORIGINS` defaults to `*`** locally and is narrowed to
+`https://patient-recap.vercel.app` on Render. Any of the three syntaxes works
+now (§9.5), so a bare origin is fine — it does not have to be JSON.
 
 **Corpus blind spot.** Every follow-up in the seeded transcripts is *relative*
 ("three weeks"), so the absolute-date branch of the resolver has unit-test coverage
@@ -1444,6 +1609,14 @@ you extract changes.
   `TranscriptStore` and is registered in `factory.get_store`; everything
   provider-independent (upload validation, the completed-visit rule, the
   insights-exist rule) stays in `transcript_service` (§8.22).
+- A new list endpoint goes through a service and returns a `Page`
+  (`app/services/pagination.py`), never a bare list plus a separate count in the
+  route. A test greps for routers importing repositories (§7).
+- A field a client may send must be one the server will *honour*. If a request
+  field is removed because it was dangerous, prefer refusing it to ignoring it —
+  a 200 that silently did nothing is worse than a 422 (§8.17).
+- Anything the model produced is optional on the frontend until something
+  validates it. See §11 on `insights_json`.
 - Comment the *why*, not the *what*, especially for the counter-intuitive items
   in §8. Several of them look like mistakes without their rationale.
 

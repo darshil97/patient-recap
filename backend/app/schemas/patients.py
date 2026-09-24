@@ -59,7 +59,11 @@ class PatientUpdate(BaseModel):
     first_name: Optional[str] = Field(default=None, min_length=1, max_length=100)
     last_name: Optional[str] = Field(default=None, max_length=100)
     date_of_birth: Optional[date] = None
-    gender: Optional[str] = Field(default=None, max_length=32)
+    # The same Literal as PatientCreate. It was a free string here, so the one
+    # route that could change gender was the one that did not validate it: POST
+    # allowed three values, PATCH allowed anything up to 32 characters.
+    gender: Optional[Literal["male", "female", "others"]] = None
+
     phone: Optional[str] = Field(default=None, max_length=32)
     email: Optional[EmailStr] = None
 

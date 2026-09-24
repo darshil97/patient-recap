@@ -233,14 +233,55 @@ class TestScheduleVisit(ApiTestCase):
         self.assertEqual(response.status_code, 422)
 
 
-class TestTranscriptProviderIsServerDecided(ApiTestCase):
-    """A client cannot choose, or lie about, where the server stores bytes.
+class TestTranscriptLocationIsServerDecided(ApiTestCase):
+    """A client cannot choose, or lie about, *where* a transcript lives.
 
-    Same category as a client-supplied doctor_id: naming a server-side decision it
-    has no business naming. Worse here in one way — claiming a provider that does
-    not actually hold the transcript makes the visit ungeneratable, because the read
-    routes on that value (§8.22).
+    Two fields, same category as a client-supplied doctor_id: naming a
+    server-side decision the caller has no business naming.
+
+    `transcript_provider` — claiming a backend that does not hold the bytes makes
+    the visit ungeneratable, because the read routes on that value (§8.22).
+
+    `transcript_path` — worse. The only check it could be given is that it
+    resolves inside `transcripts/`, which proves a file exists but not that it is
+    *yours*; the locator is `transcripts/<visit-uuid>.txt` with no doctor_id in
+    it, by design, so any valid visit uuid passes. One doctor could point their
+    own visit at another doctor's transcript and read a verbatim consultation
+    back through GET /visits/{id}/transcript. The address is now derived from
+    visit_id at upload time and nowhere else (§8.19).
     """
+
+    def test_visit_create_has_no_transcript_path_field(self):
+        from app.schemas.visits import VisitCreate
+
+        self.assertNotIn("transcript_path", VisitCreate.model_fields)
+
+    def test_visit_update_has_no_transcript_path_field(self):
+        from app.schemas.visits import VisitUpdate
+
+        self.assertNotIn("transcript_path", VisitUpdate.model_fields)
+
+    def test_a_client_supplied_path_is_ignored_on_create(self):
+        with mock.patch("app.services.visit_service.schedule_visit",
+                        return_value=a_visit()) as create:
+            response = self.client.post(
+                "/api/v1/visits",
+                json={"patient_id": PATIENT_ID, "visit_date": "2026-02-16",
+                      "transcript_path": "transcripts/deadbeef.txt"})
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertNotIn("transcript_path", create.call_args.kwargs)
+
+    def test_a_client_supplied_path_is_refused_on_patch(self):
+        """422, not a silent 200: PATCH used to honour this, so ignoring it
+        would answer success to a request that attached nothing."""
+        with mock.patch("app.services.visit_service.update_visit",
+                        return_value=a_visit()) as patch_call:
+            response = self.client.patch(
+                f"/api/v1/visits/{VISIT_ID}",
+                json={"visit_type": "follow_up",
+                      "transcript_path": "../../etc/passwd"})
+        self.assertEqual(response.status_code, 422, response.text)
+        patch_call.assert_not_called()
 
     def test_visit_create_has_no_transcript_provider_field(self):
         from app.schemas.visits import VisitCreate
@@ -270,15 +311,16 @@ class TestTranscriptProviderIsServerDecided(ApiTestCase):
         self.assertEqual(response.status_code, 201, response.text)
         self.assertNotIn("transcript_provider", create.call_args.kwargs)
 
-    def test_a_client_supplied_provider_is_ignored_on_patch(self):
+    def test_a_client_supplied_provider_is_refused_on_patch(self):
+        """VisitUpdate forbids extras; VisitCreate still ignores them."""
         with mock.patch("app.services.visit_service.update_visit",
                         return_value=a_visit()) as patch_call:
             response = self.client.patch(
                 f"/api/v1/visits/{VISIT_ID}",
                 json={"visit_type": "follow_up",
                       "transcript_provider": "neon_object_storage"})
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertNotIn("transcript_provider", patch_call.call_args.kwargs)
+        self.assertEqual(response.status_code, 422, response.text)
+        patch_call.assert_not_called()
 
     def test_openapi_exposes_no_transcript_provider_request_field(self):
         """Structural, so re-adding it to a request model trips this."""
@@ -286,49 +328,92 @@ class TestTranscriptProviderIsServerDecided(ApiTestCase):
         for name in ("VisitCreate", "VisitUpdate"):
             props = schema["components"]["schemas"][name].get("properties", {})
             self.assertNotIn("transcript_provider", props, name)
+            self.assertNotIn("transcript_path", props, name)
 
 
-class TestAttachTranscript(ApiTestCase):
+class TestVisitLifecycleIsTransitionsOnly(ApiTestCase):
+    """PATCH corrects details. It cannot move a visit through its lifecycle.
 
-    def test_patch_attaches_transcript_without_completing_the_visit(self):
-        """Completion is an explicit transition now, so PATCH must not imply it.
+    `visit_status` used to be accepted here, and the damage was invisible:
+    `{"visit_status": "cancelled"}` skipped /cancel's refusal once insights
+    exist, skipped reopening the follow-ups that visit had resolved, and left
+    `cancelled_at` NULL. A patient who still needed calling simply dropped off
+    the queue, with no error anywhere. `{"visit_status": "completed"}` left
+    `completed_at` NULL and could revive a cancelled visit that /complete would
+    have refused.
 
-        An implicit status change would contradict the Complete button and make
-        the real state depend on the order of two unrelated actions.
-        """
-        updated = a_visit(transcript_path=f"transcripts/{VISIT_ID}.txt",
-                          transcript_provider="local",
-                          transcript_filename="riya_1.txt",
-                          visit_status="scheduled")
+    The old test here mocked visit_service.update_visit wholesale, so it only
+    ever proved the *route* did not invent a status — which is why the service
+    forwarding one went unnoticed. These assert on the service and the schema.
+    """
+
+    def test_patch_rejects_visit_status(self):
+        response = self.client.patch(f"/api/v1/visits/{VISIT_ID}",
+                                     json={"visit_status": "completed"})
+        self.assertEqual(response.status_code, 422, response.text)
+
+    def test_patch_rejects_a_status_smuggled_alongside_a_real_field(self):
+        """The 422 must come from the unknown field, not from an empty body."""
         with mock.patch("app.services.visit_service.update_visit",
-                        return_value=updated) as patch_call:
+                        return_value=a_visit()) as patch_call:
             response = self.client.patch(
                 f"/api/v1/visits/{VISIT_ID}",
-                json={"transcript_path": f"transcripts/{VISIT_ID}.txt"})
-        self.assertEqual(response.status_code, 200, response.text)
-        body = response.json()
-        self.assertEqual(body["transcript_path"], f"transcripts/{VISIT_ID}.txt")
-        self.assertEqual(body["visit_status"], "scheduled")
-        self.assertEqual(patch_call.call_args.kwargs["transcript_path"],
-                         f"transcripts/{VISIT_ID}.txt")
+                json={"visit_type": "follow_up", "visit_status": "cancelled"})
+        self.assertEqual(response.status_code, 422, response.text)
+        patch_call.assert_not_called()
+
+    def test_visit_update_schema_has_no_visit_status(self):
+        from app.schemas.visits import VisitUpdate
+
+        self.assertNotIn("visit_status", VisitUpdate.model_fields)
+
+    def test_openapi_exposes_no_visit_status_on_patch(self):
+        """Structural, so re-adding it to VisitUpdate trips this."""
+        schema = self.client.get("/openapi.json").json()
+        props = schema["components"]["schemas"]["VisitUpdate"].get("properties", {})
+        self.assertNotIn("visit_status", props)
+
+    def test_visit_create_still_accepts_a_status(self):
+        """Creation is not a transition: historical loads land as 'completed'."""
+        from app.schemas.visits import VisitCreate
+
+        self.assertIn("visit_status", VisitCreate.model_fields)
+
+    def test_the_service_never_writes_visit_status(self):
+        """The repository is the last line: nothing reaches it but details."""
+        from app.services import visit_service
+
+        with mock.patch("app.services.visit_service.visits_repo") as repo:
+            repo.get.return_value = a_visit()
+            repo.update.return_value = a_visit()
+            visit_service.update_visit(mock.MagicMock(), DOCTOR_A_ID,
+                                       VISIT_ID, visit_type="follow_up")
+        changes = repo.update.call_args.args[-1]
+        self.assertEqual(changes, {"visit_type": "follow_up"})
+
+    def test_update_visit_takes_no_status_argument(self):
+        """A caller that still passes one gets a TypeError, not a silent write."""
+        import inspect
+
+        from app.services import visit_service
+
+        params = inspect.signature(visit_service.update_visit).parameters
+        self.assertNotIn("visit_status", params)
+        self.assertNotIn("transcript_path", params)
+
+    def test_status_is_not_in_the_repository_whitelist(self):
+        """Read the source, so a refactor that re-widens `allowed` fails here."""
+        import inspect
+
+        from app.db.repositories import visits as visits_repo
+
+        source = " ".join(inspect.getsource(visits_repo.update).split())
+        self.assertIn('allowed = {"visit_date", "visit_time", "visit_type"}',
+                      source)
 
     def test_empty_patch_rejected(self):
         response = self.client.patch(f"/api/v1/visits/{VISIT_ID}", json={})
         self.assertEqual(response.status_code, 422)
-
-    def test_path_outside_transcripts_dir_is_422(self):
-        """No auth in front of this API, so traversal must be refused."""
-        from app.core.errors import TranscriptError
-
-        with mock.patch("app.services.visit_service.update_visit",
-                        side_effect=TranscriptError(
-                            "Transcript path resolves outside the allowed "
-                            "transcripts directory.")):
-            response = self.client.patch(
-                f"/api/v1/visits/{VISIT_ID}",
-                json={"transcript_path": "../../etc/passwd"})
-        self.assertEqual(response.status_code, 422)
-        self.assertEqual(response.json()["code"], "transcript_error")
 
 
 class TestGenerateInsights(ApiTestCase):
@@ -357,20 +442,41 @@ class TestGenerateInsights(ApiTestCase):
                         return_value=a_job()) as enqueue, \
              mock.patch("app.services.job_service.run_job"):
             self.client.post(f"/api/v1/visits/{VISIT_ID}/insights",
-                             json={"stop_after": 1, "regenerate": True,
+                             json={"regenerate": True,
                                    "model": "gemini-3.6-flash"})
         kwargs = enqueue.call_args.kwargs
-        self.assertEqual(kwargs["stop_after"], 1)
         self.assertTrue(kwargs["regenerate"])
         self.assertEqual(kwargs["model"], "gemini-3.6-flash")
+        # The API never asks for a partial run, so it never names stop_after and
+        # job_service's default of 3 stands.
+        self.assertNotIn("stop_after", kwargs)
         # The tenant is positional and comes from the request context, never the
         # body: GenerateInsightsRequest has no doctor field to override it with.
         self.assertEqual(enqueue.call_args.args[0], DOCTOR_A_ID)
 
-    def test_stop_after_out_of_range_rejected(self):
-        response = self.client.post(f"/api/v1/visits/{VISIT_ID}/insights",
-                                    json={"stop_after": 9})
-        self.assertEqual(response.status_code, 422)
+    def test_stop_after_is_not_a_request_field(self):
+        """A partial run writes a brief with no care plan, which the UI renders
+        directly and therefore cannot display at all. The knob stays on the CLI,
+        and insight_service refuses to persist the result either way."""
+        from app.schemas.insights import GenerateInsightsRequest
+
+        self.assertNotIn("stop_after", GenerateInsightsRequest.model_fields)
+
+        schema = self.client.get("/openapi.json").json()
+        props = (schema["components"]["schemas"]["GenerateInsightsRequest"]
+                 .get("properties", {}))
+        self.assertNotIn("stop_after", props)
+
+    def test_a_client_supplied_stop_after_is_ignored(self):
+        """Ignored rather than 422'd: it was only ever an optimisation, so an
+        older client asking for one still gets a complete, correct brief."""
+        with mock.patch("app.services.job_service.enqueue",
+                        return_value=a_job()) as enqueue, \
+             mock.patch("app.services.job_service.run_job"):
+            response = self.client.post(f"/api/v1/visits/{VISIT_ID}/insights",
+                                        json={"stop_after": 1})
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertNotIn("stop_after", enqueue.call_args.kwargs)
 
     def test_missing_transcript_is_409(self):
         with mock.patch("app.services.job_service.enqueue",
@@ -401,6 +507,70 @@ class TestGenerateInsights(ApiTestCase):
     def test_malformed_visit_id_is_422(self):
         response = self.client.post(f"/api/v1/visits/{MALFORMED_ID}/insights", json={})
         self.assertEqual(response.status_code, 422)
+
+
+class TestPartialBriefIsNotPersisted(unittest.TestCase):
+    """A run that did not reach Layer 3 must not be saved.
+
+    insights_repo.save sets visits.insights_generated TRUE in the same
+    transaction (§8.7), so a partial run produced a visit that *claims* to have a
+    brief while its insights_json had no `layer_3`. The frontend renders Layer 3
+    directly — chief_issue, the remedy, the watch-outs — so opening that visit
+    threw and blanked the page.
+
+    The HTTP API no longer offers stop_after at all, but the CLI still does,
+    correctly, for iterating on an early prompt. So the guarantee lives at the
+    write rather than in the absence of a request field.
+    """
+
+    def _result(self, layers):
+        from app.pipeline.layers import LAYERS
+        from app.pipeline.results import LayerResult, PatientContext, PipelineResult
+
+        result = PipelineResult(
+            patient=PatientContext(name="Riya", age=24, gender="Female",
+                                   call_date="2026-02-16"),
+            model="gemini-3.7-flash",
+            transcript_path=f"transcripts/{VISIT_ID}.txt",
+        )
+        for number, data in layers.items():
+            result.layers[number] = LayerResult(
+                spec=LAYERS[number], prompt="", raw_response="{}", data=data)
+        return result
+
+    def test_a_three_layer_run_is_accepted(self):
+        from app.services.insight_service import require_complete_brief
+
+        require_complete_brief(
+            self._result({1: {"a": 1}, 2: {"b": 2}, 3: {"chief_issue": "x"}}))
+
+    def test_a_run_that_stopped_at_layer_1_is_refused(self):
+        from app.core.errors import LayerOutputError
+        from app.services.insight_service import require_complete_brief
+
+        with self.assertRaises(LayerOutputError) as caught:
+            require_complete_brief(self._result({1: {"a": 1}}))
+        self.assertIn("Layer 3", str(caught.exception))
+
+    def test_a_layer_3_that_is_not_an_object_is_refused(self):
+        """extract_json returns whatever parsed: a list, a string, a number."""
+        from app.core.errors import LayerOutputError
+        from app.services.insight_service import require_complete_brief
+
+        for bad in ([], "some prose", 7, None):
+            with self.subTest(bad=bad), self.assertRaises(LayerOutputError):
+                require_complete_brief(
+                    self._result({1: {"a": 1}, 2: {"b": 2}, 3: bad}))
+
+    def test_it_runs_before_anything_is_written(self):
+        """Ordering matters: the guard is useless after the upsert."""
+        import inspect
+
+        from app.services import insight_service
+
+        source = inspect.getsource(insight_service.generate_for_visit)
+        self.assertLess(source.index("require_complete_brief(result)"),
+                        source.index("insights_repo.save("))
 
 
 class TestJobPolling(ApiTestCase):
@@ -586,7 +756,8 @@ class TestApiKeyAuth(unittest.TestCase):
 
     def test_health_stays_open(self):
         """A liveness monitor should not need the secret."""
-        response = self.client(self.KEY).get("/api/v1/health")
+        with mock.patch("app.api.v1.health.connection"):
+            response = self.client(self.KEY).get("/api/v1/health")
         self.assertNotEqual(response.status_code, 401)
 
     # -- enforcement off --------------------------------------------------- #
@@ -817,7 +988,8 @@ class TestDoctorIdentityAuth(unittest.TestCase):
     def test_health_stays_exempt(self):
         """A liveness probe is not a doctor. Requiring it to be one would stop
         monitoring distinguishing 'service down' from 'headers wrong'."""
-        response = self.client.get("/api/v1/health")
+        with mock.patch("app.api.v1.health.connection"):
+            response = self.client.get("/api/v1/health")
         self.assertNotEqual(response.status_code, 401)
 
     # -- present identity resolves ----------------------------------------- #
@@ -861,6 +1033,15 @@ class TestDoctorIdentityAuth(unittest.TestCase):
         self.assertEqual(build.call_args.args[1], DOCTOR_A_ID)
 
     # -- the key gate runs first ------------------------------------------- #
+
+    def test_an_email_bound_to_another_account_is_401(self):
+        """resolve() refuses when the email's row is claimed by a different auth
+        id; the dependency must turn that into a refusal, not a fallback."""
+        self.resolve.return_value = None
+        response = self.get_stats({"X-Doctor-Auth-Id": DOCTOR_B_AUTH_ID,
+                                   "X-Doctor-Email": DOCTOR_A_EMAIL})
+        self.assertEqual(response.status_code, 401, response.text)
+        self.assertEqual(response.json()["code"], "unauthorized")
 
     def test_a_bad_api_key_is_refused_before_any_doctor_row_is_touched(self):
         """require_doctor depends on require_auth, and the order matters: an
@@ -1294,6 +1475,183 @@ class TestCrossTenantIsolation(unittest.TestCase):
 import pathlib  # noqa: E402  used by the migration assertions below
 
 
+class TestDoctorResolutionPrefersTheStableId(unittest.TestCase):
+    """The email fallback is one-way: it can claim a row, never steal one.
+
+    `resolve()` prefers `auth_user_id` because email is mutable, then falls back
+    to email because email is the only thing knowable before a first sign-in
+    (§8.12). The fallback had no upper bound: a row already bound to auth id A
+    was still returned to a request presenting auth id B with that email, so any
+    caller naming the right address resolved the tenant regardless of which
+    account they were signed in as. `claim()` guarded the *write* — it will not
+    re-point a claimed row — but nothing guarded the *read*.
+    """
+
+    def setUp(self) -> None:
+        from app.db.repositories import doctors as doctors_repo
+
+        self.repo = doctors_repo
+        self.conn = mock.MagicMock()
+
+    def _row(self, **over):
+        from app.db.models import DoctorRow
+
+        fields = dict(doctor_id=DOCTOR_A_ID, email=DOCTOR_A_EMAIL,
+                      auth_user_id=DOCTOR_A_AUTH_ID, name="Doctor A")
+        fields.update(over)
+        return DoctorRow(**fields)
+
+    def test_a_known_auth_id_resolves_without_touching_email(self):
+        with mock.patch.object(self.repo, "get_by_auth_user_id",
+                               return_value=self._row()), \
+             mock.patch.object(self.repo, "get_by_email") as by_email:
+            found = self.repo.resolve(self.conn, auth_user_id=DOCTOR_A_AUTH_ID,
+                                      email=DOCTOR_A_EMAIL)
+        self.assertEqual(found.doctor_id, DOCTOR_A_ID)
+        by_email.assert_not_called()
+
+    def test_an_unclaimed_row_is_still_claimed_by_email(self):
+        """The seeded first doctor has no auth_user_id until they sign in."""
+        unclaimed = self._row(auth_user_id=None)
+        claimed = self._row(auth_user_id=DOCTOR_A_AUTH_ID)
+        with mock.patch.object(self.repo, "get_by_auth_user_id",
+                               return_value=None), \
+             mock.patch.object(self.repo, "get_by_email",
+                               return_value=unclaimed), \
+             mock.patch.object(self.repo, "claim",
+                               return_value=claimed) as claim:
+            found = self.repo.resolve(self.conn, auth_user_id=DOCTOR_A_AUTH_ID,
+                                      email=DOCTOR_A_EMAIL)
+        claim.assert_called_once_with(self.conn, DOCTOR_A_ID, DOCTOR_A_AUTH_ID)
+        self.assertEqual(found.auth_user_id, DOCTOR_A_AUTH_ID)
+
+    def test_a_row_claimed_by_another_account_is_refused(self):
+        """The whole point. None here becomes a 401 at the dependency."""
+        with mock.patch.object(self.repo, "get_by_auth_user_id",
+                               return_value=None), \
+             mock.patch.object(self.repo, "get_by_email",
+                               return_value=self._row()), \
+             mock.patch.object(self.repo, "claim") as claim, \
+             mock.patch.object(self.repo, "create") as create:
+            found = self.repo.resolve(self.conn,
+                                      auth_user_id=DOCTOR_B_AUTH_ID,
+                                      email=DOCTOR_A_EMAIL)
+        self.assertIsNone(found)
+        claim.assert_not_called()
+        create.assert_not_called()
+
+    def test_email_alone_still_resolves_a_claimed_row(self):
+        """No auth id to conflict with — this is the CLI and the seeded path."""
+        with mock.patch.object(self.repo, "get_by_email",
+                               return_value=self._row()):
+            found = self.repo.resolve(self.conn, auth_user_id=None,
+                                      email=DOCTOR_A_EMAIL)
+        self.assertEqual(found.doctor_id, DOCTOR_A_ID)
+
+
+class TestCancellationReasonIsStored(ApiTestCase):
+    """`reason` used to reach a log line and stop there.
+
+    The endpoint accepted it, the schema documented it, and nothing kept it — so
+    the only answer to "why was this consultation cancelled" was whichever log
+    file still existed.
+    """
+
+    def test_the_reason_reaches_the_service(self):
+        with mock.patch("app.services.visit_service.cancel_visit",
+                        return_value=a_visit(visit_status="cancelled")) as cancel:
+            response = self.client.post(f"/api/v1/visits/{VISIT_ID}/cancel",
+                                        json={"reason": "Patient rescheduled"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(cancel.call_args.kwargs["reason"],
+                         "Patient rescheduled")
+
+    def test_the_service_hands_it_to_the_repository(self):
+        from app.services import visit_service
+
+        cancelled = a_visit(visit_status="cancelled",
+                            cancelled_reason="Patient rescheduled")
+        with mock.patch("app.services.visit_service.visits_repo") as repo, \
+             mock.patch("app.services.visit_service.insights_repo") as insights, \
+             mock.patch("app.services.visit_service.follow_up_service"):
+            repo.get.return_value = a_visit()
+            repo.mark_cancelled.return_value = cancelled
+            insights.get_for_visit.return_value = None
+            visit_service.cancel_visit(mock.MagicMock(), DOCTOR_A_ID, VISIT_ID,
+                                       reason="  Patient rescheduled  ")
+        self.assertEqual(repo.mark_cancelled.call_args.args[-1],
+                         "Patient rescheduled")
+
+    def test_a_blank_reason_is_stored_as_null_not_empty(self):
+        """NULL means 'not recorded'; '' would claim 'cancelled, no reason'."""
+        from app.services import visit_service
+
+        with mock.patch("app.services.visit_service.visits_repo") as repo, \
+             mock.patch("app.services.visit_service.insights_repo") as insights, \
+             mock.patch("app.services.visit_service.follow_up_service"):
+            repo.get.return_value = a_visit()
+            repo.mark_cancelled.return_value = a_visit(visit_status="cancelled")
+            insights.get_for_visit.return_value = None
+            visit_service.cancel_visit(mock.MagicMock(), DOCTOR_A_ID, VISIT_ID,
+                                       reason="   ")
+        self.assertIsNone(repo.mark_cancelled.call_args.args[-1])
+
+    def test_it_is_returned_on_the_visit(self):
+        with mock.patch("app.services.visit_service.get_visit",
+                        return_value=a_visit(visit_status="cancelled",
+                                             cancelled_reason="Patient away")):
+            response = self.client.get(f"/api/v1/visits/{VISIT_ID}")
+        self.assertEqual(response.json()["cancelled_reason"], "Patient away")
+
+    def test_the_cancel_write_records_it(self):
+        """Read the SQL, so dropping the column from the UPDATE fails here."""
+        import inspect
+
+        from app.db.repositories import visits as visits_repo
+
+        source = " ".join(inspect.getsource(visits_repo.mark_cancelled).split())
+        self.assertIn("cancelled_reason = %(cancelled_reason)s", source)
+
+
+class TestHealthDoesNotLeakOrLie(ApiTestCase):
+    """The one route with no auth in front of it.
+
+    It reported the raw psycopg exception, which carries host, user and database
+    name. And its `degraded` branch was unreachable for the failure it exists to
+    report: the connection came from `Depends(get_db)`, so an unreachable
+    database raised out of the dependency and returned a bare 500 before the
+    handler ran.
+    """
+
+    def test_a_healthy_database_reports_ok(self):
+        with mock.patch("app.api.v1.health.connection"):
+            response = self.client.get("/api/v1/health")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["database"], "ok")
+
+    def test_an_unreachable_database_is_degraded_not_a_500(self):
+        with mock.patch("app.api.v1.health.connection",
+                        side_effect=RuntimeError("connection to server at "
+                                                 "\"ep-secret.neon.tech\" "
+                                                 "user=admin failed")):
+            response = self.client.get("/api/v1/health")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "degraded")
+
+    def test_the_exception_text_is_not_returned(self):
+        with mock.patch("app.api.v1.health.connection",
+                        side_effect=RuntimeError("connection to server at "
+                                                 "\"ep-secret.neon.tech\" "
+                                                 "user=admin failed")):
+            response = self.client.get("/api/v1/health")
+        body = response.text
+        self.assertNotIn("ep-secret", body)
+        self.assertNotIn("user=admin", body)
+        self.assertEqual(response.json()["database"], "error")
+
+
 class TestScopedRepositorySql(unittest.TestCase):
     """The other half of the boundary: the SQL itself must carry a doctor filter.
 
@@ -1438,6 +1796,30 @@ class TestScopedRepositorySql(unittest.TestCase):
                 offenders.append(str(path))
         self.assertEqual(offenders, [],
                          "ALL_DOCTORS must not appear under app/api/")
+
+    def test_routers_go_through_services_not_repositories(self):
+        """`api -> services -> db`, for reads as well as writes.
+
+        Every list endpoint used to call its repository directly and do its own
+        count, which left the page size, the cap, and the pairing of list with
+        count written out once per endpoint and held together by nothing. That is
+        how three screens ended up each choosing their own limit and filtering the
+        remainder in the browser.
+
+        `deps.py` is the one exception and is not a route: require_doctor is what
+        *establishes* the scope every service below it takes as an argument, so it
+        has to reach `doctors` before any service exists to ask.
+        """
+        import pathlib
+
+        api_dir = pathlib.Path(__file__).resolve().parent.parent / "app" / "api"
+        offenders = [
+            path.relative_to(api_dir).as_posix()
+            for path in api_dir.rglob("*.py")
+            if path.name != "deps.py"
+            and "from app.db.repositories" in path.read_text()
+        ]
+        self.assertEqual(offenders, [], f"routers reaching past services: {offenders}")
 
     def test_all_doctors_sentinel_cannot_be_reached_by_accident(self):
         """None must raise rather than quietly disabling the filter, so an unset

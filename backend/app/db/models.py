@@ -78,6 +78,7 @@ class VisitRow:
     transcript_uploaded_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     cancelled_at: Optional[datetime] = None
+    cancelled_reason: Optional[str] = None
     updated_at: Optional[datetime] = None
     # Joined from patients, not stored on visits. A visit's tenant is derived
     # through its patient (§6), so this is read-only provenance: knowing which

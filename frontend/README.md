@@ -47,7 +47,10 @@ Three details in that proxy are load-bearing:
 - multipart bodies are forwarded as **raw bytes** with the incoming `Content-Type`
   copied verbatim — re-encoding would mint a boundary that no longer matches the
   body, breaking transcript upload
-- `X-Total-Count` is copied onto the response, or paginated lists lose their totals
+- `X-Total-Count` is copied onto the response, or paginated lists lose their totals.
+  It counts the same filters as the list, so a total larger than the array means
+  there are more pages — send `limit` / `offset`, do not assume you have them all.
+  Default page size is 100, maximum 500.
 - `204`/`205`/`304` are returned without a body, because constructing one throws
 
 ## Generate the client, don't hand-write it
@@ -122,12 +125,16 @@ Schedule -> Complete -> Add Transcript -> Generate Insights
 A visit is created **before** the consultation, so it starts
 `visit_status: "scheduled"` with no transcript. Each step is its own action:
 
-- `PATCH /visits/{id}` does **not** complete a visit. Only `/complete` does.
+- `PATCH /visits/{id}` corrects **date, time and type only**. It does not accept
+  `visit_status` or `transcript_path` — both are rejected with a 422 rather than
+  ignored, because both used to be honoured and a silent 200 would be worse.
+  Only `/complete` and `/cancel` change status.
 - **Upload requires the visit to be `completed`** — a 409 otherwise. That is what
   makes an Add Transcript button legitimately disabled until then.
 - `/complete` is idempotent, so no need to guard a double click.
 - `/cancel` reopens any follow-up that visit had resolved, and is refused (409)
-  once insights exist.
+  once insights exist. Its optional `reason` is stored on the visit and comes
+  back as `cancelled_reason` (NULL = not recorded).
 
 ### Transcripts are `.txt` only
 
@@ -260,6 +267,28 @@ indicator can show real movement rather than a spinner.
 rate limited, which is expected on the free tier and worth retrying unchanged
 tomorrow — not a bug to report. Distinguish it from `failed`, which needs looking
 at.
+
+The request body takes `regenerate` and `model`. There is **no `stop_after`**:
+all three layers always run, because Layer 3 is the part this UI renders and a
+run that stopped earlier produced a brief with nothing to show.
+
+**A failed job does not invalidate the brief that is already stored.** Insights
+are upserted one row per visit, so a failed *re*generation leaves the previous
+brief exactly as it was. Show the failure as a banner above it, not instead of
+it — gate the brief on `queued`/`running`, not on the last job having succeeded.
+
+### `insights_json` is not validated
+
+The column is `Dict[str, Any]` on the backend and comes through
+openapi-typescript as an opaque object, so `lib/types/insightsJson.ts` is a
+hand-written assertion, not a guarantee. **Every field in it is optional**, and
+that is deliberate: declaring them required did not make them present, it only
+stopped the compiler asking, and one missing key threw on first render and
+blanked the page. Prompts are data and can be edited, so the shape can change
+without any code changing.
+
+Treat anything under `insights_json` as possibly absent, and keep `InsightBrief`
+inside its error boundary. `app/error.tsx` catches the rest.
 
 ## Errors
 

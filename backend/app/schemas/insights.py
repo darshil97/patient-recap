@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any, Dict, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 
 class GenerateInsightsRequest(BaseModel):
@@ -14,11 +14,15 @@ class GenerateInsightsRequest(BaseModel):
     The transcript is not sent: it is loaded by reference from the visit's
     transcript_path, and patient facts come from the database, so nothing about
     the clinical content is client-supplied here.
-    """
 
-    # Highest layer to run. Lower it to iterate on an early prompt without
-    # paying for the whole chain.
-    stop_after: int = Field(default=3, ge=1, le=3)
+    There is deliberately no `stop_after`. A brief is only meaningful once all
+    three layers have run -- Layer 3 is the doctor-facing part, and the frontend
+    renders it directly -- so a partial run produced an `insights_json` with no
+    `layer_3` while still flipping `insights_generated` to TRUE, and opening that
+    visit crashed the page. The knob still exists where it is useful: on
+    `cli/load_insights.py --stop-after`, which is operator-only and used for
+    iterating on an early prompt without paying for the whole chain.
+    """
 
     # Rebuild insights that already exist. Without this a second submit is a 409.
     regenerate: bool = False

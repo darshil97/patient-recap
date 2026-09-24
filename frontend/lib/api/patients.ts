@@ -6,11 +6,26 @@ export type PatientCreate = components["schemas"]["PatientCreate"];
 export type PatientUpdate = components["schemas"]["PatientUpdate"];
 export type Timeline = components["schemas"]["TimelineOut"];
 
-export async function listPatients(params?: {
+export interface ListPatientsParams {
   q?: string;
-}): Promise<{ items: Patient[]; total: number }> {
+  /** Server-side, so it orders the whole list and not just the page. */
+  sort?: "name" | "created_desc";
+  limit?: number;
+  offset?: number;
+}
+
+export async function listPatients(
+  params: ListPatientsParams = {},
+): Promise<{ items: Patient[]; total: number }> {
   const result = await api.GET("/api/v1/patients", {
-    params: { query: { q: params?.q } },
+    params: {
+      query: {
+        q: params.q,
+        sort: params.sort,
+        limit: params.limit,
+        offset: params.offset,
+      },
+    },
   });
   const items = unwrap(result);
   const totalHeader = result.response.headers.get("X-Total-Count");

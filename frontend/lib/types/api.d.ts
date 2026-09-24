@@ -11,7 +11,25 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Service health */
+        /**
+         * Service health
+         * @description Liveness, plus one `SELECT 1` so a passing check means the DB is reachable.
+         *
+         *     The connection is borrowed *inside* the handler rather than through
+         *     `Depends(get_db)`. As a dependency it was acquired before the body ran, so
+         *     the one failure this route exists to report — the database being unreachable
+         *     — raised out of the dependency and returned a bare 500. The `degraded` branch
+         *     below could only ever fire for a database that accepted a connection and then
+         *     failed a `SELECT 1`, which is close to nothing.
+         *
+         *     The exception is logged, never returned. This route is deliberately
+         *     unauthenticated so a monitor can use it without holding the shared secret,
+         *     and psycopg's connection errors carry the host, user and database name.
+         *
+         *     Still 200 when degraded. UptimeRobot polls this every 12 minutes, which is
+         *     what keeps the Render instance warm *and* the Neon branch from suspending
+         *     (§9.5); a non-2xx here would turn every cold start into a page.
+         */
         get: operations["health_api_v1_health_get"];
         put?: never;
         post?: never;
@@ -88,8 +106,9 @@ export interface paths {
          *
          *     The total is returned in `X-Total-Count` rather than wrapping the array in an
          *     envelope, because the header is additive and changing the body shape would
-         *     break existing callers. The count is scoped the same way as the list, so it
-         *     reports what this doctor can actually see.
+         *     break existing callers. It counts the same filters as the list and is scoped
+         *     identically, so `X-Total-Count` larger than the array means there are more
+         *     pages — not that the doctor is seeing someone else's patients.
          */
         get: operations["list_patients_api_v1_patients_get"];
         put?: never;
@@ -200,8 +219,9 @@ export interface paths {
          *     patient_id that does not exist — so the body cannot be used to probe for other
          *     practices' patient ids.
          *
-         *     `visit_number` is assigned sequentially when omitted. `transcript_path` is
-         *     optional because a scheduled visit has no recording yet; upload it later.
+         *     `visit_number` is assigned sequentially when omitted. A visit starts with no
+         *     transcript; upload one with `POST /visits/{visit_id}/transcript` once the
+         *     consultation is complete.
          *
          *     Scheduling also closes any open follow-up from an earlier visit for this
          *     patient, in the same transaction.
@@ -231,12 +251,15 @@ export interface paths {
         options?: never;
         head?: never;
         /**
-         * Update a visit's details
-         * @description Patch a visit's details.
+         * Correct a visit's details
+         * @description Correct a visit's date, time or type.
          *
-         *     Attaching a transcript here does **not** complete the visit: completion is an
-         *     explicit transition via `/complete`, so the status never changes as a side
-         *     effect of an unrelated action.
+         *     This cannot change `visit_status` and cannot touch the transcript.
+         *     Completion and cancellation are explicit transitions via `/complete` and
+         *     `/cancel`, which record their own timestamps and — for `/cancel` — reopen the
+         *     follow-ups that visit had resolved (§8.17). A transcript is attached by
+         *     uploading it to `/transcript`, which derives its storage address from the
+         *     visit id (§8.19).
          */
         patch: operations["update_visit_api_v1_visits__visit_id__patch"];
         trace?: never;
@@ -346,6 +369,9 @@ export interface paths {
          *
          *     202 rather than the finished insight because the chain is three sequential
          *     model calls, roughly a minute, which is past common proxy timeouts.
+         *
+         *     All three layers always run. A partial run produces a brief with no care plan
+         *     — the doctor-facing part — so there is no `stop_after` to ask for one.
          *
          *     `poll_url` and `insights_url` are **root-relative and already include the
          *     `/api/v1` prefix**. Join them against the server origin, not against a base
@@ -666,13 +692,16 @@ export interface components {
          *     The transcript is not sent: it is loaded by reference from the visit's
          *     transcript_path, and patient facts come from the database, so nothing about
          *     the clinical content is client-supplied here.
+         *
+         *     There is deliberately no `stop_after`. A brief is only meaningful once all
+         *     three layers have run -- Layer 3 is the doctor-facing part, and the frontend
+         *     renders it directly -- so a partial run produced an `insights_json` with no
+         *     `layer_3` while still flipping `insights_generated` to TRUE, and opening that
+         *     visit crashed the page. The knob still exists where it is useful: on
+         *     `cli/load_insights.py --stop-after`, which is operator-only and used for
+         *     iterating on an early prompt without paying for the whole chain.
          */
         GenerateInsightsRequest: {
-            /**
-             * Stop After
-             * @default 3
-             */
-            stop_after: number;
             /**
              * Regenerate
              * @default false
@@ -928,7 +957,7 @@ export interface components {
             /** Date Of Birth */
             date_of_birth?: string | null;
             /** Gender */
-            gender?: string | null;
+            gender?: ("male" | "female" | "others") | null;
             /** Phone */
             phone?: string | null;
             /** Email */
@@ -1017,6 +1046,8 @@ export interface components {
             completed_at?: string | null;
             /** Cancelled At */
             cancelled_at?: string | null;
+            /** Cancelled Reason */
+            cancelled_reason?: string | null;
             /** Created At */
             created_at?: string | null;
             /** Updated At */
@@ -1094,8 +1125,6 @@ export interface components {
              * @default scheduled
              */
             visit_status: string;
-            /** Transcript Path */
-            transcript_path?: string | null;
         };
         /** VisitOut */
         VisitOut: {
@@ -1144,6 +1173,8 @@ export interface components {
             completed_at?: string | null;
             /** Cancelled At */
             cancelled_at?: string | null;
+            /** Cancelled Reason */
+            cancelled_reason?: string | null;
             /** Created At */
             created_at?: string | null;
             /** Updated At */
@@ -1170,16 +1201,29 @@ export interface components {
         };
         /**
          * VisitUpdate
-         * @description Payload for PATCH /visits/{visit_id}.
+         * @description Payload for PATCH /visits/{visit_id}: correct a visit's own details.
          *
-         *     Mainly used to attach the transcript once the consultation has happened,
-         *     which also moves the visit to 'completed' unless a status is given.
+         *     Deliberately narrow. Three things it used to accept and no longer does:
+         *
+         *       * `visit_status` — status is a lifecycle transition, not a field. Setting it
+         *         here skipped everything the transitions exist to do: `/cancel`'s refusal
+         *         once insights exist, its reopening of the follow-ups that visit had
+         *         resolved, and the `completed_at` / `cancelled_at` stamps. A cancelled
+         *         visit whose follow-up was never reopened drops a patient who still needs
+         *         calling, with no error anywhere. Use `/complete` and `/cancel` (§8.17).
+         *       * `transcript_path` — see VisitCreate; the address is derived from visit_id
+         *         at upload time.
+         *       * `transcript_provider` — a server-side storage decision (§8.22).
+         *
+         *     `extra="forbid"`, which is deliberate and is the one place in the API that
+         *     does this. Everywhere else an unknown field is ignored, so an older client
+         *     keeps working — and that is right where the field was never honoured
+         *     (`transcript_provider` on VisitCreate). Here all three removed fields *were*
+         *     honoured. Ignoring them would answer 200 to "cancel this visit" and do
+         *     nothing, which is exactly the class of silent failure this change exists to
+         *     remove. A 422 naming the field says what happened.
          */
         VisitUpdate: {
-            /** Transcript Path */
-            transcript_path?: string | null;
-            /** Visit Status */
-            visit_status?: string | null;
             /** Visit Date */
             visit_date?: string | null;
             /** Visit Time */
@@ -1585,13 +1629,13 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
-            /** @description Bad transcript path */
+            /** @description Validation Error */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ErrorResponse"];
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -1669,13 +1713,13 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
-            /** @description Bad transcript path */
+            /** @description Validation Error */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ErrorResponse"];
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
