@@ -209,3 +209,47 @@ class JobRow:
     @property
     def is_terminal(self) -> bool:
         return self.status in ("succeeded", "failed", "failed_quota")
+
+
+@dataclass
+class AudioUploadRow:
+    """One chunked audio upload and, once stitched, the recording it produced."""
+
+    upload_id: str
+    visit_id: str
+    status: str
+    filename: Optional[str]
+    extension: str
+    total_bytes: int
+    chunk_bytes: int
+    chunk_count: int
+    replace_transcript: bool
+    storage_provider: str
+    audio_path: Optional[str]
+    duration_seconds: Optional[float]
+    speakers: Optional[Any]
+    warnings: Optional[Any]
+    error_code: Optional[str]
+    error_message: Optional[str]
+    worker_id: Optional[str] = None
+    chunks_received: int = 0
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+    @property
+    def is_receiving(self) -> bool:
+        return self.status == "receiving"
+
+    @property
+    def recording_stored(self) -> bool:
+        return bool(self.audio_path)
+
+    @property
+    def all_chunks_received(self) -> bool:
+        return self.recording_stored or self.chunks_received >= self.chunk_count
+
+    @property
+    def retryable(self) -> bool:
+        """A failed upload whose bytes are all still here can be processed again."""
+        return self.status == "failed" and self.all_chunks_received

@@ -681,7 +681,7 @@ class TestApiKeyAuth(unittest.TestCase):
         tenant.
         """
         settings = mock.MagicMock()
-        settings.api_key = api_key
+        settings.api.key = api_key
         patcher = mock.patch("app.api.deps.get_settings", return_value=settings)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -882,7 +882,7 @@ class TestDoctorIdentityAuth(unittest.TestCase):
         from app.main import create_app
 
         settings = mock.MagicMock()
-        settings.api_key = None  # key gate off; this suite is about the tenant
+        settings.api.key = None  # key gate off; this suite is about the tenant
         key_patch = mock.patch("app.api.deps.get_settings", return_value=settings)
         key_patch.start()
         self.addCleanup(key_patch.stop)
@@ -1048,7 +1048,7 @@ class TestDoctorIdentityAuth(unittest.TestCase):
         unauthenticated request must not be able to create rows in `doctors` by
         presenting a new email, which would be an unauthenticated write."""
         settings = mock.MagicMock()
-        settings.api_key = "the-real-key"
+        settings.api.key = "the-real-key"
         with mock.patch("app.api.deps.get_settings", return_value=settings):
             response = self.client.get(
                 "/api/v1/stats",
@@ -1086,7 +1086,7 @@ class TestCrossTenantIsolation(unittest.TestCase):
         from app.main import create_app
 
         settings = mock.MagicMock()
-        settings.api_key = None
+        settings.api.key = None
         key_patch = mock.patch("app.api.deps.get_settings", return_value=settings)
         key_patch.start()
         self.addCleanup(key_patch.stop)

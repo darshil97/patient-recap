@@ -67,6 +67,11 @@ POST   /api/v1/visits/{visit_id}/complete     mark the consultation done
 POST   /api/v1/visits/{visit_id}/cancel       cancel, reopening its follow-ups
 
 POST   /api/v1/visits/{visit_id}/transcript   upload the .txt (multipart)
+POST   /api/v1/visits/{visit_id}/audio-uploads   or a recording: start, get chunk plan (§8.23)
+PUT    /api/v1/audio-uploads/{upload_id}/chunks/{index}   one chunk, idempotent
+POST   /api/v1/audio-uploads/{upload_id}/finish   stitch + transcribe -> 202 (also retries)
+GET    /api/v1/audio-uploads/{upload_id}          poll until completed | failed
+GET    /api/v1/visits/{visit_id}/audio-upload     latest, to resume polling (204 if none)
 GET    /api/v1/visits/{visit_id}/transcript   read it back
 DELETE /api/v1/visits/{visit_id}/transcript   remove it
 
@@ -141,8 +146,8 @@ follow-up are stored under `visit_insights.insights_json`.
 | Language | Python 3.11 |
 | Environment | conda env **`reels`** (`/opt/anaconda3/envs/reels/bin/python`) |
 | API | FastAPI + uvicorn |
-| Validation / settings | Pydantic 2, pydantic-settings |
-| LLM | Google Gemini via `langchain-google-genai` |
+| Validation / settings | Pydantic 2; `config.yaml` (PyYAML) + `.env` secrets (python-dotenv) |
+| LLM | Google Gemini via `langchain-google-genai`, or Amazon Bedrock via `langchain-aws` (`llm.provider`) |
 | LLM framework | `langchain-core` (messages only — see §8.1) |
 | Prompt templating | Jinja2 |
 | Database | Neon serverless Postgres 18 |
@@ -206,7 +211,7 @@ sometimes a wrapper whose child outlives it.
 backend/
 ├── app/
 │   ├── main.py                  FastAPI app factory, lifespan, CORS
-│   ├── config.py                all settings in one typed place
+│   ├── config.py                loads config.yaml (+ .env secrets) into typed settings
 │   ├── api/
 │   │   ├── deps.py              DI: pooled connection, API key + doctor identity
 │   │   ├── errors.py            AppError -> HTTP status, in one place
@@ -215,14 +220,18 @@ backend/
 │   ├── domain/                  pure logic, zero I/O
 │   │   ├── follow_up/           models.py + resolver.py
 │   │   ├── transcripts.py       loading + path-traversal guard
+│   │   ├── diarization.py       speaker turns -> DOCTOR:/PATIENT:/OTHER: text (§8.23)
 │   │   └── identity.py          external_id, name/phone normalisation
 │   ├── pipeline/                layers, prompts, parsing, results, runner
 │   ├── storage/                 where the .txt lives: local disk or a Neon bucket
 │   │   ├── base.py              the store contract + the locator guard
 │   │   ├── local.py             backend/transcripts/{visit_id}.txt
 │   │   ├── object_store.py      Neon Object Storage via boto3
-│   │   └── factory.py           picks a backend from visits.transcript_provider
-│   ├── llm/                     gemini.py (multi-key client), errors.py
+│   │   ├── factory.py           picks a backend from visits.transcript_provider
+│   │   └── audio.py             upload chunks + recordings (bytes), same two backends
+│   ├── speech/deepgram.py       recording -> diarized utterances, over REST (§8.23)
+│   ├── llm/                     factory.py (reads llm.provider), errors.py, base.py
+│   │   └── providers/           gemini.py, bedrock.py: LangChain chat models
 │   ├── db/
 │   │   ├── pool.py              connection pool
 │   │   ├── models.py            row dataclasses
@@ -239,7 +248,7 @@ backend/
 │   ├── load_insights.py         batch runner over the same services
 │   ├── migrate_transcripts.py   move transcripts between storage backends
 │   ├── render_prompt.py         render a prompt, no model, no DB
-│   ├── check_keys.py            which API keys are usable
+│   ├── check_keys.py            does the model provider's key work
 │   └── convert_transcripts.py   one-off JSON -> .txt migration (already run)
 │
 ├── archive/transcripts_json/    the 16 original synthetic transcripts, tracked
@@ -254,11 +263,14 @@ backend/
 │   ├── 5_api_support.sql        migration: external_id, insight_jobs
 │   ├── 6_frontend_support.sql   migration: lifecycle columns, follow_ups
 │   ├── 7_multi_tenancy.sql      migration: doctors, patients.doctor_id
+│   ├── 8_cancellation_reason.sql migration: visits.cancelled_reason
+│   ├── 9_audio_uploads.sql      migration: audio_uploads, audio_upload_chunks
 │   └── extra.sql                future tables, all commented out
 ├── tests/                       unittest suites
 ├── legacy/                      pre-refactor scripts, safe to delete
 ├── requirements.txt
-└── .env / .env.example
+├── config.yaml                  all non-secret settings, committed
+└── .env / .env.example          secrets only, referenced from config.yaml as ${NAME}
 ```
 
 `app/config.py` derives `BASE_DIR` as its own parent's parent, which is
@@ -370,8 +382,8 @@ generating the synthetic transcripts, so neither survives (§8.3).
 
 ## 6. Data model
 
-Six tables. `doctors` 1—N `patients` 1—N `visits` 1—1 `visit_insights`, plus
-`follow_ups` and `insight_jobs`.
+Eight tables. `doctors` 1—N `patients` 1—N `visits` 1—1 `visit_insights`, plus
+`follow_ups`, `insight_jobs`, and `audio_uploads` with its `audio_upload_chunks`.
 
 **`doctors` is the tenancy root, and it is the only place a doctor id is
 stored.** Everything else reaches its owner by following foreign keys it already
@@ -496,6 +508,15 @@ query in the application.
 unique index on `(visit_id) WHERE status IN ('queued','running')` means one visit
 cannot be processed twice at once, which would pay for two sets of API calls.
 `worker_id` identifies the process that claimed a job so orphans are detectable.
+
+### audio_uploads, audio_upload_chunks
+One row per recording upload (§8.23), tenancy derived through `visit_id` like
+`insight_jobs`. `status` is receiving / processing / completed / failed /
+abandoned / superseded. Two partial unique indexes: one upload in flight per visit,
+and one stored recording per visit (`completed` with `audio_path`). The completed
+row is *the* visit recording; `speakers` and `warnings` hold its labelling for the
+UI. `audio_upload_chunks` lists the pieces received and is emptied once they are
+stitched.
 
 ---
 
@@ -657,24 +678,25 @@ The pending query keys off the flag but also treats a visit as pending if the
 flag is TRUE with no insight row — otherwise a deleted row would make a visit
 invisible forever.
 
-### 8.8 Multi-key rotation with three-way error classification
+### 8.8 Two providers, one key each, three-way error classification
 
-Free-tier Gemini keys are capped per day per model, and one full backfill needs
-more than a single key allows. `app/llm/gemini.py` holds several keys and sorts
-errors three ways, because they need different responses:
+`llm.provider` in `config.yaml` picks Gemini or Amazon Bedrock. Both are LangChain
+chat models built in `app/llm/providers/` (`ChatGoogleGenerativeAI`,
+`ChatBedrockConverse`), and `app/llm/factory.py` is the only code that reads the
+setting. Each provider has a single API key; the earlier multi-key rotation for
+Gemini's free tier is gone. Retries on throttling are left to each provider's own
+client (`llm.max_retries`).
+
+`app/llm/errors.py` still sorts failures three ways, by message text:
 
 | Kind | Example | Response |
 | --- | --- | --- |
-| quota / transient | 429, 503, deadline exceeded | try the next key |
-| key rejected | `API_KEY_INVALID`, 403, 401 | disable that key, try next |
-| request problem | unknown model, safety block | raise — another key fails alike |
+| quota / transient | 429, `RESOURCE_EXHAUSTED`, `ThrottlingException`, 503 | `QuotaExhaustedError` → 429, job `failed_quota` |
+| key rejected | `API_KEY_INVALID`, `AccessDeniedException`, 401 | reported as `bad_key` by `cli.check_keys` |
+| request problem | unknown model, safety block | raised as-is |
 
-The middle row is the important one. An invalid key is a problem with the *key*,
-not the request, so it must not abort a run that other keys could finish.
-
-Rotation is **sticky**: once a key works it keeps being used, wrapping around
-only when it fails. Restarting from key 1 every call would waste a round trip
-rediscovering that key 1 is exhausted.
+Bedrock's gpt-oss returns its reasoning as separate `reasoning_content` blocks.
+`AIMessage.text` leaves those out, so JSON parsing sees only the answer.
 
 ### 8.9 Insight generation is asynchronous
 
@@ -966,7 +988,7 @@ It was not reachable in the deployed configuration: object storage is the
 provider there and the local transcripts directory does not survive a Render
 restart, so the `is_file()` check failed. But that is an accident of deployment,
 not a boundary, and it would come back the first time a second doctor used
-`TRANSCRIPT_STORAGE=local`. Both fields are removed. Uploading is the only way a
+local transcript storage. Both fields are removed. Uploading is the only way a
 transcript is attached, and it derives the key from the visit id.
 
 One subtlety in the decoder: `utf-8-sig` is tried **before** `utf-8`. A byte-order
@@ -1005,11 +1027,12 @@ someone else. A 403 would confirm the id is real. The repositories return `None`
 for both "unknown" and "not yours", so the service layer cannot tell them apart
 even if it wanted to.
 
-Three places are cross-doctor on purpose, and only three:
+These places are cross-doctor on purpose, and only these:
 
 | Where | Why |
 | --- | --- |
 | `jobs_repo.fail_orphans` | runs at startup, no request, no doctor. Reaping one doctor's jobs would leave every other doctor's stuck in `running`. |
+| `audio_uploads_repo.fail_orphans`, `.stale_receiving` | the same startup sweep (called from `job_service.reap_orphans`) for recording uploads, §8.23. |
 | `jobs_repo.owner_doctor_id` | it is what *establishes* a scope — see below. |
 | `cli/load_insights.py` | §8.21 |
 
@@ -1059,7 +1082,7 @@ worse, were the *live* ones shared by every branch, where a test upload would
 overwrite production evidence.
 
 **Reads follow the row; writes follow the setting.** `store_for_visit(visit)` routes
-on `visit.transcript_provider`; `default_provider()` reads `TRANSCRIPT_STORAGE`.
+on `visit.transcript_provider`; `default_provider()` reads `transcripts.storage`.
 That asymmetry is the design: a transcript stored before the setting changed stays
 readable, and the two backends coexist, so a migration runs in batches, can be
 interrupted, and resumes. A read that consulted the setting would have made
@@ -1093,6 +1116,91 @@ copy is verifiably readable.
 Nothing outside the local loader reads it — the pipeline uses `text` and
 `relative_path` — but a new caller must not assume a filesystem location.
 
+### 8.23 Recordings: sent in chunks, stored once, transcribed into an ordinary transcript
+
+A recording ends up as exactly what a `.txt` upload produces —
+`transcripts/{visit_id}.txt` in the `DOCTOR:` / `PATIENT:` format — so reading
+back, the three-layer chain and delete have no audio branch. The recording itself
+is kept too, as one file per visit.
+
+```
+browser  POST /visits/{id}/audio-uploads   checks + chunk plan        -> receiving
+         PUT  /audio-uploads/{id}/chunks/i  x N, 4 MB each, retried
+         POST /audio-uploads/{id}/finish    202                        -> processing
+backend  stitch chunks -> recordings/<visit>/<upload><ext>, verify size, delete chunks
+         Deepgram (diarize_model=latest) -> utterances by "Speaker 0/1/2"
+         LLM, prompts/speaker_identification.md -> a role per voice
+         app/domain/diarization.py -> DOCTOR: / PATIENT: / OTHER (patient's mother):
+         transcript_service.save_transcript_text
+         job_service.enqueue (insight job queued)           -> completed | failed
+         job_service.run_job, same background task, own connection
+browser  GET  /audio-uploads/{id}  polls; on completed, follows GET /visits/{id}/job
+```
+
+**Insights start on the server, with no click.** Unlike a `.txt` upload, where
+the browser chains `POST /insights`, the background task queues the job itself
+once the transcript is stored, then runs it. So a brief is compiled even if the
+uploading tab is closed. The job is queued *before* the upload is marked
+`completed`, so a poller that sees `completed` always finds the job. Queueing is
+best-effort: if it is refused (a job already running), the upload still
+completes and the visit offers Generate insights. A failed or quota-limited job
+is retried from the UI as for any other brief.
+
+**Why chunks.** Every browser request goes through the BFF, and on Vercel a
+function's request body is capped at 4.5 MB; consultation recordings are larger.
+`speech.chunk_bytes` (4,000,000) stays under it with room for the multipart
+envelope. Each chunk must be *exactly* its planned size — every one
+`chunk_bytes` except the remainder — and the plan must cover the file (a CHECK
+constraint), so "every chunk arrived" means "the stitched file is byte-for-byte
+the original". Resending a chunk replaces it, which is what makes the browser's
+per-chunk retry safe.
+
+**Stitching** happens in a temporary file on disk and goes up as one PUT, not an
+S3 multipart upload: the chunks are below S3's 5 MB part minimum, and a single PUT
+does not depend on the endpoint supporting multipart. The stored size is checked
+against the plan before any chunk is deleted, because until then the chunks are
+the only copy.
+
+**One recording per visit**, enforced by a partial unique index. The key carries
+the upload id, so a replacement is written beside the current recording, and the
+old one is deleted only once the new upload has completed. A failed replacement
+therefore never costs the visit the recording its transcript came from.
+
+**Processing is a background task**, the §8.9 pattern: state in `audio_uploads`,
+`finish` returns 202, the worker resolves the owning doctor from the upload id and
+works under that scope. Stitching plus speech-to-text plus a model call can
+outlast both the BFF's 25 s timeout and a Vercel function's duration limit. A
+failed upload keeps its chunks or recording, so Finish again retries without a
+re-upload (`retryable`). Startup (`job_service.reap_orphans`) fails uploads a dead
+process left in `processing` and discards ones nobody has sent a chunk to for a
+day. Starting a new upload for a visit discards any unfinished one.
+
+**Everything checkable is checked before a byte is sent**: visit completed,
+`replace`, format, size, and that `DEEPGRAM_API_KEY` and the LLM key are set. The
+LLM client is built before Deepgram is called, the 256 KB text ceiling is checked
+before the identification call, and the visit is re-read before writing.
+
+**The model labels voices; it never writes the transcript.** It returns
+`{speaker, role, description, confidence}` per voice and Python assembles the text
+from Deepgram's words. A confused or prompt-injected answer can mislabel a voice
+but cannot add, drop or reword speech — the same instinct as §8.2. Descriptions
+are sanitised before they become a label.
+
+**OTHER is a real role, and PATIENT is not required.** A parent speaking for a
+child is `OTHER (patient's mother)`. What is refused (stored as `failed`, no
+transcript written): one voice only, no doctor, or nobody but the doctor — each
+means the conversation was not separated. Doubtful-but-usable labellings complete
+with `warnings`, stored on the upload. They do not hold generation back (a
+product decision: the doctor should never have to press Generate after a
+recording); the visit page shows them above the brief as a "check the speaker
+labels" notice, until a different transcript replaces this one. Two voices mapped to the
+same person are merged, which repairs Deepgram splitting one speaker in two.
+
+Errors by who can fix them: unsupported format or unreadable audio 422, missing
+or rejected `DEEPGRAM_API_KEY` 500, storage hiccup on a chunk 503 (resend),
+Deepgram throttled/down 503, other Deepgram failure 502, LLM throttled 429. During
+processing these become the upload's `error_code` / `error_message`.
+
 ## 9. Commands
 
 All with the `reels` interpreter, run from `backend/`.
@@ -1120,8 +1228,12 @@ python -m cli.migrate_transcripts --to neon_object_storage
 python -m cli.migrate_transcripts --verify
 python -m cli.migrate_transcripts --prune-local      # only after --verify passes
 
-# Which API keys are usable (one small request each)
+# Does the configured provider's key work (one small request)
 python -m cli.check_keys
+
+# Two-voice test recording from a transcript, via Deepgram text-to-speech (§8.23)
+python -m cli.synthesize_transcript archive/shalin_1.txt          # -> archive/shalin_1.wav
+python -m cli.synthesize_transcript archive/shalin_1.txt --dry-run  # character count only
 
 # Render a prompt without calling the model — best way to iterate on prompts
 python -m cli.render_prompt --transcript transcripts/<visit_id>.txt \
@@ -1140,7 +1252,7 @@ Ctrl-C once stops after the visit in flight; twice abandons it immediately. Eith
 way nothing partial is written and re-running skips completed visits.
 
 Schema is applied in numeric order, and migrations 1 through 8 are all applied
-to the current database. `sql/7_multi_tenancy.sql` seeds the first doctor from an email set at the
+to the current database; `sql/9_audio_uploads.sql` is needed for recording uploads. `sql/7_multi_tenancy.sql` seeds the first doctor from an email set at the
 top of its section 2 and aborts on the placeholder, so a fresh database needs that
 line edited before running.
 
@@ -1235,31 +1347,29 @@ the path Render must poll is the full `/api/v1/health`. This tripped the first
 deploy: Render's health check 404'd against the bare `/health` path even though
 the service was running correctly.
 
-**List-typed settings used to need JSON syntax in Render's env var UI, and no
-longer do — but the reason is worth keeping.** pydantic-settings treats a
-`List[str]` field as complex and runs `json.loads()` on the raw environment value
-*inside the settings source*, which happens before any field validator. So
-`CORS_ORIGINS=*` failed at startup with `SettingsError` / `JSONDecodeError:
-Expecting value`, because `*` is not valid JSON, and only `CORS_ORIGINS=["*"]`
-worked.
+**Configuration on Render.** `config.yaml` is committed and deployed with the
+code, so provider, models and the storage backend come from it. Render's
+environment carries only what `config.yaml` references as `${NAME}`: the secrets
+(`GOOGLE_API_KEY`, `AWS_BEARER_TOKEN_BEDROCK` if Bedrock is selected, `CONNSTR`,
+`API_KEY`, the four Neon `AWS_*` storage values) and `CORS_ORIGINS`. Variables
+from the old flat configuration (`TRANSCRIPT_STORAGE`, `GEMINI_MODEL`,
+`GOOGLE_API_KEY_1..8`, ...) are ignored, and startup logs a warning for each one
+still set, so they can be removed from the dashboard. A Render service still
+holding only `GOOGLE_API_KEY_1` needs `GOOGLE_API_KEY` added.
 
-`cors_origins` is now `Annotated[List[str], NoDecode]` with a `_split_origins`
-validator (`app/config.py`), so it accepts a bare value (`*`), a comma-separated
-list (`a,b`) and JSON (`["a","b"]`) alike, and strips trailing slashes. Set it
-however reads best.
-
-**The original trap still applies to any *other* list-typed setting** that has
-not been given `NoDecode` — a multi-key `GOOGLE_API_KEY` list (§8.8), say. If a
-new one fails at startup with `JSONDecodeError`, this is why, and `NoDecode` plus
-a `mode="before"` validator is the fix.
+`CORS_ORIGINS` accepts a bare value (`*`), a comma-separated list (`a,b`) and JSON
+(`["a","b"]`) alike, and trailing slashes are stripped (`ApiConfig._split_origins`
+in `app/config.py`). The old pydantic-settings trap, where a list-typed setting
+ran `json.loads()` on the raw value and `CORS_ORIGINS=*` crashed startup, no
+longer exists: the YAML loader hands the string to that validator directly.
 
 **Free-tier constraints that interact with this project's design:**
 
 - No persistent disk. `backend/transcripts/` (the 18 kept-for-reference original
   files, §11) does not survive a restart or redeploy on Render — this is fine
-  only because `TRANSCRIPT_STORAGE=neon_object_storage` is set for the
-  deployment, so no runtime read or write depends on that local directory.
-  Don't set `TRANSCRIPT_STORAGE=local` here.
+  only because `transcripts.storage` in `config.yaml` is `neon_object_storage`,
+  so no runtime read or write depends on that local directory. Don't commit it
+  as `local`.
 - Free instances spin down after ~15 minutes idle and cold-start (30–60s) on the
   next request. Mitigated with UptimeRobot pinging
   `https://YOUR-SERVICE.onrender.com/api/v1/health` every 12 minutes, which
@@ -1270,7 +1380,7 @@ a `mode="before"` validator is the fix.
   recycle a free instance independent of idle-based sleep (periodic restarts,
   monthly hour caps), and a restart mid-job leaves an `insight_jobs` row that
   `reap_orphans()` marks failed on the next boot rather than resuming it — that
-  row's 3 model calls are wasted against the 20/day/key quota (§11). Prefer
+  row's 3 model calls are wasted against Gemini's 20/day quota (§11). Prefer
   running `cli.load_insights` batch jobs from a local machine against the same
   Neon database rather than triggering bulk generation through the deployed API
   while on the free tier.
@@ -1390,9 +1500,11 @@ preserves human decisions, and the resolve/reopen transitions.
 contains, with hand-checked expected dates, plus malformed input, bad anchor
 dates, and prompt wiring.
 
-`test_gemini_llm.py` covers key rotation with stubbed clients: fall-through,
-stickiness, permanent disabling of rejected keys, request errors not touching
-other keys, and total exhaustion.
+`test_llm.py` covers error classification for both providers, building each
+provider's LangChain model from config (no network), the missing-key error, and
+the Bedrock path end to end against a stubbed botocore client. `test_config.py`
+covers config.yaml loading: `${...}` substitution, `.env` precedence, unknown
+keys rejected, and `CORS_ORIGINS` parsing.
 
 `test_api.py` covers routing, validation, status codes and error mapping with the
 DB dependency overridden and the services patched. It also holds the four
@@ -1460,9 +1572,10 @@ Conventions:
 
 - stdlib `unittest`; `tests/__init__.py` must exist for discovery to work
 - tests insert the project root on `sys.path`
-- when reading settings in a test, pass `_env_file=None` **and** scrub
-  `GOOGLE_API_KEY*`, `AWS_*` and `TRANSCRIPT_*` from `os.environ`; a value exported
-  in the developer's shell will otherwise make assertions machine-dependent
+- when a test needs settings, build them explicitly: `Settings()` for code
+  defaults, or `load_settings(env_file=None, environ={...})` for config.yaml with a
+  controlled environment. A value exported in the developer's shell or a real
+  `.env` will otherwise make assertions machine-dependent
 - fixtures carry a `doctor_id`. `test_api.py` defines two tenants, `DOCTOR_A_*` and
   `DOCTOR_B_*`, plus the header dicts the BFF would send for each
 - database write semantics are verified against a **throwaway Neon branch**, never
@@ -1536,7 +1649,7 @@ the move to object storage briefly flagged all 18. It now uses
 **`backend/transcripts/` still holds the 18 originals.** All 18 transcripts were
 migrated to object storage and verified byte-for-byte; the local copies are
 redundant but deliberately kept, and `--prune-local` removes them when you decide
-to. `TRANSCRIPT_STORAGE` governs only *new* uploads (§8.22), so changing it moves
+to. `transcripts.storage` governs only *new* uploads (§8.22), so changing it moves
 nothing.
 
 **`npm run dev` serves HTTPS, and Safari is why** (§9). Reverting to HTTP gives a

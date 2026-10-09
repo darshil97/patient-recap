@@ -1,32 +1,80 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { Visit } from "@/lib/api/visits";
 import { completeVisit, cancelVisit, uploadTranscript } from "@/lib/api/visits";
+import {
+  finishAudioUpload,
+  isAudioFile,
+  uploadRecording,
+  type AudioUploadOut,
+  type ChunkProgress,
+} from "@/lib/api/audioUploads";
 import { generateInsights } from "@/lib/api/insights";
 import type { JobOut } from "@/lib/api/insights";
 import { TranscriptDropzone } from "./TranscriptDropzone";
+import { TranscriptSection } from "./TranscriptSection";
 import { useToast } from "../../components/Toast";
 import { ApiError } from "@/lib/api/client";
 
 /**
  * The pre-brief lifecycle states from visit-pending.html: not yet held,
- * awaiting transcript, compiling, and the daily-quota-reached state.
- * Renders whichever state the visit (and its latest job) is currently in.
+ * awaiting transcript, transcribing a recording, compiling, and the
+ * daily-quota-reached state. Renders whichever state the visit (and its latest
+ * job and recording upload) is currently in.
+ *
+ * The recording upload is tracked by VisitPage, not here, because what happens
+ * when it completes — following the insight job the backend starts — belongs to
+ * the page that owns the job.
  */
 export function VisitLifecycle({
   visit,
   job,
+  recording,
+  recordingError,
   onVisitChanged,
+  onRecordingStarted,
   onGenerationStarted,
 }: {
   visit: Visit;
   job: JobOut | null;
+  recording: AudioUploadOut | null;
+  recordingError: string | null;
   onVisitChanged: () => void;
+  /** An upload handed to the backend, to be polled until it settles. */
+  onRecordingStarted: (upload: AudioUploadOut) => void;
   onGenerationStarted: (jobId: string) => void;
 }) {
   const { showToast } = useToast();
   const [busy, setBusy] = useState(false);
+  // Chunks of a recording on their way up. Only this tab can send them, so this
+  // is local state; once handed over, the backend's upload row takes over.
+  const [sending, setSending] = useState<ChunkProgress | null>(null);
+
+  async function startGeneration(regenerate: boolean) {
+    try {
+      const accepted = await generateInsights(visit.visit_id, { regenerate });
+      onGenerationStarted(accepted.job_id);
+    } catch (genErr) {
+      showToast(
+        genErr instanceof ApiError
+          ? genErr.message
+          : "Transcript saved, but generation could not start yet. Use Generate insights below.",
+        { variant: "error" },
+      );
+    }
+  }
+
+  // Closing the tab mid-send loses the chunks still to go, so ask first. Once
+  // the backend has the whole file, leaving is safe and this is removed.
+  useEffect(() => {
+    if (!sending) return;
+    const warn = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [sending]);
 
   async function handleComplete() {
     setBusy(true);
@@ -59,26 +107,55 @@ export function VisitLifecycle({
   }
 
   async function handleUpload(file: File) {
+    if (isAudioFile(file)) {
+      await handleRecording(file);
+      return;
+    }
     setBusy(true);
     try {
       const updated = await uploadTranscript(visit.visit_id, file, visit.has_insights);
       showToast("Transcript saved. Starting insight generation…");
       onVisitChanged();
-      try {
-        const accepted = await generateInsights(updated.visit_id, {
-          regenerate: updated.has_insights,
-        });
-        onGenerationStarted(accepted.job_id);
-      } catch (genErr) {
-        showToast(
-          genErr instanceof ApiError
-            ? genErr.message
-            : "Transcript saved, but generation could not start yet. Use Generate insights below.",
-          { variant: "error" },
-        );
-      }
+      await startGeneration(updated.has_insights);
     } catch (err) {
       showToast(err instanceof ApiError ? err.message : "Could not upload the transcript.", {
+        variant: "error",
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRecording(file: File) {
+    setBusy(true);
+    setSending({ sent: 0, total: 0 });
+    try {
+      const accepted = await uploadRecording(visit.visit_id, file, {
+        replace: Boolean(visit.transcript_path),
+        onProgress: setSending,
+      });
+      onRecordingStarted(accepted);
+      showToast("Recording uploaded. Transcribing, then compiling the brief…");
+    } catch (err) {
+      showToast(
+        err instanceof ApiError
+          ? err.message
+          : "Could not upload the recording. Check the connection and try again.",
+        { variant: "error" },
+      );
+    } finally {
+      setBusy(false);
+      setSending(null);
+    }
+  }
+
+  async function handleRetryRecording(uploadId: string) {
+    setBusy(true);
+    try {
+      const accepted = await finishAudioUpload(uploadId);
+      onRecordingStarted(accepted);
+    } catch (err) {
+      showToast(err instanceof ApiError ? err.message : "Could not retry the recording.", {
         variant: "error",
       });
     } finally {
@@ -144,6 +221,11 @@ export function VisitLifecycle({
     );
   }
 
+  // State: a recording is going up, or the backend is transcribing it.
+  if (sending || recording?.status === "processing") {
+    return <RecordingProgressState sending={sending} recording={recording} />;
+  }
+
   // State: completed, no transcript yet.
   if (!visit.transcript_path) {
     return (
@@ -158,11 +240,55 @@ export function VisitLifecycle({
           </span>
         </div>
         <div className="card-body">
+          {recordingError && <div className="error-banner" style={{ marginBottom: 12 }}>{recordingError}</div>}
+          {recording?.status === "failed" && (
+            <div className="notice notice--critical" style={{ marginBottom: 14 }}>
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
+                <path d="M8 2.8 14.2 13H1.8L8 2.8Z" />
+                <path d="M8 6.6v2.9M8 11.2h.01" />
+              </svg>
+              <span>
+                <span className="notice-title">
+                  {recording.filename ?? "The recording"} could not be transcribed.
+                </span>{" "}
+                {recording.error_message ?? "Something went wrong while processing it."}
+                {recording.retryable && (
+                  <>
+                    {" "}It is still stored, so trying again does not re-upload it.
+                    <span style={{ display: "block", marginTop: 8 }}>
+                      <button
+                        className="btn btn--primary"
+                        disabled={busy}
+                        onClick={() => handleRetryRecording(recording.upload_id)}
+                      >
+                        {busy ? "Retrying…" : "Try again"}
+                      </button>
+                    </span>
+                  </>
+                )}
+              </span>
+            </div>
+          )}
+          {recording?.status === "receiving" && (
+            <div className="notice" style={{ marginBottom: 14 }}>
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
+                <circle cx="8" cy="8" r="6" />
+                <path d="M8 5v3.5M8 11h.01" />
+              </svg>
+              <span>
+                <span className="notice-title">An earlier upload did not finish.</span>{" "}
+                {recording.filename ?? "The recording"} stopped at{" "}
+                {recording.chunks_received} of {recording.chunk_count} parts. Choose the
+                file again to start over.
+              </span>
+            </div>
+          )}
           <TranscriptDropzone onFileSelected={handleUpload} busy={busy} />
           <p style={{ fontSize: 12.5, color: "var(--ink-2)", marginTop: 12 }}>
-            Save the recording as plain text before uploading. Word documents, PDFs and
-            JSON are not accepted &mdash; a mis-read file would produce a confident but
-            wrong record.
+            A recording is stored with the visit, transcribed, and each voice is labelled
+            as doctor, patient or someone else present. Word documents, PDFs and JSON are
+            not accepted &mdash; a mis-read file would produce a confident but wrong
+            record.
           </p>
         </div>
       </div>
@@ -186,12 +312,97 @@ export function VisitLifecycle({
               {busy ? "Starting…" : "Generate insights"}
             </button>
           </div>
+          {/* Usually only seen briefly, or when generation could not be
+              started: either way the transcript is worth having to hand. */}
+          <div style={{ marginTop: 14 }}>
+            <TranscriptSection visitId={visit.visit_id} filename={visit.transcript_filename} />
+          </div>
         </div>
       </div>
     );
   }
 
   return null;
+}
+
+/** Upload progress, then the server-side transcription, for a recording. */
+function RecordingProgressState({
+  sending,
+  recording,
+}: {
+  sending: ChunkProgress | null;
+  recording: AudioUploadOut | null;
+}) {
+  const uploading = sending !== null;
+  const total = sending?.total ?? 0;
+  const sent = sending?.sent ?? 0;
+  const pct = uploading ? (total > 0 ? Math.round((sent / total) * 100) : 0) : 100;
+  const steps = [
+    {
+      name: "Upload",
+      detail: uploading
+        ? total > 0
+          ? `Part ${Math.min(sent + 1, total)} of ${total}`
+          : "Preparing"
+        : "Stored with the visit",
+      state: uploading ? "active" : "done",
+    },
+    {
+      name: "Transcribe",
+      detail: uploading
+        ? "Speech to text, then who is speaking"
+        : "Speech to text, then working out who is speaking",
+      state: uploading ? "todo" : "active",
+    },
+    {
+      name: "Brief",
+      detail: "Compiled automatically once transcribed",
+      state: "todo",
+    },
+  ];
+  return (
+    <div className="card">
+      <div className="card-head">
+        <h2 className="card-title">{uploading ? "Uploading recording" : "Transcribing"}</h2>
+      </div>
+      <div className="card-body">
+        <p role="status" aria-live="polite" style={{ color: "var(--ink-2)", fontSize: 13, maxWidth: "64ch" }}>
+          {uploading
+            ? "Keep this page open until the upload finishes."
+            : `${recording?.filename ?? "The recording"} is uploaded. Transcribing a long consultation can take a few minutes. You can leave this page — it will keep going.`}
+        </p>
+        <ul className="steps" style={{ marginTop: 12 }}>
+          {steps.map((step) => (
+            <li key={step.name} className={`step--${step.state}`}>
+              <span className="step-mark" aria-hidden="true">
+                {step.state === "done" && (
+                  <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.4" aria-hidden="true">
+                    <path d="M3.5 8.5l3 3 6-7" />
+                  </svg>
+                )}
+              </span>
+              <div>
+                <div className="step-name">{step.name}</div>
+                <div className="step-detail">{step.state === "active" && !uploading ? "running" : step.detail}</div>
+              </div>
+            </li>
+          ))}
+        </ul>
+        {uploading && (
+          <div
+            className="bar"
+            role="progressbar"
+            aria-valuenow={sent}
+            aria-valuemin={0}
+            aria-valuemax={total}
+            aria-label={`Upload progress: ${sent} of ${total} parts`}
+          >
+            <span style={{ width: `${Math.max(pct, 4)}%` }} />
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
 function NotYetHeldState({

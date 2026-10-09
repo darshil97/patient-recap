@@ -100,12 +100,11 @@ def validate_upload(filename: Optional[str], raw: bytes) -> str:
             f"Got {suffix or 'no extension'}.",
             details={"filename": display, "suffix": suffix})
 
-    if len(raw) > settings.max_transcript_bytes:
+    limit = settings.transcripts.max_upload_bytes
+    if len(raw) > limit:
         raise TranscriptTooLargeError(
-            f"Transcript is {len(raw):,} bytes; the limit is "
-            f"{settings.max_transcript_bytes:,}.",
-            details={"size_bytes": len(raw),
-                     "max_bytes": settings.max_transcript_bytes})
+            f"Transcript is {len(raw):,} bytes; the limit is {limit:,}.",
+            details={"size_bytes": len(raw), "max_bytes": limit})
 
     text = decode_transcript_bytes(raw, display).strip()
     if not text:
@@ -130,7 +129,7 @@ def store_transcript(
     version would let one doctor overwrite the source recording behind another
     doctor's generated brief.
 
-    Writes go to whichever backend TRANSCRIPT_STORAGE names, and the provider is
+    Writes go to whichever backend transcripts.storage names, and the provider is
     recorded on the visit alongside the path. A replacement is written to the
     *currently configured* backend rather than the one holding the old copy, and
     the old copy is removed afterwards — so replacing a transcript is also how a
@@ -138,21 +137,63 @@ def store_transcript(
     file both claiming to be the source.
     """
     visit = get_visit(conn, scope, visit_id)
+    check_can_attach(visit, replace)
+    text = validate_upload(filename, raw)
+    return save_transcript_text(conn, scope, visit, text, filename)
 
+
+def check_can_attach(visit: VisitRow, replace: bool) -> None:
+    """The rules every way of attaching a transcript shares.
+
+    Separate so the audio path can apply them *before* paying for transcription,
+    rather than discovering after a minute of speech-to-text that the visit was
+    never going to accept the result.
+    """
     if visit.visit_status not in UPLOADABLE_STATUSES:
         raise ConflictError(
             f"Visit is {visit.visit_status}; a transcript can only be attached to a "
             f"completed visit. Mark the visit complete first.",
-            details={"visit_id": visit_id, "visit_status": visit.visit_status})
+            details={"visit_id": visit.visit_id, "visit_status": visit.visit_status})
 
     if visit.transcript_path and not replace:
         raise ConflictError(
             "This visit already has a transcript. Send replace=true to overwrite it.",
-            details={"visit_id": visit_id,
+            details={"visit_id": visit.visit_id,
                      "transcript_filename": visit.transcript_filename})
 
-    text = validate_upload(filename, raw)
 
+def check_transcript_text(text: str) -> str:
+    """The size and emptiness rules, for text that did not arrive as a file.
+
+    An uploaded .txt is checked by validate_upload on its raw bytes. Text produced
+    server-side — from an audio recording — has to meet the same ceiling, so that
+    whatever reaches the pipeline obeys one limit regardless of where it came from.
+    """
+    text = text.strip()
+    if not text:
+        raise TranscriptError("Transcript is empty.")
+    limit = get_settings().transcripts.max_upload_bytes
+    size = len(text.encode("utf-8"))
+    if size > limit:
+        raise TranscriptTooLargeError(
+            f"Transcript is {size:,} bytes; the limit is {limit:,}.",
+            details={"size_bytes": size, "max_bytes": limit})
+    return text
+
+
+def save_transcript_text(
+    conn: psycopg.Connection,
+    scope: DoctorScope,
+    visit: VisitRow,
+    text: str,
+    filename: Optional[str],
+) -> VisitRow:
+    """Write already-validated transcript text for a visit and point the row at it.
+
+    `visit` must have been loaded under `scope` and passed check_can_attach.
+    `filename` is the client's name, kept for display only.
+    """
+    visit_id = visit.visit_id
     provider = default_provider()
     locator = transcript_locator(visit_id)
     get_store(provider).write(locator, text)
@@ -203,7 +244,7 @@ def read_transcript(conn: psycopg.Connection, scope: DoctorScope,
                             details={"visit_id": visit_id})
 
     # store_for_visit reads the provider off the row, not from settings, so a
-    # transcript stored before TRANSCRIPT_STORAGE changed is still readable.
+    # transcript stored before transcripts.storage changed is still readable.
     stored = store_for_visit(visit).read(visit.transcript_path)
     return TranscriptContent(
         visit_id=visit.visit_id,

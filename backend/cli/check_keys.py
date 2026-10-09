@@ -1,10 +1,11 @@
 """
-Report which Gemini API keys are usable.
+Check whether the model provider's API key works.
 
-    python -m cli.check_keys
+    python -m cli.check_keys                     # the provider in config.yaml
+    python -m cli.check_keys --provider bedrock  # another one
 
-One small request per key: cheap, but it does consume a request from each
-working key's daily quota, so don't run it in a loop.
+One small request: cheap, but on Gemini's free tier it is 1 of 20 a day, and on
+Bedrock it is a billed call, so don't run it in a loop.
 """
 
 from __future__ import annotations
@@ -13,38 +14,33 @@ import argparse
 import logging
 from typing import List, Optional
 
-from app.config import get_settings
+from app.config import LLM_PROVIDERS, get_settings
 from app.core.logging import configure_logging
-from app.llm.gemini import check_keys
+from app.llm.factory import check_llm
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     configure_logging(level=logging.WARNING)
-    settings = get_settings()
+    configured = get_settings().llm.provider
 
-    parser = argparse.ArgumentParser(description="Check Gemini API key health.")
-    parser.add_argument("--model", default=settings.gemini_model)
+    parser = argparse.ArgumentParser(description="Check the model provider's API key.")
+    parser.add_argument("--provider", choices=LLM_PROVIDERS, default=configured,
+                        help=f"default: llm.provider in config.yaml ({configured})")
+    parser.add_argument("--model", default=None,
+                        help="model id within the provider (default: its configured model)")
     args = parser.parse_args(argv)
 
-    keys = settings.api_keys
-    if not keys:
-        print("No API keys configured. Set GOOGLE_API_KEY_1 (and optionally _2, _3) "
-              "or a single GOOGLE_API_KEY in .env.")
+    row = check_llm(provider=args.provider, model=args.model)
+    print(f"{row['provider']} | model {row['model']}")
+
+    if not row["configured"]:
+        print(f"No API key: set {row['key_variable']} in backend/.env.")
         return 1
 
-    print(f"{len(keys)} key(s) configured | model {args.model}\n")
-    usable = 0
-    for row in check_keys(args.model, keys):
-        verdict = "USABLE" if row["usable"] else f"unusable ({row['kind']})"
-        usable += int(row["usable"])
-        print(f"key {row['index']}: {verdict}  "
-              f"[len={row['length']}, AIza-prefixed={row['looks_like_google_key']}]")
-        if row["detail"]:
-            print(f"         {row['detail']}")
-
-    print(f"\n{usable}/{len(keys)} usable. Each visit costs 3 requests; "
-          f"the free tier allows 20 per day per model per project.")
-    return 0 if usable else 1
+    print("USABLE" if row["usable"] else f"unusable ({row['kind']})")
+    if row["detail"]:
+        print(f"  {row['detail']}")
+    return 0 if row["usable"] else 1
 
 
 if __name__ == "__main__":

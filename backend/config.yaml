@@ -1,0 +1,102 @@
+# Backend configuration, loaded by app/config.py.
+#
+# This file is committed, so it holds no secrets. Secrets (and the one value that
+# differs per deployment, CORS_ORIGINS) are pulled in from backend/.env or the
+# host's environment with ${...}:
+#
+#   ${NAME}            the value of NAME; unset or empty means "use the default"
+#   ${NAME:-fallback}  the value of NAME, or `fallback` if unset or empty
+#
+# backend/.env wins over a variable already exported in the shell. An unknown key
+# here is a startup error, so a typo cannot silently fall back to a default.
+
+llm:
+  # Which provider answers the pipeline's model calls: gemini | bedrock.
+  # A per-request `model` override applies within the selected provider.
+  provider: bedrock
+
+  temperature: 0.0
+  timeout_seconds: 120
+  # Retries on throttling and transient server errors, handled by each
+  # provider's own client.
+  max_retries: 2
+
+  # Jinja templates for the three layers, relative to backend/.
+  prompts_dir: prompts
+
+  gemini:
+    model: gemini-3.7-flash
+    api_key: ${GOOGLE_API_KEY}
+    # Ask the API itself to constrain replies to JSON (response_mime_type).
+    json_mode: true
+
+  bedrock:
+    # Bedrock model id, not the bare OpenAI name.
+    model: openai.gpt-oss-120b-1:0
+    # A Bedrock API key, sent as a bearer token.
+    api_key: ${AWS_BEARER_TOKEN_BEDROCK}
+    # Where the key works and the model is enabled. Separate from the Neon
+    # Object Storage region below.
+    region: ap-southeast-2
+    # Cap on generated tokens, reasoning included. null = the API's default.
+    max_tokens: null
+
+database:
+  url: ${CONNSTR}
+  pool_min: 1
+  pool_max: 8
+
+api:
+  prefix: /api/v1
+  # Shared secret. When set, every route except GET /health requires a matching
+  # X-API-Key header; unset leaves the API open for local development.
+  key: ${API_KEY}
+  # Allowed browser origins: "*", one origin, a comma-separated list, or a YAML
+  # list. "*" locally; the deployment narrows it to the frontend origin.
+  cors_origins: ${CORS_ORIGINS:-*}
+
+transcripts:
+  # Upload ceiling. Real transcripts are 3-5 KB.
+  max_upload_bytes: 262144
+
+  # Where NEW uploads are written: local | neon_object_storage. Existing visits
+  # are read back through whichever backend their row names, so changing this
+  # never orphans anything (see cli/migrate_transcripts.py to move old ones).
+  storage: neon_object_storage
+
+  # Used by the local backend, and home of the already-migrated originals.
+  local_dir: transcripts
+
+  # Neon Object Storage (S3-compatible). AWS-standard variable names, so
+  # `neon env pull` writes them directly.
+  object_storage:
+    bucket: consultation-transcripts
+    endpoint_url: ${AWS_ENDPOINT_URL_S3}
+    access_key_id: ${AWS_ACCESS_KEY_ID}
+    secret_access_key: ${AWS_SECRET_ACCESS_KEY}
+    region: ${AWS_REGION:-us-east-2}
+speech:
+  # Audio uploads: the recording is stored, transcribed by Deepgram with speaker
+  # diarization, an LLM call (llm.provider above) works out which voice is the
+  # doctor, the patient, or someone else, and the labelled text is stored exactly
+  # like an uploaded .txt.
+  # Ceiling on an uploaded recording (100 MB).
+  max_upload_bytes: 104857600
+  # The browser sends a recording in pieces of this size, because every request
+  # goes through the Vercel-hosted BFF and Vercel caps a request body at 4.5 MB.
+  # The pieces are stitched into one recording and deleted.
+  chunk_bytes: 4000000
+  # Where chunks and recordings go when transcripts.storage is local (relative
+  # to backend/). With neon_object_storage they go in the same bucket.
+  local_dir: audio
+  deepgram:
+    api_key: ${DEEPGRAM_API_KEY}
+    # https://api.eu.deepgram.com keeps processing in the EU.
+    base_url: https://api.deepgram.com
+    model: nova-3
+    # en, or multi for code-switched speech (e.g. English/Hindi).
+    language: en
+    # latest = Deepgram's current batch diarizer.
+    diarize_model: latest
+    smart_format: true
+    timeout_seconds: 300

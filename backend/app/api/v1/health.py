@@ -9,8 +9,8 @@ from fastapi import APIRouter, Depends
 from app.api.deps import require_auth
 from app.config import get_settings
 from app.db.pool import connection
-from app.llm.gemini import check_keys
-from app.schemas.common import HealthResponse, KeyHealth, KeyHealthResponse
+from app.llm.factory import check_llm
+from app.schemas.common import HealthResponse, KeyHealthResponse
 
 logger = logging.getLogger(__name__)
 
@@ -21,9 +21,10 @@ logger = logging.getLogger(__name__)
 # wrong".
 #
 # The key-health route below requires the API key, because each call spends one
-# request from every Gemini key's daily quota. It deliberately does *not* require
-# a doctor identity: it reports on the server's own credentials and touches no
-# patient data, so there is no tenant to scope it to.
+# model request (1 of Gemini's 20 free-tier requests a day, or one billed Bedrock
+# call). It deliberately does *not* require a doctor identity: it reports on the
+# server's own credentials and touches no patient data, so there is no tenant to
+# scope it to.
 router = APIRouter(tags=["health"])
 
 
@@ -59,8 +60,9 @@ def health() -> HealthResponse:
     return HealthResponse(
         status="ok" if database == "ok" else "degraded",
         database=database,
-        model=settings.gemini_model,
-        api_keys_configured=len(settings.api_keys),
+        provider=settings.llm.provider,
+        model=settings.llm.model,
+        api_key_configured=settings.llm.api_key_configured,
     )
 
 
@@ -68,17 +70,12 @@ def health() -> HealthResponse:
     "/health/api-keys",
     response_model=KeyHealthResponse,
     dependencies=[Depends(require_auth)],
-    summary="Check which Gemini keys are usable",
+    summary="Check the model provider's API key",
 )
 def api_key_health() -> KeyHealthResponse:
-    """Send one minimal request per key to see which work.
+    """Send one minimal request with the configured provider's key.
 
-    Never poll this: each call consumes one request from every working key's
-    daily quota, and the free tier allows only 20 per key per day.
+    Never poll this: on Gemini each call spends one of the free tier's 20
+    requests a day, and on Bedrock it is a billed call.
     """
-    settings = get_settings()
-    results = check_keys(settings.gemini_model, settings.api_keys)
-    return KeyHealthResponse(
-        model=settings.gemini_model,
-        keys=[KeyHealth(**r) for r in results],
-    )
+    return KeyHealthResponse(**check_llm())

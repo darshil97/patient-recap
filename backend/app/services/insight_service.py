@@ -29,8 +29,9 @@ from app.db.tenancy import DoctorScope
 from app.domain.follow_up.models import SCHEDULED, ResolvedFollowUp
 from app.domain.transcripts import Transcript
 from app.storage import store_for_visit
-from app.llm.errors import AllKeysExhausted, is_quota_failure
-from app.llm.gemini import ChatClient, build_llm
+from app.llm.base import ChatClient
+from app.llm.errors import is_quota_failure
+from app.llm.factory import build_llm
 from app.pipeline.layers import LAYERS
 from app.pipeline.results import PatientContext, PipelineResult
 from app.pipeline.runner import ProgressFn, run_pipeline
@@ -48,7 +49,7 @@ def prompt_version() -> str:
     settings = get_settings()
     digest = hashlib.sha256()
     for spec in sorted(LAYERS.values(), key=lambda s: s.number):
-        path = settings.prompts_dir / spec.template
+        path = settings.llm.prompts_dir / spec.template
         digest.update(path.read_bytes() if path.is_file() else b"")
     return digest.hexdigest()[:12]
 
@@ -232,7 +233,7 @@ def generate_for_visit(
     """Run the chain for one visit and persist the result.
 
     Raises ConflictError if insights already exist and regenerate is False, and
-    QuotaExhaustedError when every API key is rate limited. Nothing is written
+    QuotaExhaustedError when the model provider is rate limiting. Nothing is written
     unless all requested layers succeed, so a mid-chain failure leaves
     visits.insights_generated FALSE and the visit still pending.
 
@@ -259,14 +260,14 @@ def generate_for_visit(
             transcript=transcript,
             patient=patient_context(visit),
             llm=client,
-            prompts_dir=get_settings().prompts_dir,
+            prompts_dir=get_settings().llm.prompts_dir,
             stop_after=stop_after,
             strict_json=strict_json,
             progress=progress,
         )
-    except AllKeysExhausted as exc:
-        raise QuotaExhaustedError(str(exc), details={"keys": exc.status}) from exc
     except Exception as exc:
+        # The provider's client has already retried; a throttle that outlasted
+        # those retries is worth trying again later, unchanged.
         if is_quota_failure(exc):
             raise QuotaExhaustedError(str(exc)) from exc
         raise

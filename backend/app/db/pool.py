@@ -30,7 +30,7 @@ _pool: Optional[ConnectionPool] = None
 def create_pool(conninfo: Optional[str] = None, *, open_now: bool = True) -> ConnectionPool:
     """Build a pool. Callers normally use get_pool() instead."""
     settings = get_settings()
-    dsn = conninfo or settings.connstr
+    dsn = conninfo or settings.database.url
     if not dsn:
         raise RuntimeError(
             "No database connection string. Set CONNSTR in your environment or .env."
@@ -38,8 +38,8 @@ def create_pool(conninfo: Optional[str] = None, *, open_now: bool = True) -> Con
 
     pool = ConnectionPool(
         conninfo=dsn,
-        min_size=settings.db_pool_min,
-        max_size=settings.db_pool_max,
+        min_size=settings.database.pool_min,
+        max_size=settings.database.pool_max,
         kwargs={"row_factory": dict_row, "autocommit": True},
         open=False,
     )

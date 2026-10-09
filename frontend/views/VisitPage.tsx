@@ -3,8 +3,19 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { getVisit, type Visit } from "@/lib/api/visits";
-import { getInsights, generateInsights, type InsightOut } from "@/lib/api/insights";
+import {
+  getInsights,
+  generateInsights,
+  getLatestJob,
+  type InsightOut,
+} from "@/lib/api/insights";
+import type { AudioUploadOut } from "@/lib/api/audioUploads";
 import { useInsightJob } from "../hooks/useInsightJob";
+import { useAudioUpload } from "../hooks/useAudioUpload";
+import {
+  SpeakerLabelNotice,
+  speakerWarningsApply,
+} from "../features/visits/SpeakerLabelNotice";
 import { useStatsContext } from "../hooks/StatsContext";
 import { useToast } from "../components/Toast";
 import { VisitLifecycle } from "../features/visits/VisitLifecycle";
@@ -56,6 +67,38 @@ export function VisitPage({ visitId }: { visitId: string }) {
   useEffect(() => {
     load();
   }, [load]);
+
+  // A recording finished transcribing. The backend has already queued the
+  // insight job (before marking the upload completed), so follow that job
+  // rather than starting one — a second POST /insights would only 409.
+  const handleRecordingSettled = useCallback(
+    async (settled: AudioUploadOut) => {
+      if (settled.status === "failed") {
+        showToast(settled.error_message ?? "The recording could not be processed.", {
+          variant: "error",
+        });
+        return;
+      }
+      if (settled.status !== "completed") return;
+      showToast("Recording transcribed. Compiling the brief…");
+      try {
+        const latest = await getLatestJob(visitId);
+        if (latest) startTracking(latest.job_id);
+      } catch {
+        // The visit reload below still shows the transcript; a reload of the
+        // page picks the job up if this lookup blipped.
+      }
+      load();
+      reloadStats();
+    },
+    [visitId, showToast, startTracking, load, reloadStats],
+  );
+
+  const {
+    upload: recording,
+    error: recordingError,
+    track: trackRecording,
+  } = useAudioUpload(visitId, handleRecordingSettled);
 
   // When a job finishes successfully after we started tracking it, refresh
   // the visit + insight so the brief replaces the compiling state.
@@ -212,6 +255,21 @@ export function VisitPage({ visitId }: { visitId: string }) {
           </div>
         )}
 
+        {speakerWarningsApply(recording, visit) && (
+          <SpeakerLabelNotice
+            recording={recording}
+            onShowTranscript={
+              showBrief
+                ? () => {
+                    const el = document.getElementById("transcript");
+                    el?.setAttribute("open", "");
+                    el?.scrollIntoView({ behavior: "smooth" });
+                  }
+                : undefined
+            }
+          />
+        )}
+
         {showBrief && insight ? (
           // Boundary, not optimism. insights_json is whatever the model
           // returned: the backend stores it as Dict[str, Any] and the shape here
@@ -231,7 +289,10 @@ export function VisitPage({ visitId }: { visitId: string }) {
           <VisitLifecycle
             visit={visit}
             job={job}
+            recording={recording}
+            recordingError={recordingError}
             onVisitChanged={load}
+            onRecordingStarted={trackRecording}
             onGenerationStarted={(jobId) => {
               startTracking(jobId);
               load();

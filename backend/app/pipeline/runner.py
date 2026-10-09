@@ -22,7 +22,7 @@ from langchain_core.messages import HumanMessage
 from app.core.errors import LayerOutputError, PipelineError
 from app.domain.follow_up.resolver import resolve_follow_up
 from app.domain.transcripts import Transcript
-from app.llm.gemini import ChatClient
+from app.llm.base import ChatClient, model_name
 from app.pipeline.layers import LAYERS, LayerSpec
 from app.pipeline.parsing import extract_json, response_text
 from app.pipeline.prompts import build_jinja_env, render_prompt
@@ -131,7 +131,8 @@ def run_pipeline(
     Args:
         transcript: an already-loaded transcript (see app.domain.transcripts).
         patient: name, age, gender and the real consultation date.
-        llm: any client exposing `.invoke()`; normally the multi-key Gemini one.
+        llm: any client exposing `.invoke()`; normally the LangChain chat model
+            app.llm.factory.build_llm returns for llm.provider.
         stop_after: highest layer to run, for iterating on an early prompt
             without paying for the whole chain.
         strict_json: raise if a layer's reply isn't parseable JSON.
@@ -149,7 +150,7 @@ def run_pipeline(
 
     result = PipelineResult(
         patient=patient,
-        model=str(getattr(llm, "model", "unknown")),
+        model=model_name(llm),
         transcript_path=transcript.relative_path,
     )
 

@@ -1,42 +1,47 @@
 """
-Classifying Gemini failures.
+Classifying model failures, for Gemini and Bedrock alike.
 
-Three kinds, because each needs a different response. The middle one is the
-reason this module exists: an invalid key is a problem with the *key*, not the
-request, so it must not abort a run that other keys could finish.
+Three kinds, because each needs a different response:
+
+    QUOTA     throttled, out of quota, or the service is briefly unavailable.
+              Worth retrying unchanged later, so it surfaces as HTTP 429.
+    BAD_KEY   the credential is missing, wrong, expired, or not allowed to call
+              this model. Retrying cannot help; the configuration has to change.
+    REQUEST   anything else: a malformed request, an unknown model, a safety block.
+
+Classification is by message text. Both providers' errors name their cause in
+the message (Google's RESOURCE_EXHAUSTED, botocore's "(ThrottlingException)"),
+and the providers' own exception types are not stable across library versions.
 """
 
 from __future__ import annotations
-
-from typing import Dict, Optional
 
 QUOTA = "quota"
 BAD_KEY = "bad_key"
 REQUEST = "request"
 
-# 429 / 503 / transient. The key may work again later, so it is only skipped.
+# The key may work again shortly.
 _QUOTA_MARKERS = (
+    # Gemini
     "429", "resource_exhausted", "resourceexhausted", "quota",
     "rate limit", "rate-limit", "503", "unavailable",
     "deadline exceeded", "deadline_exceeded", "overloaded",
+    # Bedrock (botocore puts the error code in the message)
+    "throttlingexception", "too many requests", "serviceunavailableexception",
+    "modelnotreadyexception", "modeltimeoutexception", "read timeout",
 )
 
-# The key itself is bad: no point trying it again this run.
+# The credential itself is the problem.
 _BAD_KEY_MARKERS = (
+    # Gemini
     "api key not valid", "api_key_invalid", "invalid api key",
     "permission_denied", "permissiondenied", "401", "unauthenticated",
     "api key expired", "consumer_suspended",
+    # Bedrock
+    "accessdeniedexception", "unrecognizedclientexception",
+    "expiredtokenexception", "invalid api key format", "not authorized",
+    "security token included in the request is invalid",
 )
-
-
-class AllKeysExhausted(RuntimeError):
-    """Every configured key failed. Carries the last underlying error."""
-
-    def __init__(self, message: str, last_error: Optional[BaseException] = None,
-                 status: Optional[Dict[str, str]] = None) -> None:
-        super().__init__(message)
-        self.last_error = last_error
-        self.status = status or {}
 
 
 def classify_error(error: BaseException) -> str:
@@ -52,7 +57,5 @@ def classify_error(error: BaseException) -> str:
 
 
 def is_quota_failure(error: BaseException) -> bool:
-    """True if this failure is a rate limit, including a wrapped AllKeysExhausted."""
-    if isinstance(error, AllKeysExhausted):
-        return True
+    """True if this failure is a rate limit or a transient outage."""
     return classify_error(error) == QUOTA

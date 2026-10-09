@@ -53,6 +53,16 @@ def reap_orphans() -> int:
     """
     with connection() as conn:
         count = jobs_repo.fail_orphans(conn, WORKER_ID)
+        # Audio uploads are the other in-process background work, so they are
+        # reaped here too: one startup entry point for everything a dead process
+        # can leave half-done. Isolated, so a problem tidying audio cannot stop
+        # insight jobs from being reaped or the app from starting.
+        try:
+            from app.services import audio_upload_service
+
+            audio_upload_service.reap(conn)
+        except Exception:
+            logger.exception("Could not tidy up interrupted audio uploads")
     if count:
         logger.warning("Failed %d orphaned insight job(s) from a previous run", count)
     return count

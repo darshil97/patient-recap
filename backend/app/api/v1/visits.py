@@ -35,7 +35,7 @@ from app.schemas.insights import (
     JobAccepted,
     JobOut,
 )
-from app.schemas.transcripts import TranscriptOut
+from app.schemas.transcripts import AudioUploadCreate, AudioUploadOut, TranscriptOut
 from app.schemas.visits import (
     VisitCancelRequest,
     VisitCompleteRequest,
@@ -43,7 +43,13 @@ from app.schemas.visits import (
     VisitOut,
     VisitUpdate,
 )
-from app.services import insight_service, job_service, transcript_service, visit_service
+from app.services import (
+    audio_upload_service,
+    insight_service,
+    job_service,
+    transcript_service,
+    visit_service,
+)
 from app.services.pagination import MAX_PAGE_SIZE
 
 # require_doctor depends on require_auth, so both gates apply to every route here
@@ -282,6 +288,68 @@ async def upload_transcript(
     return VisitOut.model_validate(visit)
 
 
+@router.post(
+    "/{visit_id}/audio-uploads",
+    response_model=AudioUploadOut,
+    status_code=status.HTTP_201_CREATED,
+    responses={404: {"model": ErrorResponse},
+               409: {"model": ErrorResponse,
+                     "description": "Visit not completed, transcript already "
+                                    "attached without replace=true, or a recording "
+                                    "is already being processed"},
+               413: {"model": ErrorResponse, "description": "Recording too large"},
+               422: {"model": ErrorResponse, "description": "Unsupported format"},
+               500: {"model": ErrorResponse,
+                     "description": "Speech-to-text or the model provider is not "
+                                    "configured on the server"}},
+    summary="Start a chunked recording upload",
+)
+def start_audio_upload(
+    visit_id: UUID,
+    payload: AudioUploadCreate,
+    conn: psycopg.Connection = Depends(get_db),
+    doctor: CurrentDoctor = Depends(require_doctor),
+) -> AudioUploadOut:
+    """Plan the upload of a consultation recording, to be sent in chunks.
+
+    Recordings go up in pieces because every request passes through the BFF, and
+    on Vercel a request body is capped at 4.5 MB. The response gives the chunk
+    plan: send each chunk with `PUT /audio-uploads/{upload_id}/chunks/{index}`,
+    then `POST /audio-uploads/{upload_id}/finish`.
+
+    Everything that would make the recording unusable is checked now, before any
+    bytes are sent. Starting again discards any unfinished upload for this visit.
+    """
+    upload = audio_upload_service.start_upload(
+        conn, doctor.doctor_id, str(visit_id),
+        filename=payload.filename, size_bytes=payload.size_bytes,
+        replace=payload.replace)
+    return AudioUploadOut.from_row(upload)
+
+
+@router.get(
+    "/{visit_id}/audio-upload",
+    response_model=Optional[AudioUploadOut],
+    responses={404: {"model": ErrorResponse, "description": "Unknown visit"}},
+    summary="The latest recording upload for a visit",
+)
+def latest_audio_upload(
+    visit_id: UUID,
+    response: Response,
+    conn: psycopg.Connection = Depends(get_db),
+    doctor: CurrentDoctor = Depends(require_doctor),
+):
+    """The most recent recording upload, so a page reload can resume polling.
+
+    204 when the visit has never had one, like `GET /visits/{id}/job`.
+    """
+    upload = audio_upload_service.latest_upload(conn, doctor.doctor_id, str(visit_id))
+    if upload is None:
+        response.status_code = status.HTTP_204_NO_CONTENT
+        return None
+    return AudioUploadOut.from_row(upload)
+
+
 @router.get(
     "/{visit_id}/transcript",
     response_model=TranscriptOut,
@@ -367,7 +435,7 @@ def generate_insights(
     )
     background.add_task(job_service.run_job, job.job_id)
 
-    prefix = get_settings().api_prefix
+    prefix = get_settings().api.prefix
     return JobAccepted(
         job_id=job.job_id,
         visit_id=job.visit_id,

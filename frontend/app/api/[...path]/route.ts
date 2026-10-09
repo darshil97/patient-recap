@@ -57,8 +57,11 @@ const BODILESS_STATUSES = new Set([204, 205, 304]);
  * the likely cause. UptimeRobot polls /api/v1/health every 12 minutes precisely
  * so this stays rare (§9.5).
  *
- * Insight generation does not sit behind this: POST /insights returns 202 in
- * milliseconds and the work happens on a background task the client polls.
+ * Neither insight generation nor recording transcription sits behind this:
+ * POST /insights and POST /audio-uploads/{id}/finish return 202 in milliseconds
+ * and the work happens on a background task the client polls. Recordings are
+ * sent in chunks under Vercel's 4.5 MB request body limit, so no single request
+ * here carries more than one chunk (backend speech.chunk_bytes).
  */
 const BACKEND_TIMEOUT_MS = 25_000;
 

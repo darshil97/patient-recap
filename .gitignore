@@ -8,6 +8,8 @@
 # seed transcripts live in backend/archive/transcripts_json/ and are tracked,
 # so a fresh clone can rebuild these with `python -m cli.convert_transcripts`.
 backend/transcripts/*.txt
+# Consultation recordings and in-flight upload chunks (local storage backend).
+backend/audio/
 
 # Generated output
 backend/output/
@@ -42,3 +44,5 @@ archive
 
 # run_local.sh state (pid files, logs)
 .run_local/
+
+*.ipynb

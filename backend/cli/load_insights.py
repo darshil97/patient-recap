@@ -58,7 +58,9 @@ from app.db.pool import close_pool, connection
 from app.db.repositories import doctors as doctors_repo
 from app.db.repositories import visits as visits_repo
 from app.db.tenancy import ALL_DOCTORS, DoctorScope
-from app.llm.gemini import build_llm
+from app.config import get_settings
+from app.llm.base import model_name
+from app.llm.factory import build_llm
 from app.services import insight_service
 
 # Set when the user presses Ctrl-C: stop after the current visit finishes.
@@ -123,7 +125,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="Abort on the first failure (default: skip and continue)")
     parser.add_argument("--sleep", type=float, default=0.0, metavar="SECONDS",
                         help="Pause between visits to stay under per-minute limits")
-    parser.add_argument("--model", default=None, help="Override the Gemini model id")
+    parser.add_argument("--model", default=None,
+                        help="Override the model id within llm.provider (config.yaml)")
     parser.add_argument("--stop-after", type=int, choices=(1, 2, 3), default=3,
                         help="Highest layer to run (default: 3)")
     parser.add_argument("--dry-run", action="store_true",
@@ -256,11 +259,10 @@ def select_visits(conn, scope: DoctorScope,
         visit = visits_repo.get(conn, scope, args.visit)
         return [visit] if visit else []
     if args.transcript:
-        from app.config import get_settings
         from app.domain.transcripts import normalise_path
 
         path = normalise_path(Path(args.transcript),
-                              get_settings().transcripts_dir.parent)
+                              get_settings().transcripts.local_dir.parent)
         visit = visits_repo.get_by_transcript_path(conn, scope, path)
         return [visit] if visit else []
     return visits_repo.list_visits(conn, scope, pending_only=not args.regenerate)
@@ -307,7 +309,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 report.line("Dry run: no model calls made, nothing written.")
                 return 0
 
-            llm = build_llm(model=args.model)
+            provider = get_settings().llm.provider
+            try:
+                llm = build_llm(model=args.model)
+            except AppError as exc:  # e.g. no API key configured
+                report.line(f"Error: {exc.message}")
+                return 1
+            report.line(f"model: {provider} {model_name(llm)}\n")
             progress = make_progress(report)
             saved = failed = skipped = 0
             tokens_total = 0
@@ -370,16 +378,22 @@ def main(argv: Optional[List[str]] = None) -> int:
 
                 except QuotaExhaustedError as exc:
                     failed += 1
-                    report.line(f"        EVERY API KEY IS EXHAUSTED "
-                                f"({llm.key_count} configured).")
-                    for label, state in llm.status().items():
-                        report.line(f"          {label}: {state}")
-                    report.line("        Free tier allows 20 requests per day per "
-                                "model per project; each visit costs 3.")
-                    report.line("        Options: wait for the daily reset and re-run "
-                                "(finished visits are skipped); try another model with "
-                                "--model, which has its own bucket; add another key as "
-                                "GOOGLE_API_KEY_4; or enable billing.")
+                    if provider == "bedrock":
+                        report.line("        BEDROCK IS THROTTLING or unavailable, "
+                                    "even after retries.")
+                        report.line("        Options: wait a minute and re-run "
+                                    "(finished visits are skipped); add --sleep "
+                                    "between visits; or request a higher on-demand "
+                                    "quota for the model in the AWS console.")
+                    else:
+                        report.line("        THE GEMINI KEY IS OUT OF QUOTA. The free "
+                                    "tier allows 20 requests per day per model per "
+                                    "project; each visit costs 3.")
+                        report.line("        Options: wait for the daily reset and "
+                                    "re-run (finished visits are skipped); try another "
+                                    "model with --model, which has its own bucket; "
+                                    "switch llm.provider in config.yaml; or enable "
+                                    "billing.")
                     report.line(f"        detail: {exc.message[:200]}")
                     skipped = len(visits) - index
                     report.line("\nStopping: every remaining call would fail the same "
@@ -409,8 +423,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             report.line(f"saved {saved} | failed {failed} | not processed {skipped}")
             report.line(f"tokens {_tokens(tokens_total)} | "
                         f"{time.monotonic() - run_started:.0f}s total")
-            report.line("api keys: " + ", ".join(
-                f"{label} {state}" for label, state in llm.status().items()))
+            report.line(f"model: {provider} {model_name(llm)}")
             if failed or skipped:
                 report.line("Re-run the same command to pick up whatever is left; "
                             "completed visits are skipped automatically.")

@@ -14,9 +14,12 @@ from fastapi.responses import JSONResponse
 
 from app.core.errors import (
     AppError,
+    AudioStorageError,
     ConflictError,
     NotFoundError,
     QuotaExhaustedError,
+    SpeechToTextError,
+    SpeechToTextUnavailableError,
     TranscriptError,
     TranscriptTooLargeError,
     UnauthorizedError,
@@ -34,6 +37,9 @@ STATUS_BY_TYPE = (
     (QuotaExhaustedError, 429),
     (ValidationError, 422),
     (TranscriptError, 422),           # a bad path is the caller's mistake
+    (SpeechToTextUnavailableError, 503),  # before its parent: retry shortly
+    (SpeechToTextError, 502),         # Deepgram failed, not the upload
+    (AudioStorageError, 503),         # retry the chunk
 )
 
 DEFAULT_STATUS = 500

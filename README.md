@@ -156,8 +156,8 @@ Because FastAPI trusts the BFF's identity assertion rather than verifying a toke
 
 ```
 GET    /api/v1/stats                          home-screen counters
-GET    /api/v1/health                         service + database + key count
-GET    /api/v1/health/api-keys                which Gemini keys work — never poll
+GET    /api/v1/health                         service + database + model provider
+GET    /api/v1/health/api-keys                does the model key work — never poll
 
 POST   /api/v1/patients                       register a patient
 GET    /api/v1/patients                       list / search (q, X-Total-Count)
@@ -277,7 +277,8 @@ python -m cli.load_insights --all         # process everything pending
 python -m cli.load_insights --all --limit 2      # costed trial run
 python -m cli.load_insights --all --pause        # confirm each visit
 python -m cli.load_insights --all --doctor me@example.com   # one doctor only
-python -m cli.check_keys                  # which API keys are usable
+python -m cli.check_keys                  # does the configured provider's key work
+python -m cli.check_keys --provider bedrock      # check the other provider's key
 python -m cli.render_prompt --transcript transcripts/<visit_id>.txt \
   --age 24 --gender Female --call-date 2026-02-16 --layer 1
 ```
@@ -306,10 +307,10 @@ written either way, and re-running skips finished visits.
 cd backend && python -m unittest discover -s tests -t .
 ```
 
-295 tests across six files, all offline: no API calls, no database, no object
-storage. They cover follow-up date resolution against every timing pattern in the
-sample corpus, multi-key rotation with stubbed clients, transcript storage on both
-backends, and the HTTP layer's routing, validation and error mapping.
+All offline: no API calls, no database, no object storage. They cover follow-up
+date resolution against every timing pattern in the sample corpus, configuration
+loading, provider construction and error classification, transcript storage on
+both backends, and the HTTP layer's routing, validation and error mapping.
 
 The most important suite is `TestCrossTenantIsolation` in `tests/test_api.py`: a
 regression there is a real patient data leak, not a cosmetic bug.
@@ -318,35 +319,53 @@ regression there is a real patient data leak, not a cosmetic bug.
 
 ## Configuration
 
-`backend/.env`, see `.env.example`:
+Two files with separate jobs:
 
-| Variable | Purpose |
+- **`backend/config.yaml`** (committed) holds everything about *what to run*:
+  provider, models, timeouts, pool sizes, upload limit, storage backend. It is
+  loaded into a typed tree by `app/config.py`, and an unknown key is a startup
+  error.
+- **`backend/.env`** (gitignored, see `.env.example`) holds secrets only. The YAML
+  reads them by name as `${NAME}` or `${NAME:-fallback}`; on a host without a
+  `.env`, set the same names as environment variables.
+
+```yaml
+llm:
+  provider: gemini            # gemini | bedrock
+  gemini:  { model: gemini-3.7-flash, api_key: ${GOOGLE_API_KEY} }
+  bedrock: { model: openai.gpt-oss-120b-1:0, api_key: ${AWS_BEARER_TOKEN_BEDROCK}, region: us-west-2 }
+```
+
+| Secret / per-host variable | Read as |
 | --- | --- |
-| `CONNSTR` | Postgres connection string |
-| `GOOGLE_API_KEY_1..8` | Gemini keys; the client rotates when one is rate limited |
-| `GOOGLE_API_KEY` | fallback if no numbered keys are set |
-| `GEMINI_MODEL` | model id, default `gemini-3.7-flash` |
-| `API_KEY` | shared secret for the API; unset leaves it open |
-| `CORS_ORIGINS` | allowed origins, default `*`. Accepts a bare value, a comma-separated list, or JSON |
-| `MAX_TRANSCRIPT_BYTES` | upload ceiling, default 262144 (256 KB) |
-| `TRANSCRIPT_STORAGE` | `local` or `neon_object_storage`; governs new uploads only |
-| `TRANSCRIPT_BUCKET` | bucket name, default `consultation-transcripts` |
+| `GOOGLE_API_KEY` | `llm.gemini.api_key` |
+| `AWS_BEARER_TOKEN_BEDROCK` | `llm.bedrock.api_key` (a Bedrock API key) |
+| `DEEPGRAM_API_KEY` | `speech.deepgram.api_key`; only needed for audio uploads |
+| `CONNSTR` | `database.url` |
+| `API_KEY` | `api.key`; shared secret for the API, unset leaves it open |
+| `CORS_ORIGINS` | `api.cors_origins`, default `*`. A bare value, a comma-separated list, or JSON |
 | `AWS_ENDPOINT_URL_S3` | Neon branch storage endpoint |
 | `AWS_ACCESS_KEY_ID` | the credential's `token_id` |
 | `AWS_SECRET_ACCESS_KEY` | the credential's `s3_secret_access_key` |
-| `AWS_REGION` | `us-east-2` |
+| `AWS_REGION` | Neon storage region, default `us-east-2` |
 
-The `AWS_*` names are standard on purpose, so `neon env pull` writes them directly
-and boto3 finds them without an alias layer. Create the credential in the Neon
-Console under the branch's **Credentials**, with `storage:read` and `storage:write`.
-**The secret is shown once and cannot be retrieved**, and credentials are
-branch-scoped: one minted on the default branch works there and on descendants
-only.
+The variables the old flat configuration read (`LLM_PROVIDER`, `GEMINI_MODEL`,
+`GOOGLE_API_KEY_1..8`, `TRANSCRIPT_STORAGE`, `MAX_TRANSCRIPT_BYTES`, ...) are no
+longer read; if one is still set, startup logs a warning naming its config.yaml
+key.
 
-Free-tier Gemini keys allow 20 requests per day per model per project, and each
-consultation costs 3. Keys in the same Google Cloud project share one bucket, so
-several keys do not guarantee proportionally more requests. `python -m
-cli.check_keys` tells you where you stand.
+The `AWS_*` names are standard on purpose, so `neon env pull` writes them directly.
+Create the credential in the Neon Console under the branch's **Credentials**, with
+`storage:read` and `storage:write`. **The secret is shown once and cannot be
+retrieved**, and credentials are branch-scoped: one minted on the default branch
+works there and on descendants only.
+
+Both providers go through LangChain (`app/llm/providers/`): Gemini through
+`ChatGoogleGenerativeAI`, Bedrock through `ChatBedrockConverse` with the API key as
+a bearer token. Each has one key. Throttling is retried by the provider's client and
+then surfaces as `quota_exhausted` (HTTP 429). Free-tier Gemini allows 20 requests
+per day per model per project, and each consultation costs 3. `python -m
+cli.check_keys` sends one request to confirm the selected provider's key.
 
 ---
 

@@ -24,7 +24,7 @@ from app.pipeline.prompts import render_prompt  # noqa: E402
 from app.pipeline.results import PatientContext  # noqa: E402
 from app.pipeline.runner import build_contexts  # noqa: E402
 
-PROMPTS_DIR = get_settings().prompts_dir
+PROMPTS_DIR = get_settings().llm.prompts_dir
 
 CALL_DATE = "2026-08-22"
 

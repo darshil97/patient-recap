@@ -10,7 +10,7 @@ Move stored transcripts between backends.
 
 WHY THIS IS A SEPARATE, EXPLICIT STEP
 
-Changing `TRANSCRIPT_STORAGE` only changes where the *next* upload goes. Existing
+Changing `transcripts.storage` only changes where the *next* upload goes. Existing
 visits keep reading through the provider recorded on their own row, so nothing
 breaks and nothing moves. Moving them is this script's job, and it is deliberately
 not a side effect of a setting or a startup hook: these files are the source
@@ -105,11 +105,12 @@ def show_status(conn, one_visit: Optional[str]) -> int:
     visits = _with_transcripts(conn, one_visit)
     settings = get_settings()
 
-    print(f"configured default for new uploads: {settings.transcript_storage}")
-    if settings.transcript_storage == NEON_OBJECT_STORAGE:
-        print(f"bucket: {settings.transcript_bucket}  "
-              f"endpoint: {settings.s3_endpoint_url or '(unset)'}")
-        print(f"credentials configured: {settings.object_storage_configured}")
+    storage = settings.transcripts
+    print(f"configured default for new uploads: {storage.storage}")
+    if storage.storage == NEON_OBJECT_STORAGE:
+        print(f"bucket: {storage.object_storage.bucket}  "
+              f"endpoint: {storage.object_storage.endpoint_url or '(unset)'}")
+        print(f"credentials configured: {storage.object_storage.configured}")
     print()
 
     by_provider: Dict[str, int] = {}

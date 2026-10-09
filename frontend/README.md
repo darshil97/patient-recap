@@ -103,6 +103,11 @@ POST   /visits/{id}/complete           mark done             -> 200
 POST   /visits/{id}/cancel             cancel                -> 200
 
 POST   /visits/{id}/transcript         upload .txt (multipart) -> 201
+POST   /visits/{id}/audio-uploads      or a recording: start   -> 201 + chunk plan
+PUT    /audio-uploads/{id}/chunks/{i}  one chunk (multipart)
+POST   /audio-uploads/{id}/finish      transcribe              -> 202
+GET    /audio-uploads/{id}             poll
+GET    /visits/{id}/audio-upload       latest (204 if none)
 GET    /visits/{id}/transcript         read it back
 DELETE /visits/{id}/transcript         remove it             -> 204
 
@@ -156,6 +161,56 @@ address is the same either way. The name you send is kept only for display in
 `GET /visits/{id}/transcript` returns the text with a `character_count`, so a
 brief can be shown next to its source.
 
+### Or a recording, sent in chunks
+
+Every request goes through the BFF, and on Vercel a request body is capped at
+4.5 MB, so a recording goes up in pieces. `lib/api/audioUploads.ts`
+(`uploadRecording`) does all of this; the steps are:
+
+1. `POST /visits/{id}/audio-uploads` with `{filename, size_bytes, replace}`.
+   Accepts `.mp3 .m4a .mp4 .aac .wav .flac .ogg .oga .opus .webm` up to 100 MB.
+   Everything that would make the recording unusable is checked here, before any
+   bytes move. The response is the plan: `upload_id`, `chunk_bytes`,
+   `chunk_count`.
+2. `PUT /audio-uploads/{upload_id}/chunks/{i}` for each `i`, multipart `file` =
+   bytes `[i * chunk_bytes, min((i + 1) * chunk_bytes, size_bytes))` —
+   `File.slice` does it. Sizes must be exact. Resending a chunk replaces it, so
+   retry a chunk on network errors, 5xx and 504; a 4xx will fail the same way
+   again.
+3. `POST /audio-uploads/{upload_id}/finish` -> 202. A 409 with
+   `details.missing` lists chunks to resend.
+4. Poll `GET /audio-uploads/{upload_id}` until `completed` or `failed`. On a
+   reload, `GET /visits/{id}/audio-upload` finds it again.
+
+The backend stitches the chunks into one stored recording, deletes the chunks,
+transcribes it, labels each voice `DOCTOR`, `PATIENT` or `OTHER (description)`,
+and stores the text as the visit's transcript — afterwards indistinguishable from
+a `.txt` upload.
+
+**Do not call `POST /insights` after a recording.** The backend queues the
+insight job itself, before it marks the upload `completed`, so on `completed`
+follow `GET /visits/{id}/job` straight into the compiling state. This is the one
+difference from `.txt`, where the frontend chains the generate call. It means a
+brief is compiled even if the uploading tab was closed. A failed job is retried
+with `POST /insights` as usual.
+
+`warnings` on a completed upload do not hold generation back. Show them above
+the brief (and its progress) as something to check against the transcript.
+They are stored, so they survive a reload; stop showing them once the visit's
+`transcript_uploaded_at` is later than the upload's `completed_at` (a different
+transcript replaced it).
+
+A `failed` upload with `retryable: true` still has its bytes: `finish` again to
+retry, no re-upload. Its `error_message` is written for the doctor.
+
+| Status | When |
+| --- | --- |
+| 409 | visit not `completed`, transcript exists without `replace`, a recording is already processing, chunks missing, or the upload no longer accepts chunks |
+| 413 | recording over the limit |
+| 422 | unsupported format, chunk index out of range, or a chunk not exactly its planned size |
+| 500 | `DEEPGRAM_API_KEY` or the LLM key missing on the server (at start) |
+| 503 | storage hiccup on a chunk — resend it |
+
 ### Follow-ups
 
 `GET /follow-ups` takes `status` (`open` default, or `resolved`/`dismissed`/`all`),
@@ -208,7 +263,9 @@ distinct — do not collapse them:
 
 Product decision: the doctor should not have to press a second button. A
 successful upload is immediately followed by `POST /visits/{id}/insights`, and the
-UI moves straight into the progress state.
+UI moves straight into the progress state. (A recording goes one step further:
+the backend starts generation itself once it is transcribed — see "Or a
+recording, sent in chunks".)
 
 The chaining lives in the **frontend**, not the upload endpoint, on purpose.
 Storing bytes always succeeds; generation costs money and hits a daily cap. Keeping
@@ -581,7 +638,7 @@ absent). It deliberately omits `insights_json`, which is 20-30 KB per visit.
 polling, or `204` when the visit has never had one — distinguishable from a `404`
 for an unknown visit.
 
-Never poll `GET /health/api-keys`: each call spends one request from every key's
-daily quota.
+Never poll `GET /health/api-keys`: each call spends one model request with the
+backend's API key (on Gemini's free tier, 1 of 20 a day).
 
 **Vercel Deployment:** https://patient-recap.vercel.app

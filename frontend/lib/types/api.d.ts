@@ -47,11 +47,11 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Check which Gemini keys are usable
-         * @description Send one minimal request per key to see which work.
+         * Check the model provider's API key
+         * @description Send one minimal request with the configured provider's key.
          *
-         *     Never poll this: each call consumes one request from every working key's
-         *     daily quota, and the free tier allows only 20 per key per day.
+         *     Never poll this: on Gemini each call spends one of the free tier's 20
+         *     requests a day, and on Bedrock it is a billed call.
          */
         get: operations["api_key_health_api_v1_health_api_keys_get"];
         put?: never;
@@ -350,6 +350,56 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/visits/{visit_id}/audio-uploads": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a chunked recording upload
+         * @description Plan the upload of a consultation recording, to be sent in chunks.
+         *
+         *     Recordings go up in pieces because every request passes through the BFF, and
+         *     on Vercel a request body is capped at 4.5 MB. The response gives the chunk
+         *     plan: send each chunk with `PUT /audio-uploads/{upload_id}/chunks/{index}`,
+         *     then `POST /audio-uploads/{upload_id}/finish`.
+         *
+         *     Everything that would make the recording unusable is checked now, before any
+         *     bytes are sent. Starting again discards any unfinished upload for this visit.
+         */
+        post: operations["start_audio_upload_api_v1_visits__visit_id__audio_uploads_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/visits/{visit_id}/audio-upload": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The latest recording upload for a visit
+         * @description The most recent recording upload, so a page reload can resume polling.
+         *
+         *     204 when the visit has never had one, like `GET /visits/{id}/job`.
+         */
+        get: operations["latest_audio_upload_api_v1_visits__visit_id__audio_upload_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/visits/{visit_id}/insights": {
         parameters: {
             query?: never;
@@ -523,10 +573,163 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/audio-uploads/{upload_id}/chunks/{index}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Send one chunk of a recording
+         * @description Store chunk `index`. Idempotent: sending it again replaces it, so a chunk
+         *     whose response was lost can simply be resent.
+         *
+         *     Every chunk but the last must be exactly `chunk_bytes`; the last is the
+         *     remainder of `size_bytes`.
+         */
+        put: operations["put_chunk_api_v1_audio_uploads__upload_id__chunks__index__put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/audio-uploads/{upload_id}/finish": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Finish a recording upload and start transcription
+         * @description Stitch the chunks into one stored recording and transcribe it.
+         *
+         *     202, then poll `GET /audio-uploads/{upload_id}`: stitching, speech-to-text
+         *     and speaker labelling together run past request timeouts. Also how a `failed`
+         *     upload is retried — its chunks or recording are kept, so nothing is re-sent.
+         */
+        post: operations["finish_upload_api_v1_audio_uploads__upload_id__finish_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/audio-uploads/{upload_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Poll a recording upload
+         * @description Progress and outcome. `completed` means the transcript is attached.
+         */
+        get: operations["get_upload_api_v1_audio_uploads__upload_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * AudioUploadCreate
+         * @description Start a chunked recording upload. The file itself follows in chunks.
+         */
+        AudioUploadCreate: {
+            /**
+             * Filename
+             * @description The recording's name; its extension decides the format. Kept for display only.
+             */
+            filename: string;
+            /**
+             * Size Bytes
+             * @description Exact size of the whole file
+             */
+            size_bytes: number;
+            /**
+             * Replace
+             * @description Required to overwrite an existing transcript
+             * @default false
+             */
+            replace: boolean;
+        };
+        /**
+         * AudioUploadOut
+         * @description A chunked recording upload: its chunk plan, progress, and outcome.
+         *
+         *     Send chunk `i` as bytes `[i * chunk_bytes, min((i + 1) * chunk_bytes,
+         *     size_bytes))` of the file. `speakers` and `warnings` are filled in once
+         *     `status` is `completed`; non-empty `warnings` mean the labels deserve a read
+         *     before insights are generated. A `failed` upload with `retryable` true can be
+         *     finished again without re-sending anything.
+         */
+        AudioUploadOut: {
+            /** Upload Id */
+            upload_id: string;
+            /** Visit Id */
+            visit_id: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "receiving" | "processing" | "completed" | "failed" | "abandoned" | "superseded";
+            /** Filename */
+            filename?: string | null;
+            /** Size Bytes */
+            size_bytes: number;
+            /** Chunk Bytes */
+            chunk_bytes: number;
+            /** Chunk Count */
+            chunk_count: number;
+            /** Chunks Received */
+            chunks_received: number;
+            /**
+             * Recording Stored
+             * @description The chunks have been stitched into one stored recording
+             */
+            recording_stored: boolean;
+            /** Retryable */
+            retryable: boolean;
+            /** Speakers */
+            speakers: components["schemas"]["SpeakerOut"][];
+            /** Warnings */
+            warnings: string[];
+            /** Duration Seconds */
+            duration_seconds?: number | null;
+            /** Error Code */
+            error_code?: string | null;
+            /** Error Message */
+            error_message?: string | null;
+            /** Created At */
+            created_at?: string | null;
+            /** Updated At */
+            updated_at?: string | null;
+            /** Completed At */
+            completed_at?: string | null;
+        };
+        /** Body_put_chunk_api_v1_audio_uploads__upload_id__chunks__index__put */
+        Body_put_chunk_api_v1_audio_uploads__upload_id__chunks__index__put: {
+            /**
+             * File
+             * Format: binary
+             * @description Exactly the bytes of this chunk
+             */
+            file: string;
+        };
         /** Body_upload_transcript_api_v1_visits__visit_id__transcript_post */
         Body_upload_transcript_api_v1_visits__visit_id__transcript_post: {
             /**
@@ -721,10 +924,12 @@ export interface components {
             status: string;
             /** Database */
             database: string;
+            /** Provider */
+            provider: string;
             /** Model */
             model: string;
-            /** Api Keys Configured */
-            api_keys_configured: number;
+            /** Api Key Configured */
+            api_key_configured: boolean;
         };
         /** InsightOut */
         InsightOut: {
@@ -856,30 +1061,28 @@ export interface components {
             /** Finished At */
             finished_at?: string | null;
         };
-        /** KeyHealth */
-        KeyHealth: {
-            /** Index */
-            index: number;
+        /**
+         * KeyHealthResponse
+         * @description Result of one minimal request with the configured provider's API key.
+         */
+        KeyHealthResponse: {
+            /** Provider */
+            provider: string;
+            /** Model */
+            model: string;
+            /** Key Variable */
+            key_variable: string;
+            /** Configured */
+            configured: boolean;
             /** Usable */
             usable: boolean;
             /** Kind */
             kind: string;
-            /** Length */
-            length: number;
-            /** Looks Like Google Key */
-            looks_like_google_key: boolean;
             /**
              * Detail
              * @default
              */
             detail: string;
-        };
-        /** KeyHealthResponse */
-        KeyHealthResponse: {
-            /** Model */
-            model: string;
-            /** Keys */
-            keys: components["schemas"]["KeyHealth"][];
         };
         /**
          * PatientCreate
@@ -962,6 +1165,37 @@ export interface components {
             phone?: string | null;
             /** Email */
             email?: string | null;
+        };
+        /**
+         * SpeakerOut
+         * @description One voice in a recording, and who it was identified as.
+         */
+        SpeakerOut: {
+            /**
+             * Speaker
+             * @description The speech-to-text service's anonymous voice number. Not shown in the transcript.
+             */
+            speaker: number;
+            /**
+             * Role
+             * @enum {string}
+             */
+            role: "doctor" | "patient" | "other";
+            /**
+             * Label
+             * @description The line prefix used in the stored transcript, e.g. DOCTOR or OTHER (patient's mother)
+             */
+            label: string;
+            /**
+             * Confidence
+             * @enum {string}
+             */
+            confidence: "high" | "medium" | "low";
+            /**
+             * Turns
+             * @description How many turns this voice has in the transcript
+             */
+            turns: number;
         };
         /**
          * StatsOut
@@ -1979,6 +2213,117 @@ export interface operations {
             };
         };
     };
+    start_audio_upload_api_v1_visits__visit_id__audio_uploads_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                visit_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AudioUploadCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioUploadOut"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Visit not completed, transcript already attached without replace=true, or a recording is already being processed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Recording too large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unsupported format */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Speech-to-text or the model provider is not configured on the server */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    latest_audio_upload_api_v1_visits__visit_id__audio_upload_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                visit_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioUploadOut"] | null;
+                };
+            };
+            /** @description Unknown visit */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     read_insights_api_v1_visits__visit_id__insights_get: {
         parameters: {
             query?: never;
@@ -2303,6 +2648,159 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["JobOut"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    put_chunk_api_v1_audio_uploads__upload_id__chunks__index__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                upload_id: string;
+                /** @description 0-based chunk number */
+                index: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["Body_put_chunk_api_v1_audio_uploads__upload_id__chunks__index__put"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioUploadOut"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description The upload no longer accepts chunks */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Index out of range, or not exactly the planned size */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Storage unavailable; send the chunk again */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    finish_upload_api_v1_audio_uploads__upload_id__finish_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                upload_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioUploadOut"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Chunks missing (listed in details.missing), or the upload is already processing, completed or replaced */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_upload_api_v1_audio_uploads__upload_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                upload_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioUploadOut"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
             /** @description Validation Error */

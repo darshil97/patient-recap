@@ -27,7 +27,8 @@ class GenerateInsightsRequest(BaseModel):
     # Rebuild insights that already exist. Without this a second submit is a 409.
     regenerate: bool = False
 
-    # Override the configured Gemini model. Each model has its own daily quota.
+    # Override the model id within the configured llm.provider (a Gemini name,
+    # or a Bedrock model id). On Gemini each model has its own daily quota.
     model: Optional[str] = None
 
 

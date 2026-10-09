@@ -45,7 +45,7 @@ ignores, exactly as `X-API-Key` does today.
 
 `GET /health` stays fully exempt from both gates so a monitor can check liveness
 without holding the secret or being a doctor. `GET /health/api-keys` is *not*
-exempt, because each call spends one request from every Gemini key's daily quota.
+exempt, because each call spends one model request with the server's API key.
 """
 
 from __future__ import annotations
@@ -148,7 +148,7 @@ async def require_auth(
     Compared with hmac.compare_digest rather than `==` so the check cannot leak
     the key's length or content through response timing.
     """
-    expected = get_settings().api_key
+    expected = get_settings().api.key
     if not expected:
         return  # open by design when unset
 

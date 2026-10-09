@@ -52,7 +52,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     try:
-        transcript = load_transcript(args.transcript, settings.transcripts_dir)
+        transcript = load_transcript(args.transcript, settings.transcripts.local_dir)
     except AppError as exc:
         print(f"Error: {exc.message}")
         return 1
@@ -77,7 +77,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         print(render_prompt(LAYERS[args.layer].template, context,
-                            settings.prompts_dir))
+                            settings.llm.prompts_dir))
     except AppError as exc:
         print(f"Error: {exc.message}")
         return 1
