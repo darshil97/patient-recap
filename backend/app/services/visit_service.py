@@ -1,11 +1,16 @@
 """
 Visit scheduling and lifecycle, scoped to one doctor.
 
-    Schedule  ->  Complete  ->  Add Transcript  ->  Generate Insights
+    Schedule  ->  [Start session]  ->  Complete  ->  Add Transcript  ->  Generate Insights
 
 Each transition is explicit. Attaching a transcript deliberately does *not*
 complete a visit: an implicit status change would contradict the Complete button
-and make the real state depend on the order of two unrelated actions.
+and make the real state depend on the order of two unrelated actions. The UI may
+make both calls for the doctor in one gesture; the server still sees two.
+
+Starting a session is optional. It moves a visit to `in_progress`, which is what
+a live recording requires (§8.24); a doctor who uploads a file afterwards never
+needs it.
 
 Every function takes a `DoctorScope`. A visit has no doctor_id of its own — it
 derives one through its patient — so "which doctor is asking" has to travel down
@@ -128,7 +133,7 @@ def update_visit(
     exist, its reopening of the follow-ups that visit had resolved, and the
     `completed_at` / `cancelled_at` stamps -- so a visit could end up cancelled
     with its follow-up still closed, silently dropping a patient who needs
-    calling. `/complete` and `/cancel` are the only transitions (§8.17).
+    calling. `/start`, `/complete` and `/cancel` are the only transitions (§8.17).
 
     The transcript is attached by upload, which derives its address from the
     visit id; a caller-supplied path could name another doctor's transcript
@@ -147,6 +152,34 @@ def update_visit(
     updated = visits_repo.update(conn, scope, visit_id, changes)
     logger.info("Updated %s: %s", visit_id, ", ".join(changes) or "no changes")
     return updated  # type: ignore[return-value]
+
+
+def start_visit(conn: psycopg.Connection, scope: DoctorScope,
+                visit_id: str) -> VisitRow:
+    """Mark a scheduled consultation as under way (`in_progress`).
+
+    Idempotent for a visit already in progress, so a double click or a second
+    tab is harmless. A completed or cancelled visit cannot be restarted: either
+    would reopen a consultation the record says is over.
+    """
+    visit = get_visit(conn, scope, visit_id)
+    if visit.visit_status == "in_progress":
+        return visit
+    if visit.visit_status != "scheduled":
+        raise ConflictError(
+            f"This visit is {visit.visit_status} and cannot be started.",
+            details={"visit_id": visit_id, "visit_status": visit.visit_status})
+
+    updated = visits_repo.mark_in_progress(conn, scope, visit_id)
+    # The UPDATE re-checks the status, so a visit completed or cancelled since
+    # the read above is left alone and shows up here unchanged.
+    if updated is None or updated.visit_status != "in_progress":
+        raise ConflictError(
+            "This visit changed while it was being started. Reload and try again.",
+            details={"visit_id": visit_id,
+                     "visit_status": updated.visit_status if updated else None})
+    logger.info("Started %s", updated.label)
+    return updated
 
 
 def complete_visit(
@@ -206,11 +239,34 @@ def cancel_visit(
         reopened = follow_up_service.reopen_for_cancelled_visit(conn, scope,
                                                                visit_id)
 
+    _discard_recordings(conn, scope, visit_id)
+
     logger.info("Cancelled %s%s (reason: %s)",
                 visit.label,
                 f", reopened {len(reopened)} follow-up(s)" if reopened else "",
                 cleaned or "not given")
     return updated  # type: ignore[return-value]
+
+
+def _discard_recordings(conn: psycopg.Connection, scope: DoctorScope,
+                        visit_id: str) -> None:
+    """Remove a cancelled visit's unfinished recordings, best-effort.
+
+    After the cancel has committed, so a live recording still running in some tab
+    is refused its next chunk rather than accepted for a visit that is over. A
+    failure here is logged, not raised: the cancellation itself is done, and
+    leftovers are tidied by the startup reaper a day later anyway.
+
+    Imported here, not at the top: audio_upload_service imports get_visit from
+    this module.
+    """
+    from app.services import audio_upload_service
+
+    try:
+        audio_upload_service.discard_unfinished_for_visit(conn, scope, visit_id)
+    except Exception:
+        logger.warning("Cancelled %s, but could not discard its unfinished "
+                       "recordings", visit_id, exc_info=True)
 
 
 def list_visits(

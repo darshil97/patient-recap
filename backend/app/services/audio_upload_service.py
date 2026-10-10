@@ -37,6 +37,26 @@ TENANCY ON THE ASYNC PATH
 
 As in job_service: `process_upload` holds only an upload id, resolves the owning
 doctor from it, and does every read and write under that scope.
+
+LIVE RECORDINGS (§8.24)
+
+    POST /visits/{id}/start                   the session      -> visit in_progress
+    POST /visits/{id}/audio-uploads/live      no size, no plan -> receiving (live)
+    PUT  /audio-uploads/{id}/chunks/{index}   while recording, live_chunk_bytes each
+    POST /visits/{id}/complete                the consultation is over
+    POST /audio-uploads/{id}/finish           {chunk_count}: plan fixed -> processing
+    POST /audio-uploads/{id}/discard          or throw an unfinished one away
+
+A recording made in the browser is sent while it is still being recorded, so a
+closed tab costs the last piece, not the consultation. Its size is unknown until
+it stops, so it starts with no plan; finish works the plan out from the chunks
+that arrived (live_plan) and writes it in the same UPDATE that claims it. From
+there it is an ordinary upload and everything below is shared. The pieces are
+exact-size like a file's, so "every chunk arrived" keeps its meaning.
+
+While a live recording is receiving, nothing may start another upload for the
+visit: a file upload used to discard whatever was unfinished, which would delete
+a consultation that is still being recorded.
 """
 
 from __future__ import annotations
@@ -64,10 +84,12 @@ from app.db.tenancy import DoctorScope
 from app.domain.audio import (
     audio_extension,
     check_audio_size,
+    check_live_chunk,
     chunk_count,
     content_type_for,
     display_filename,
     expected_chunk_size,
+    live_plan,
 )
 from app.llm.base import ChatClient
 from app.services import audio_transcript_service, job_service, transcript_service
@@ -152,6 +174,28 @@ def _get(conn: psycopg.Connection, scope: DoctorScope, upload_id: str) -> AudioU
     return upload
 
 
+def _refuse_if_busy(visit_id: str, unfinished: List[AudioUploadRow]) -> None:
+    """Refuse a new upload while another for the visit must not be disturbed.
+
+    One being processed is about to write the transcript. A live recording still
+    receiving is a consultation being recorded right now -- or one whose tab
+    closed, which the doctor has not yet chosen to process or discard. Discarding
+    either silently (what starting an upload used to do with anything unfinished)
+    would lose it.
+    """
+    if any(u.status == "processing" for u in unfinished):
+        raise ConflictError(
+            "A recording for this visit is already being processed. Wait for it to "
+            "finish before uploading another.",
+            details={"visit_id": visit_id})
+    live = next((u for u in unfinished if u.is_live and u.is_receiving), None)
+    if live is not None:
+        raise ConflictError(
+            "A live recording for this visit has not been finished. Finish or "
+            "discard it before starting another.",
+            details={"visit_id": visit_id, "upload_id": live.upload_id})
+
+
 # --------------------------------------------------------------------------- #
 # Request path
 # --------------------------------------------------------------------------- #
@@ -170,8 +214,8 @@ def start_upload(
     Everything that would make the recording unusable is checked here, before a
     byte is sent: the visit rules, the format, the size, and the keys needed to
     process it. Any unfinished upload for the same visit (a closed tab, or a
-    failed one the doctor chose not to retry) is discarded; one still processing
-    is a conflict.
+    failed one the doctor chose not to retry) is discarded; one still processing,
+    or an unfinished live recording, is a conflict (_refuse_if_busy).
     """
     settings = get_settings()
     visit = get_visit(conn, scope, visit_id)
@@ -181,11 +225,7 @@ def start_upload(
     _require_processing_configured()
 
     unfinished = uploads_repo.unfinished_for_visit(conn, scope, visit_id)
-    if any(u.status == "processing" for u in unfinished):
-        raise ConflictError(
-            "A recording for this visit is already being processed. Wait for it to "
-            "finish before uploading another.",
-            details={"visit_id": visit_id})
+    _refuse_if_busy(visit_id, unfinished)
     _discard(conn, unfinished)
 
     chunk_bytes = settings.speech.chunk_bytes
@@ -213,6 +253,73 @@ def start_upload(
     return upload
 
 
+def start_live_upload(
+    conn: psycopg.Connection,
+    scope: DoctorScope,
+    visit_id: str,
+    *,
+    filename: Optional[str],
+    replace: bool = False,
+) -> AudioUploadRow:
+    """Open a live recording for a visit in progress, to be sent while recording.
+
+    Checked now, before the microphone is on: the visit is in progress, the
+    format, and the keys needed to process it. The size cannot be checked yet;
+    each chunk is checked against the ceiling as it arrives instead. A second live
+    recording for the visit, from another tab say, is a conflict rather than a
+    replacement, because the first may still be recording.
+    """
+    settings = get_settings()
+    visit = get_visit(conn, scope, visit_id)
+    transcript_service.check_can_record(visit, replace)
+    extension = audio_extension(filename)
+    _require_processing_configured()
+
+    unfinished = uploads_repo.unfinished_for_visit(conn, scope, visit_id)
+    _refuse_if_busy(visit_id, unfinished)
+    _discard(conn, unfinished)
+
+    try:
+        upload = uploads_repo.create(
+            conn, scope,
+            visit_id=visit_id,
+            filename=display_filename(filename),
+            extension=extension,
+            total_bytes=None,
+            chunk_bytes=settings.speech.live_chunk_bytes,
+            chunk_count=None,
+            replace_transcript=replace,
+            storage_provider=default_provider(),
+            mode="live",
+        )
+    except psycopg.errors.UniqueViolation as exc:
+        raise ConflictError("Another recording for this visit has just started.",
+                            details={"visit_id": visit_id}) from exc
+    if upload is None:
+        raise NotFoundError(f"No visit with id {visit_id}.")
+
+    logger.info("Started live recording %s for %s (%d-byte chunks)",
+                upload.upload_id, visit.label, upload.chunk_bytes)
+    return upload
+
+
+def _check_planned_chunk(upload: AudioUploadRow, index: int, data: bytes) -> None:
+    """A file upload's chunk against the plan it declared at start."""
+    count = upload.chunk_count or 0
+    if not 0 <= index < count:
+        raise ValidationError(
+            f"Chunk index {index} is out of range; this upload has "
+            f"{count} chunks (0 to {count - 1}).",
+            details={"index": index, "chunk_count": count})
+
+    expected = expected_chunk_size(index, upload.total_bytes or 0, upload.chunk_bytes)
+    if len(data) != expected:
+        raise ValidationError(
+            f"Chunk {index} is {len(data):,} bytes; it must be exactly {expected:,}.",
+            details={"index": index, "size_bytes": len(data),
+                     "expected_bytes": expected})
+
+
 def put_chunk(
     conn: psycopg.Connection,
     scope: DoctorScope,
@@ -231,18 +338,13 @@ def put_chunk(
         raise ConflictError(
             f"This upload is {upload.status} and no longer accepts chunks.",
             details={"upload_id": upload_id, "status": upload.status})
-    if not 0 <= index < upload.chunk_count:
-        raise ValidationError(
-            f"Chunk index {index} is out of range; this upload has "
-            f"{upload.chunk_count} chunks (0 to {upload.chunk_count - 1}).",
-            details={"index": index, "chunk_count": upload.chunk_count})
 
-    expected = expected_chunk_size(index, upload.total_bytes, upload.chunk_bytes)
-    if len(data) != expected:
-        raise ValidationError(
-            f"Chunk {index} is {len(data):,} bytes; it must be exactly {expected:,}.",
-            details={"index": index, "size_bytes": len(data),
-                     "expected_bytes": expected})
+    if upload.is_live:
+        # No plan yet: the exact-size rule is applied at finish (live_plan).
+        check_live_chunk(index, len(data), upload.chunk_bytes,
+                         get_settings().speech.max_upload_bytes)
+    else:
+        _check_planned_chunk(upload, index, data)
 
     store = get_audio_store(upload.storage_provider)
     locator = chunk_locator(upload_id, index)
@@ -258,11 +360,16 @@ def put_chunk(
 
 
 def finish_upload(conn: psycopg.Connection, scope: DoctorScope,
-                  upload_id: str) -> AudioUploadRow:
+                  upload_id: str, *,
+                  chunk_count: Optional[int] = None) -> AudioUploadRow:
     """Hand a fully received (or failed, retryable) upload to the background task.
 
     The caller schedules `process_upload` after this returns. Missing chunks are a
     409 naming them, so the browser can resend exactly those.
+
+    `chunk_count` is how many chunks the client sent. A live recording uses it to
+    fix its plan (omitted after an interrupted session: what arrived is the
+    recording). For a file upload it is optional and must match the plan.
     """
     upload = _get(conn, scope, upload_id)
     if upload.status == "processing":
@@ -271,9 +378,21 @@ def finish_upload(conn: psycopg.Connection, scope: DoctorScope,
     if upload.status == "completed":
         raise ConflictError("This recording has already been transcribed.",
                             details={"upload_id": upload_id})
-    if upload.status in ("abandoned", "superseded"):
+    if upload.status == "abandoned":
+        raise ConflictError("This upload was discarded or replaced by a newer one.",
+                            details={"upload_id": upload_id, "status": upload.status})
+    if upload.status == "superseded":
         raise ConflictError("This upload was replaced by a newer one.",
                             details={"upload_id": upload_id, "status": upload.status})
+
+    if not upload.plan_known:
+        return _claim_live(conn, scope, upload, chunk_count)
+
+    if chunk_count is not None and chunk_count != upload.chunk_count:
+        raise ValidationError(
+            f"This upload was planned as {upload.chunk_count} chunks, not "
+            f"{chunk_count}.",
+            details={"upload_id": upload_id, "chunk_count": upload.chunk_count})
 
     if not upload.recording_stored:
         received = uploads_repo.chunk_sizes(conn, upload_id)
@@ -289,6 +408,74 @@ def finish_upload(conn: psycopg.Connection, scope: DoctorScope,
                             details={"upload_id": upload_id})
     logger.info("Audio upload %s queued for processing", upload_id)
     return claimed
+
+
+def _claim_live(conn: psycopg.Connection, scope: DoctorScope,
+                upload: AudioUploadRow,
+                declared_count: Optional[int]) -> AudioUploadRow:
+    """Fix a live recording's plan from what arrived, and claim it.
+
+    The visit must be completed by now (End session completes it first), so this
+    applies check_can_attach like any upload start does: refusing here leaves the
+    recording receiving and intact, whereas discovering it after speech-to-text
+    would have paid for a transcript the visit could not accept.
+    """
+    visit = get_visit(conn, scope, upload.visit_id)
+    transcript_service.check_can_attach(visit, upload.replace_transcript)
+
+    sizes = uploads_repo.chunk_sizes(conn, upload.upload_id)
+    try:
+        total, count = live_plan(sizes, upload.chunk_bytes, declared_count)
+    except AppError as exc:
+        exc.details.setdefault("upload_id", upload.upload_id)
+        raise
+    check_audio_size(total, get_settings().speech.max_upload_bytes)
+
+    claimed = uploads_repo.claim_live(conn, scope, upload.upload_id, WORKER_ID,
+                                      total_bytes=total, chunk_count=count)
+    if claimed is None:
+        # A chunk landed (or the upload was discarded) between reading the chunks
+        # and claiming them; the plan no longer matches what is stored.
+        raise ConflictError(
+            "The recording changed while finishing; try again.",
+            details={"upload_id": upload.upload_id})
+    logger.info("Live recording %s queued for processing (%d bytes in %d chunks)",
+                upload.upload_id, total, count)
+    return claimed
+
+
+def discard_upload(conn: psycopg.Connection, scope: DoctorScope,
+                   upload_id: str) -> AudioUploadRow:
+    """Throw away an unfinished upload: its chunks, and any stitched recording.
+
+    For the doctor who decides an interrupted live recording is not worth
+    processing, or wants to record again. Idempotent for one already discarded.
+    Refused once processing has started, and for a completed recording, which is
+    the source of the visit's transcript.
+    """
+    upload = _get(conn, scope, upload_id)
+    if upload.status == "abandoned":
+        return upload
+    if upload.status not in ("receiving", "failed"):
+        raise ConflictError(
+            f"This recording is {upload.status} and cannot be discarded.",
+            details={"upload_id": upload_id, "status": upload.status})
+    _discard(conn, [upload])
+    return _get(conn, scope, upload_id)
+
+
+def discard_unfinished_for_visit(conn: psycopg.Connection, scope: DoctorScope,
+                                 visit_id: str) -> int:
+    """Discard a cancelled visit's unfinished uploads. Returns how many.
+
+    A cancelled visit can never accept a transcript, so a live recording left
+    receiving, or a failed upload, would sit in storage with nothing able to use
+    it. One mid-processing is left alone: it fails by itself at the visit check.
+    """
+    unfinished = [u for u in uploads_repo.unfinished_for_visit(conn, scope, visit_id)
+                  if u.status != "processing"]
+    _discard(conn, unfinished)
+    return len(unfinished)
 
 
 def get_upload(conn: psycopg.Connection, scope: DoctorScope,

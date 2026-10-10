@@ -35,7 +35,12 @@ from app.schemas.insights import (
     JobAccepted,
     JobOut,
 )
-from app.schemas.transcripts import AudioUploadCreate, AudioUploadOut, TranscriptOut
+from app.schemas.transcripts import (
+    AudioUploadCreate,
+    AudioUploadOut,
+    LiveRecordingCreate,
+    TranscriptOut,
+)
 from app.schemas.visits import (
     VisitCancelRequest,
     VisitCompleteRequest,
@@ -197,6 +202,29 @@ def update_visit(
 # --------------------------------------------------------------------------- #
 
 @router.post(
+    "/{visit_id}/start",
+    response_model=VisitOut,
+    responses={404: {"model": ErrorResponse},
+               409: {"model": ErrorResponse,
+                     "description": "Visit is completed or cancelled"}},
+    summary="Start a consultation session",
+)
+def start_visit(
+    visit_id: UUID,
+    conn: psycopg.Connection = Depends(get_db),
+    doctor: CurrentDoctor = Depends(require_doctor),
+) -> VisitOut:
+    """Move a scheduled visit to `in_progress`: the consultation is under way.
+
+    Required before a live recording (`POST /visits/{visit_id}/audio-uploads/live`).
+    Idempotent: starting a visit already in progress returns it unchanged. Finish
+    the consultation with `/complete`, as for any other visit.
+    """
+    return VisitOut.model_validate(
+        visit_service.start_visit(conn, doctor.doctor_id, str(visit_id)))
+
+
+@router.post(
     "/{visit_id}/complete",
     response_model=VisitOut,
     responses={404: {"model": ErrorResponse},
@@ -318,12 +346,54 @@ def start_audio_upload(
     then `POST /audio-uploads/{upload_id}/finish`.
 
     Everything that would make the recording unusable is checked now, before any
-    bytes are sent. Starting again discards any unfinished upload for this visit.
+    bytes are sent. Starting again discards any unfinished upload for this visit,
+    except an unfinished live recording, which is a 409 until it is finished or
+    discarded.
     """
     upload = audio_upload_service.start_upload(
         conn, doctor.doctor_id, str(visit_id),
         filename=payload.filename, size_bytes=payload.size_bytes,
         replace=payload.replace)
+    return AudioUploadOut.from_row(upload)
+
+
+@router.post(
+    "/{visit_id}/audio-uploads/live",
+    response_model=AudioUploadOut,
+    status_code=status.HTTP_201_CREATED,
+    responses={404: {"model": ErrorResponse},
+               409: {"model": ErrorResponse,
+                     "description": "Session not started, transcript already "
+                                    "attached without replace=true, a live "
+                                    "recording is already open, or a recording is "
+                                    "being processed"},
+               422: {"model": ErrorResponse, "description": "Unsupported format"},
+               500: {"model": ErrorResponse,
+                     "description": "Speech-to-text or the model provider is not "
+                                    "configured on the server"}},
+    summary="Start a live recording, sent while it is recorded",
+)
+def start_live_recording(
+    visit_id: UUID,
+    payload: LiveRecordingCreate,
+    conn: psycopg.Connection = Depends(get_db),
+    doctor: CurrentDoctor = Depends(require_doctor),
+) -> AudioUploadOut:
+    """Open a recording made in the browser during the consultation (§8.24).
+
+    The visit must be `in_progress` (`POST /visits/{visit_id}/start`). Send the
+    recording as it is made with `PUT /audio-uploads/{upload_id}/chunks/{index}`:
+    every chunk exactly `chunk_bytes`, except the last. When the consultation
+    ends, `POST /visits/{visit_id}/complete`, then
+    `POST /audio-uploads/{upload_id}/finish` with `{"chunk_count": n}`.
+
+    Unlike a file upload, this does not discard an unfinished live recording for
+    the visit: that is a conflict, because it may still be recording. Finish or
+    discard it first.
+    """
+    upload = audio_upload_service.start_live_upload(
+        conn, doctor.doctor_id, str(visit_id),
+        filename=payload.filename, replace=payload.replace)
     return AudioUploadOut.from_row(upload)
 
 

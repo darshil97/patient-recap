@@ -56,6 +56,9 @@ logger = logging.getLogger(__name__)
 # Uploading is only allowed once the consultation is done, which is what makes an
 # "Add Transcript" button legitimately disabled until then.
 UPLOADABLE_STATUSES = ("completed",)
+# A live recording is the exception: it is made during the consultation, so it
+# starts on a visit in progress and is attached once the visit is completed.
+RECORDABLE_STATUSES = ("in_progress",)
 
 
 @dataclass
@@ -153,6 +156,27 @@ def check_can_attach(visit: VisitRow, replace: bool) -> None:
         raise ConflictError(
             f"Visit is {visit.visit_status}; a transcript can only be attached to a "
             f"completed visit. Mark the visit complete first.",
+            details={"visit_id": visit.visit_id, "visit_status": visit.visit_status})
+
+    if visit.transcript_path and not replace:
+        raise ConflictError(
+            "This visit already has a transcript. Send replace=true to overwrite it.",
+            details={"visit_id": visit.visit_id,
+                     "transcript_filename": visit.transcript_filename})
+
+
+def check_can_record(visit: VisitRow, replace: bool) -> None:
+    """The rules for starting a live recording, the one thing allowed *before* a
+    visit is completed (§8.24).
+
+    A session must have been started: recording is something that happens during
+    a consultation, so `in_progress` is the state it belongs to. The transcript it
+    eventually becomes is still attached under check_can_attach, at finish, by
+    which time the visit has been completed like any other.
+    """
+    if visit.visit_status not in RECORDABLE_STATUSES:
+        raise ConflictError(
+            f"Visit is {visit.visit_status}; start the session before recording.",
             details={"visit_id": visit.visit_id, "visit_status": visit.visit_status})
 
     if visit.transcript_path and not replace:

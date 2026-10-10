@@ -2,26 +2,32 @@
 
 import { useEffect, useState } from "react";
 import type { Visit } from "@/lib/api/visits";
-import { completeVisit, cancelVisit, uploadTranscript } from "@/lib/api/visits";
+import { completeVisit, cancelVisit, startVisit, uploadTranscript } from "@/lib/api/visits";
 import {
+  discardAudioUpload,
   finishAudioUpload,
+  finishWithRecovery,
   isAudioFile,
   uploadRecording,
   type AudioUploadOut,
   type ChunkProgress,
 } from "@/lib/api/audioUploads";
+import { checkUploadFile } from "@/lib/api/uploadChecks";
 import { generateInsights } from "@/lib/api/insights";
 import type { JobOut } from "@/lib/api/insights";
 import { TranscriptDropzone } from "./TranscriptDropzone";
 import { TranscriptSection } from "./TranscriptSection";
+import { lifecycleState } from "./lifecycleState";
 import { useToast } from "../../components/Toast";
 import { ApiError } from "@/lib/api/client";
+import { useLiveSession } from "../recording/LiveSessionProvider";
+import { LiveRecorderPanel } from "../recording/LiveRecorderPanel";
 
 /**
- * The pre-brief lifecycle states from visit-pending.html: not yet held,
- * awaiting transcript, transcribing a recording, compiling, and the
- * daily-quota-reached state. Renders whichever state the visit (and its latest
- * job and recording upload) is currently in.
+ * The pre-brief lifecycle states from visit-pending.html: not yet held, in
+ * session (recording live), awaiting transcript, transcribing a recording,
+ * an interrupted live recording, compiling, and the daily-quota-reached state.
+ * Which one applies is decided by lifecycleState(); this renders it.
  *
  * The recording upload is tracked by VisitPage, not here, because what happens
  * when it completes — following the insight job the backend starts — belongs to
@@ -33,7 +39,7 @@ export function VisitLifecycle({
   recording,
   recordingError,
   onVisitChanged,
-  onRecordingStarted,
+  onRecordingChanged,
   onGenerationStarted,
 }: {
   visit: Visit;
@@ -41,11 +47,13 @@ export function VisitLifecycle({
   recording: AudioUploadOut | null;
   recordingError: string | null;
   onVisitChanged: () => void;
-  /** An upload handed to the backend, to be polled until it settles. */
-  onRecordingStarted: (upload: AudioUploadOut) => void;
+  /** An upload changed here: handed over (to be polled until it settles), or
+   *  discarded. */
+  onRecordingChanged: (upload: AudioUploadOut) => void;
   onGenerationStarted: (jobId: string) => void;
 }) {
   const { showToast } = useToast();
+  const live = useLiveSession();
   const [busy, setBusy] = useState(false);
   // Chunks of a recording on their way up. Only this tab can send them, so this
   // is local state; once handed over, the backend's upload row takes over.
@@ -134,7 +142,7 @@ export function VisitLifecycle({
         replace: Boolean(visit.transcript_path),
         onProgress: setSending,
       });
-      onRecordingStarted(accepted);
+      onRecordingChanged(accepted);
       showToast("Recording uploaded. Transcribing, then compiling the brief…");
     } catch (err) {
       showToast(
@@ -153,7 +161,7 @@ export function VisitLifecycle({
     setBusy(true);
     try {
       const accepted = await finishAudioUpload(uploadId);
-      onRecordingStarted(accepted);
+      onRecordingChanged(accepted);
     } catch (err) {
       showToast(err instanceof ApiError ? err.message : "Could not retry the recording.", {
         variant: "error",
@@ -179,34 +187,146 @@ export function VisitLifecycle({
     }
   }
 
-  // State: an in-flight job that hasn't reached a terminal status yet.
-  if (job && !["succeeded", "failed", "failed_quota"].includes(job.status)) {
-    return <CompilingState job={job} />;
+  /**
+   * Upload to a visit not completed yet. The file is checked here first, so an
+   * obviously wrong one is refused before the visit is marked complete; then two
+   * explicit calls, /complete and the upload (the server rule is unchanged).
+   */
+  async function handleUploadAndComplete(file: File) {
+    const problem = await checkUploadFile(file);
+    if (problem) {
+      showToast(problem, { variant: "error" });
+      return;
+    }
+    setBusy(true);
+    try {
+      await completeVisit(visit.visit_id);
+    } catch (err) {
+      showToast(err instanceof ApiError ? err.message : "Could not complete the visit.", {
+        variant: "error",
+      });
+      setBusy(false);
+      return;
+    }
+    setBusy(false);
+    onVisitChanged();
+    await handleUpload(file);
   }
 
-  // State: the last job failed because every configured API key is rate limited.
-  if (job && job.status === "failed_quota") {
-    return <QuotaState onRetry={handleGenerate} busy={busy} />;
+  async function handleStartSession() {
+    setBusy(true);
+    try {
+      await startVisit(visit.visit_id);
+      showToast("Session started.");
+      onVisitChanged();
+    } catch (err) {
+      showToast(err instanceof ApiError ? err.message : "Could not start the session.", {
+        variant: "error",
+      });
+    } finally {
+      setBusy(false);
+    }
   }
 
-  // State: the last job failed for a real reason.
-  if (job && job.status === "failed") {
+  /** A live session ended here: follow it into transcribing, like an upload. */
+  function handleHandedOver(accepted: AudioUploadOut) {
+    onRecordingChanged(accepted);
+    onVisitChanged();
+  }
+
+  /** An interrupted live recording: complete the visit if needed, then finish
+   *  with no chunk count, so whatever arrived is the recording. */
+  async function handleProcessInterrupted(upload: AudioUploadOut) {
+    setBusy(true);
+    try {
+      if (visit.visit_status !== "completed") await completeVisit(visit.visit_id);
+      const accepted = await finishWithRecovery(upload.upload_id);
+      onRecordingChanged(accepted);
+      onVisitChanged();
+      showToast("Transcribing what was recorded, then compiling the brief…");
+    } catch (err) {
+      showToast(err instanceof ApiError ? err.message : "Could not process the recording.", {
+        variant: "error",
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleDiscardInterrupted(upload: AudioUploadOut) {
+    if (!confirm("Discard this recording? It is deleted and cannot be recovered.")) return;
+    setBusy(true);
+    try {
+      onRecordingChanged(await discardAudioUpload(upload.upload_id));
+      showToast("Recording discarded.");
+    } catch (err) {
+      showToast(err instanceof ApiError ? err.message : "Could not discard the recording.", {
+        variant: "error",
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const state = lifecycleState({
+    visit,
+    job,
+    recording,
+    sending: sending !== null,
+    recordingHere: live.session?.visitId === visit.visit_id,
+  });
+
+  if (state === "compiling" && job) return <CompilingState job={job} />;
+  // The last job failed because the model provider's daily limit was reached.
+  if (state === "quota") return <QuotaState onRetry={handleGenerate} busy={busy} />;
+  if (state === "job_failed" && job) {
     return <FailedState job={job} onRetry={handleGenerate} busy={busy} />;
   }
 
-  // State: not yet held.
-  if (visit.visit_status === "scheduled") {
+  if (state === "recording_live" || state === "in_session") {
     return (
-      <NotYetHeldState
+      <InSessionState
         visit={visit}
         busy={busy}
+        recordingHere={state === "recording_live"}
+        onHandedOver={handleHandedOver}
         onComplete={handleComplete}
         onCancel={handleCancel}
+        onUpload={handleUploadAndComplete}
       />
     );
   }
 
-  if (visit.visit_status === "cancelled") {
+  if (state === "transcribing") {
+    return <RecordingProgressState sending={sending} recording={recording} />;
+  }
+
+  if (state === "interrupted" && recording) {
+    return (
+      <InterruptedState
+        visit={visit}
+        recording={recording}
+        busy={busy}
+        onProcess={() => handleProcessInterrupted(recording)}
+        onDiscard={() => handleDiscardInterrupted(recording)}
+      />
+    );
+  }
+
+  if (state === "scheduled") {
+    return (
+      <ScheduledState
+        visit={visit}
+        busy={busy}
+        onStartSession={handleStartSession}
+        onComplete={handleComplete}
+        onCancel={handleCancel}
+        onUpload={handleUploadAndComplete}
+      />
+    );
+  }
+
+  if (state === "cancelled") {
     return (
       <div className="card">
         <div className="card-body">
@@ -221,13 +341,8 @@ export function VisitLifecycle({
     );
   }
 
-  // State: a recording is going up, or the backend is transcribing it.
-  if (sending || recording?.status === "processing") {
-    return <RecordingProgressState sending={sending} recording={recording} />;
-  }
-
   // State: completed, no transcript yet.
-  if (!visit.transcript_path) {
+  if (state === "add_transcript") {
     return (
       <div className="card">
         <div className="card-head">
@@ -249,7 +364,10 @@ export function VisitLifecycle({
               </svg>
               <span>
                 <span className="notice-title">
-                  {recording.filename ?? "The recording"} could not be transcribed.
+                  {recording.mode === "live"
+                    ? "The live recording"
+                    : (recording.filename ?? "The recording")}{" "}
+                  could not be transcribed.
                 </span>{" "}
                 {recording.error_message ?? "Something went wrong while processing it."}
                 {recording.retryable && (
@@ -269,7 +387,7 @@ export function VisitLifecycle({
               </span>
             </div>
           )}
-          {recording?.status === "receiving" && (
+          {recording?.status === "receiving" && recording.mode === "file" && (
             <div className="notice" style={{ marginBottom: 14 }}>
               <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
                 <circle cx="8" cy="8" r="6" />
@@ -278,8 +396,8 @@ export function VisitLifecycle({
               <span>
                 <span className="notice-title">An earlier upload did not finish.</span>{" "}
                 {recording.filename ?? "The recording"} stopped at{" "}
-                {recording.chunks_received} of {recording.chunk_count} parts. Choose the
-                file again to start over.
+                {recording.chunks_received} of {recording.chunk_count ?? "?"} parts. Choose
+                the file again to start over.
               </span>
             </div>
           )}
@@ -296,7 +414,7 @@ export function VisitLifecycle({
   }
 
   // State: transcript attached, insights never generated (and no job history).
-  if (!visit.has_insights) {
+  if (state === "generate") {
     return (
       <div className="card">
         <div className="card-body">
@@ -405,16 +523,53 @@ function RecordingProgressState({
   );
 }
 
-function NotYetHeldState({
+/** Upload instead of recording: the dropzone, behind a button, with the note
+ *  that uploading also completes the visit. */
+function UploadInstead({
+  busy,
+  onUpload,
+  label,
+}: {
+  busy: boolean;
+  onUpload: (file: File) => void;
+  label: string;
+}) {
+  const [open, setOpen] = useState(false);
+  if (!open) {
+    return (
+      <button className="btn" disabled={busy} onClick={() => setOpen(true)}>
+        {label}
+      </button>
+    );
+  }
+  return (
+    <div style={{ marginTop: 14, flexBasis: "100%" }}>
+      <TranscriptDropzone onFileSelected={onUpload} busy={busy} />
+      <p style={{ fontSize: 12.5, color: "var(--ink-2)", marginTop: 10 }}>
+        Uploading marks the visit complete. A recording is transcribed and each voice
+        is labelled as doctor, patient or someone else present.{" "}
+        <button className="btn btn--subtle btn--sm" onClick={() => setOpen(false)}>
+          Hide
+        </button>
+      </p>
+    </div>
+  );
+}
+
+function ScheduledState({
   visit,
   busy,
+  onStartSession,
   onComplete,
   onCancel,
+  onUpload,
 }: {
   visit: Visit;
   busy: boolean;
+  onStartSession: () => void;
   onComplete: () => void;
   onCancel: () => void;
+  onUpload: (file: File) => void;
 }) {
   return (
     <div className="card">
@@ -423,17 +578,16 @@ function NotYetHeldState({
           <div>
             <p style={{ fontWeight: 600 }}>Consultation not yet held</p>
             <p style={{ color: "var(--ink-2)", fontSize: 13, marginTop: 4, maxWidth: "60ch" }}>
-              Mark the visit complete once you have seen the patient. You can then add
-              the recording transcript and compile the brief.
+              Start a session to record the consultation here as it happens, or upload a
+              recording or transcript once it is over. Either way the brief is compiled
+              from it.
             </p>
           </div>
-          <div style={{ display: "flex", gap: 8 }}>
-            <button className="btn btn--primary" disabled={busy} onClick={onComplete}>
-              Complete visit
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button className="btn btn--primary" disabled={busy} onClick={onStartSession}>
+              Start session
             </button>
-            <button className="btn btn--subtle" disabled={busy} onClick={onCancel}>
-              Cancel visit
-            </button>
+            <UploadInstead busy={busy} onUpload={onUpload} label="Upload transcript" />
           </div>
         </div>
 
@@ -449,7 +603,7 @@ function NotYetHeldState({
             <span className="step-mark" aria-hidden="true" />
             <div>
               <div className="step-name">Transcript</div>
-              <div className="step-detail">Upload after the consultation</div>
+              <div className="step-detail">Recorded live, or uploaded afterwards</div>
             </div>
           </li>
           <li className="step--todo">
@@ -460,6 +614,148 @@ function NotYetHeldState({
             </div>
           </li>
         </ul>
+
+        <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+          <button className="btn btn--subtle btn--sm" disabled={busy} onClick={onComplete}>
+            Mark complete without a transcript
+          </button>
+          <button className="btn btn--subtle btn--sm" disabled={busy} onClick={onCancel}>
+            Cancel visit
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function InSessionState({
+  visit,
+  busy,
+  recordingHere,
+  onHandedOver,
+  onComplete,
+  onCancel,
+  onUpload,
+}: {
+  visit: Visit;
+  busy: boolean;
+  /** This tab is recording this visit: no alternatives while it does. */
+  recordingHere: boolean;
+  onHandedOver: (upload: AudioUploadOut) => void;
+  onComplete: () => void;
+  onCancel: () => void;
+  onUpload: (file: File) => void;
+}) {
+  return (
+    <div className="card">
+      <div className="card-head">
+        <h2 className="card-title">{recordingHere ? "Recording the consultation" : "Session in progress"}</h2>
+        <span className="badge badge--accent badge--dot">In session</span>
+      </div>
+      <div className="card-body">
+        <LiveRecorderPanel visit={visit} onHandedOver={onHandedOver} />
+        {!recordingHere && (
+          <div
+            style={{
+              display: "flex",
+              gap: 8,
+              marginTop: 16,
+              paddingTop: 14,
+              borderTop: "1px solid var(--border)",
+              flexWrap: "wrap",
+              alignItems: "center",
+            }}
+          >
+            <span className="muted" style={{ fontSize: 12.5 }}>Not recording here?</span>
+            <UploadInstead busy={busy} onUpload={onUpload} label="Upload a recording or transcript" />
+            <button className="btn btn--subtle btn--sm" disabled={busy} onClick={onComplete}>
+              Mark complete without a transcript
+            </button>
+            <button className="btn btn--subtle btn--sm" disabled={busy} onClick={onCancel}>
+              Cancel visit
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function timeOf(iso: string | null | undefined): string | null {
+  if (!iso) return null;
+  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/** A live recording that stopped without End session: a closed tab, a crash. */
+function InterruptedState({
+  visit,
+  recording,
+  busy,
+  onProcess,
+  onDiscard,
+}: {
+  visit: Visit;
+  recording: AudioUploadOut;
+  busy: boolean;
+  onProcess: () => void;
+  onDiscard: () => void;
+}) {
+  const from = timeOf(recording.created_at);
+  const to = timeOf(recording.last_chunk_at);
+  const saved = recording.bytes_received > 0;
+  // Pieces arrive about once a minute while recording, so one this recent means
+  // it may still be recording in another tab, where it should be ended instead.
+  const [openedAt] = useState(() => Date.now());
+  const lastPieceAt = recording.last_chunk_at ? Date.parse(recording.last_chunk_at) : null;
+  const maybeStillRecording = lastPieceAt !== null && openedAt - lastPieceAt < 3 * 60_000;
+  return (
+    <div className="card">
+      <div className="card-head">
+        <h2 className="card-title">Recording interrupted</h2>
+      </div>
+      <div className="card-body">
+        <div className="notice">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
+            <circle cx="8" cy="8" r="6" />
+            <path d="M8 5v3.5M8 11h.01" />
+          </svg>
+          <span>
+            <span className="notice-title">
+              The live recording stopped before the session was ended.
+            </span>{" "}
+            {saved ? (
+              <>
+                What was saved runs from {from ?? "the start"}
+                {to ? ` to ${to}` : ""}. Up to the last minute before it stopped may be
+                missing. It is kept for a day unless you process or discard it.
+              </>
+            ) : (
+              <>Nothing was saved before it stopped.</>
+            )}
+          </span>
+        </div>
+        {maybeStillRecording && (
+          <p style={{ fontSize: 13, marginBottom: 12, maxWidth: "64ch" }}>
+            The last part arrived a few minutes ago. If this consultation is still being
+            recorded in another tab or on another computer, end the session there instead:
+            processing or discarding it here stops that recording.
+          </p>
+        )}
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {saved && (
+            <button className="btn btn--primary" disabled={busy} onClick={onProcess}>
+              {busy ? "Working…" : "Process what was saved"}
+            </button>
+          )}
+          <button className={saved ? "btn" : "btn btn--primary"} disabled={busy} onClick={onDiscard}>
+            {visit.visit_status === "in_progress" ? "Discard and record again" : "Discard"}
+          </button>
+        </div>
+        {saved && visit.visit_status !== "completed" && (
+          <p className="muted" style={{ fontSize: 12.5, marginTop: 10 }}>
+            Processing marks the visit complete.
+          </p>
+        )}
       </div>
     </div>
   );

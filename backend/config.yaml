@@ -86,6 +86,10 @@ speech:
   # goes through the Vercel-hosted BFF and Vercel caps a request body at 4.5 MB.
   # The pieces are stitched into one recording and deleted.
   chunk_bytes: 4000000
+  # A live recording made in the browser is sent while it is still being
+  # recorded, in pieces of this size (256 KiB, about a minute of speech), so a
+  # closed tab loses at most the last one. Must not exceed chunk_bytes.
+  live_chunk_bytes: 262144
   # Where chunks and recordings go when transcripts.storage is local (relative
   # to backend/). With neon_object_storage they go in the same bucket.
   local_dir: audio

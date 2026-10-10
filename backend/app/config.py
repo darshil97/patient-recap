@@ -27,7 +27,14 @@ from typing import Any, Dict, List, Literal, Mapping, Optional
 
 import yaml
 from dotenv import dotenv_values
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +250,10 @@ class SpeechConfig(_Section):
     # Next.js BFF, and Vercel caps a function's request body at 4.5 MB, so this
     # stays under that with room for the multipart envelope.
     chunk_bytes: int = Field(default=4_000_000, ge=64 * 1024)
+    # Size of each piece a live, in-browser recording is sent in while it is
+    # still being recorded (§8.24). Small, so a closed tab loses at most this
+    # much: 256 KiB is about a minute of speech at the recorder's 32 kbps.
+    live_chunk_bytes: int = Field(default=256 * 1024, ge=64 * 1024)
     # Chunks and recordings for the local storage backend. Which backend is used
     # follows transcripts.storage, so audio sits next to its transcript.
     local_dir: Path = Path("audio")
@@ -252,6 +263,16 @@ class SpeechConfig(_Section):
     @classmethod
     def _resolve_local_dir(cls, value: Path) -> Path:
         return _under_base_dir(value)
+
+    @model_validator(mode="after")
+    def _live_chunks_fit_a_request(self) -> "SpeechConfig":
+        # Both kinds of chunk cross the same 4.5 MB BFF body cap, and the chunk
+        # route reads at most chunk_bytes + 1 of a request.
+        if self.live_chunk_bytes > self.chunk_bytes:
+            raise ValueError(
+                f"speech.live_chunk_bytes ({self.live_chunk_bytes}) must not exceed "
+                f"speech.chunk_bytes ({self.chunk_bytes}).")
+        return self
 
 
 class Settings(_Section):

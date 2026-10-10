@@ -54,11 +54,47 @@ export async function putAudioChunk(
   return unwrap(result);
 }
 
-export async function finishAudioUpload(uploadId: string): Promise<AudioUploadOut> {
+/**
+ * Hand an upload over for transcription. `chunkCount` fixes a live recording's
+ * plan; omit it for a file upload, a retry, or an interrupted live session (the
+ * backend then takes whatever arrived as the recording).
+ */
+export async function finishAudioUpload(
+  uploadId: string,
+  chunkCount?: number,
+): Promise<AudioUploadOut> {
   const result = await api.POST("/api/v1/audio-uploads/{upload_id}/finish", {
+    params: { path: { upload_id: uploadId } },
+    body: chunkCount === undefined ? null : { chunk_count: chunkCount },
+  });
+  return unwrap(result);
+}
+
+/** Open a live recording on a visit in progress. No size: it is not known yet. */
+export async function startLiveRecording(
+  visitId: string,
+  body: { filename: string; replace: boolean },
+): Promise<AudioUploadOut> {
+  const result = await api.POST("/api/v1/visits/{visit_id}/audio-uploads/live", {
+    params: { path: { visit_id: visitId } },
+    body,
+  });
+  return unwrap(result);
+}
+
+/** Throw away an unfinished upload. Idempotent; 409 once processing or done. */
+export async function discardAudioUpload(uploadId: string): Promise<AudioUploadOut> {
+  const result = await api.POST("/api/v1/audio-uploads/{upload_id}/discard", {
     params: { path: { upload_id: uploadId } },
   });
   return unwrap(result);
+}
+
+/** A live recording that stopped receiving before anyone finished it. */
+export function isInterruptedLiveRecording(
+  upload: Pick<AudioUploadOut, "mode" | "status"> | null | undefined,
+): boolean {
+  return Boolean(upload && upload.mode === "live" && upload.status === "receiving");
 }
 
 export async function getAudioUpload(uploadId: string): Promise<AudioUploadOut> {
@@ -88,7 +124,7 @@ const RETRY_BASE_MS = 1000;
  * for the backend, or storage hiccuped. A 4xx is the request itself and will
  * fail the same way every time.
  */
-function isTransient(err: unknown): boolean {
+export function isTransient(err: unknown): boolean {
   if (err instanceof ApiError) {
     return [408, 429, 500, 502, 503, 504].includes(err.status);
   }
@@ -98,7 +134,7 @@ function isTransient(err: unknown): boolean {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function withRetry<T>(attempt: () => Promise<T>): Promise<T> {
+export async function withRetry<T>(attempt: () => Promise<T>): Promise<T> {
   for (let tries = 1; ; tries++) {
     try {
       return await attempt();
@@ -134,6 +170,11 @@ export async function uploadRecording(
     replace: options.replace,
   });
   const { upload_id: uploadId, chunk_bytes: size, chunk_count: total } = upload;
+  // A file upload declares its size, so its plan is always known. Only a live
+  // recording (mode "live") has a null plan while it is being recorded.
+  if (total === null) {
+    throw new Error("The server did not return a chunk plan for this upload.");
+  }
 
   options.onProgress?.({ sent: 0, total });
   for (let index = 0; index < total; index++) {
@@ -142,11 +183,21 @@ export async function uploadRecording(
     options.onProgress?.({ sent: index + 1, total });
   }
 
-  // If Finish was accepted but its response was lost, a resend is a 409 — so on
-  // any failure, check whether the server already has it before trying again.
+  return finishWithRecovery(uploadId);
+}
+
+/**
+ * Finish, surviving a lost response. If Finish was accepted but its response
+ * never arrived, a resend is a 409 — so on any failure, check whether the server
+ * already has it before trying again.
+ */
+export function finishWithRecovery(
+  uploadId: string,
+  chunkCount?: number,
+): Promise<AudioUploadOut> {
   return withRetry(async () => {
     try {
-      return await finishAudioUpload(uploadId);
+      return await finishAudioUpload(uploadId, chunkCount);
     } catch (err) {
       const current = await getAudioUpload(uploadId).catch(() => null);
       if (current && (current.status === "processing" || current.status === "completed")) {

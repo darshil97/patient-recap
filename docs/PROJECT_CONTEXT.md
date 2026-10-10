@@ -63,13 +63,16 @@ POST   /api/v1/visits                         schedule a consultation
 GET    /api/v1/visits                         list (status/date filters, sort)
 GET    /api/v1/visits/{visit_id}              single visit
 PATCH  /api/v1/visits/{visit_id}              correct date/time/type only (§8.17)
+POST   /api/v1/visits/{visit_id}/start        start the session -> in_progress (§8.24)
 POST   /api/v1/visits/{visit_id}/complete     mark the consultation done
 POST   /api/v1/visits/{visit_id}/cancel       cancel, reopening its follow-ups
 
 POST   /api/v1/visits/{visit_id}/transcript   upload the .txt (multipart)
 POST   /api/v1/visits/{visit_id}/audio-uploads   or a recording: start, get chunk plan (§8.23)
+POST   /api/v1/visits/{visit_id}/audio-uploads/live   or record live, sent while recording (§8.24)
 PUT    /api/v1/audio-uploads/{upload_id}/chunks/{index}   one chunk, idempotent
 POST   /api/v1/audio-uploads/{upload_id}/finish   stitch + transcribe -> 202 (also retries)
+POST   /api/v1/audio-uploads/{upload_id}/discard  throw an unfinished one away
 GET    /api/v1/audio-uploads/{upload_id}          poll until completed | failed
 GET    /api/v1/visits/{visit_id}/audio-upload     latest, to resume polling (204 if none)
 GET    /api/v1/visits/{visit_id}/transcript   read it back
@@ -91,9 +94,11 @@ deliberately does **not** complete a visit (§8.17), and a transcript can only b
 attached to a visit that is already `completed`.
 
 `PATCH /visits/{id}` corrects a visit's own details — date, time, type — and
-**cannot** change `visit_status` or touch the transcript. `/complete` and
-`/cancel` are the only status transitions (§8.17); `POST /transcript` is the only
-way a transcript is attached (§8.19).
+**cannot** change `visit_status` or touch the transcript. `/start`, `/complete`
+and `/cancel` are the only status transitions (§8.17); `/start` (scheduled →
+`in_progress`) is optional and exists for live recording (§8.24). A transcript is
+attached only by uploading one — `POST /transcript`, or a recording that becomes
+one (§8.19, §8.23).
 
 Every list endpoint returns the total in `X-Total-Count`, and it counts the same
 filters as the list (§7). A total larger than the array means there are more
@@ -265,6 +270,7 @@ backend/
 │   ├── 7_multi_tenancy.sql      migration: doctors, patients.doctor_id
 │   ├── 8_cancellation_reason.sql migration: visits.cancelled_reason
 │   ├── 9_audio_uploads.sql      migration: audio_uploads, audio_upload_chunks
+│   ├── 10_live_recordings.sql   migration: audio_uploads.mode, plan nullable while live
 │   └── extra.sql                future tables, all commented out
 ├── tests/                       unittest suites
 ├── legacy/                      pre-refactor scripts, safe to delete
@@ -301,7 +307,9 @@ frontend/
 │   └── design-system.css   the approved clinical design (accent tokens in :root)
 ├── views/                  the six page components, ported from the Vite app
 ├── features/  components/  hooks/
+│   └── features/recording/ the live recorder: provider (in the (app) layout), panel, bar (§8.24)
 ├── lib/
+│   ├── recording/          pure: format picker, exact-size chunker, uploader, level meter maths
 │   ├── api/                openapi-fetch wrappers, same-origin only
 │   ├── auth/               server.ts (secrets) and client.ts (browser)
 │   └── types/api.d.ts      generated from /openapi.json
@@ -517,6 +525,12 @@ and one stored recording per visit (`completed` with `audio_path`). The complete
 row is *the* visit recording; `speakers` and `warnings` hold its labelling for the
 UI. `audio_upload_chunks` lists the pieces received and is emptied once they are
 stitched.
+
+`mode` is `file` or `live` (§8.24). A live recording has `total_bytes` and
+`chunk_count` NULL while it is receiving; finish writes them. The
+`audio_uploads_plan_known` CHECK allows a NULL plan only for a live row that is
+`receiving` or `abandoned`, so nothing reaches processing without one, and the
+existing cover constraint still holds once it is set.
 
 ---
 
@@ -1201,6 +1215,138 @@ or rejected `DEEPGRAM_API_KEY` 500, storage hiccup on a chunk 503 (resend),
 Deepgram throttled/down 503, other Deepgram failure 502, LLM throttled 429. During
 processing these become the upload's `error_code` / `error_message`.
 
+### 8.24 Live recordings: sent while recording, planned at the end
+
+A doctor can record the consultation in the browser instead of uploading a file
+afterwards. Every scheduled visit offers **Start session** and **Upload
+transcript**. Upload completes the visit and then uploads: two explicit calls,
+with the file checked in the browser first (`lib/api/uploadChecks.ts`).
+
+```
+browser  POST /visits/{id}/start                  scheduled -> in_progress
+         POST /visits/{id}/audio-uploads/live     mode=live, no plan  -> receiving
+         PUT  /audio-uploads/{id}/chunks/i        every ~minute while recording
+         POST /visits/{id}/complete               End session
+         POST /audio-uploads/{id}/finish {chunk_count: n}   plan fixed -> processing
+backend  unchanged from §8.23: stitch -> Deepgram -> speakers -> transcript -> job
+```
+
+**Chunks go up during the consultation, not after it.** A consultation cannot be
+repeated. Kept only in the tab's memory until the end, it would be lost to a
+closed tab, a crash, or a laptop going to sleep. Sent as it is recorded, a crash
+costs at most the piece not yet sent. A Render restart mid-consultation costs
+nothing: the browser keeps retrying until the backend is back.
+
+**Same security, by construction.** Each chunk is an ordinary authenticated
+`PUT` through the BFF, the same route a file upload uses, so the session check,
+`X-API-Key` and `X-Doctor-*` all apply (§8.12). Deepgram is still called only by
+FastAPI. A WebSocket was ruled out: Vercel cannot proxy one, and connecting the
+browser straight to Render would bypass the BFF.
+
+**The plan is written last, not weakened.** A file upload declares its size and
+gets its plan at start. A live one cannot, so `total_bytes` and `chunk_count`
+are NULL while it is receiving. The pieces are still exact-size —
+`speech.live_chunk_bytes`, 256 KiB, about a minute at 32 kbps, every one except
+the last. The browser cuts the recorder's byte stream to that size rather than
+sending `MediaRecorder` blobs as they come.
+
+At finish, `domain/audio.live_plan` works the plan out from the chunk rows:
+- indices 0..n-1 all present (409 `details.missing` otherwise);
+- every chunk except the last full size;
+- `n` equal to the `chunk_count` the browser declares.
+
+`claim_live` then writes the plan and moves the upload to `processing` in one
+UPDATE. Its WHERE re-checks the chunk count, the byte total and that nothing sits
+past index n-1, so a chunk landing in between matches nothing rather than
+producing a wrong plan. From there the row is an ordinary upload, with no live
+branch: the cover constraint, `_stitch`'s byte-for-byte check, retry and the
+reaper all see a known plan. A short middle chunk is refused because it would
+make the stitched file differ from the recording.
+
+The ceiling is enforced as the recording grows. Every earlier chunk is full, so
+chunk `i` ends at `i * chunk_bytes + size`, and anything past
+`speech.max_upload_bytes` is a 413 without counting rows.
+
+**`in_progress` is what recording needs.** Uploads still require `completed`
+(§8.17). Recording is the one thing allowed before that, because it happens
+during the consultation. `/start` is the explicit transition into that state.
+Finish still applies `check_can_attach`, so End session completes the visit and
+then finishes. Finishing on an in-progress visit is a 409 while the chunks are
+still intact, not a failure after paying for speech-to-text.
+
+**A live recording is never silently replaced.** Starting a file upload used to
+discard anything unfinished for the visit. Applied to a live recording, that
+would delete a consultation still being recorded in another tab. Now any upload
+start, live or file, is a 409 while a live recording is `receiving`. The doctor
+resolves it explicitly:
+- *process*: finish with no `chunk_count`, so whatever arrived is the recording;
+- *discard*: `POST /audio-uploads/{id}/discard`.
+
+`/cancel` discards the visit's unfinished uploads after it commits, so a
+recorder still sending gets a 409 on its next chunk and stops. An interrupted
+recording nobody resolves is kept for 24 hours after its last chunk, then
+removed by the startup reaper, like any stale `receiving` upload.
+
+**Formats.** `.webm` (Chrome, Edge, Firefox), `.mp4` (Safari) and `.ogg` were
+already in the allowlist. The extension of the filename sent at start declares
+the recorder's format, as for a file.
+
+**The recorder lives in the `(app)` layout, not on the visit page.**
+`features/recording/LiveSessionProvider.tsx` owns the microphone, the
+MediaRecorder, the chunker and the uploader. A layout survives client-side
+navigation, so the doctor can open the patient's previous brief
+mid-consultation without stopping the recording. `RecordingBar`, in the sticky
+header, shows the session on every other page. There is one session at a time,
+because there is one microphone and one consultation in the room. A full reload
+or sign-out ends the session, and the `beforeunload` warning asks first.
+
+**Browser half of the plan rule.** The recorder emits a blob every 10 s at
+32 kbps mono (`lib/recording/format.ts`). Browser defaults are several times
+higher, which would reach the 100 MB ceiling in a long consultation.
+`ExactChunker` joins those blobs and re-cuts them into exact 256 KiB pieces. The
+pieces join back into the same bytes, so the stitched file is the recording.
+
+`LiveUploader` sends pieces one at a time and in order, which is what keeps the
+server's chunk rows gap-free. It retries transient failures forever with backoff
+capped at 30 s: giving up would only throw away audio that will get through
+later, and recording carries on meanwhile. It stops on a failure the server
+means:
+- 409 (discarded, or the visit cancelled elsewhere): the session fails with an
+  explanation;
+- 413 (the size ceiling): recording stops and End session processes what was
+  acknowledged.
+
+**End session order:** stop the recorder, flush the last piece, wait for every
+piece, `/complete`, then `finish {chunk_count}`, using `finishWithRecovery`'s
+lost-response handling. If either of the last two fails, the session stays
+open, nothing is lost, and End session retries only those two steps. An empty
+recording is discarded rather than finished.
+
+**Microphone settings.** Echo cancellation and noise suppression are off: they
+are tuned for calls and can clip the far voice in a room, which is the
+patient's. Automatic gain stays on. A level meter and a 30-second silence
+warning catch a muted or wrong microphone. A screen wake lock is taken while
+recording and re-taken when the tab becomes visible again, because a sleeping
+laptop suspends the recorder.
+
+**Interrupted sessions** are worked out from the server's row, not remembered:
+the latest upload is `mode: live, status: receiving` and not this tab's
+(`features/visits/lifecycleState.ts`). The visit page shows when it ran
+(`created_at` → `last_chunk_at`) and offers *Process what was saved* (complete
+if needed, then finish with no count) or *Discard*. If the last piece arrived in
+the past three minutes, it warns that the recording may still be running in
+another tab, where processing it here would stop it.
+
+**Consent** is a checkbox in the UI ("The patient has agreed to this
+consultation being recorded") that enables Start recording. It is not stored on
+the server; storing it would be a small follow-up.
+
+**Not verified in a real browser yet** (Vitest covers the logic with a fake
+MediaRecorder): that Deepgram decodes the joined WebM from Chrome and Firefox and
+the joined MP4 from Safari, including a recording cut off part-way. If a cut-off
+Safari MP4 cannot be decoded, crash recovery on Safari falls back to Discard
+only. A normal End session is unaffected.
+
 ## 9. Commands
 
 All with the `reels` interpreter, run from `backend/`.
@@ -1251,8 +1397,10 @@ daily quota bucket), `--stop-after`, `--stop-on-error`.
 Ctrl-C once stops after the visit in flight; twice abandons it immediately. Either
 way nothing partial is written and re-running skips completed visits.
 
-Schema is applied in numeric order, and migrations 1 through 8 are all applied
-to the current database; `sql/9_audio_uploads.sql` is needed for recording uploads. `sql/7_multi_tenancy.sql` seeds the first doctor from an email set at the
+Schema is applied in numeric order. Migrations 1 through 9 are applied to the
+current database. `sql/10_live_recordings.sql` is required by the code from
+§8.24 onwards: every audio upload query selects `mode`. Its `DO` blocks need a
+real client (psql or psycopg), not a tool that splits on semicolons. `sql/7_multi_tenancy.sql` seeds the first doctor from an email set at the
 top of its section 2 and aborts on the placeholder, so a fresh database needs that
 line edited before running.
 
@@ -1479,7 +1627,21 @@ allowlist enforcement is expected to start mattering.
 
 ### Backend
 
-Six files, 348 tests, all offline — no API calls, no database, no object storage.
+Eight files, 429 tests, all offline — no API calls, no database, no object storage.
+
+`test_audio_uploads.py` covers live recordings (§8.24). The pure part is
+`live_plan` and `check_live_chunk`, including a check that every plan
+`live_plan` returns satisfies the file-upload rules. The service rules are
+tested against a mocked repository:
+- start needs a session;
+- a second live recording is a conflict, not a replacement;
+- a file upload cannot discard a live recording;
+- finish needs a completed visit and names missing chunks;
+- discard and cancel.
+
+One test stitches real files from a live plan and compares them byte-for-byte
+with what was sent. The routes, cross-tenant isolation and SQL scoping of the
+new endpoints are in `test_api.py` beside the others.
 
 `test_transcripts.py` covers the loader, the traversal guard, and upload
 validation, including the BOM case and that the client filename never reaches a
@@ -1545,11 +1707,11 @@ Plus `TestCancellationReasonIsStored` and `TestHealthDoesNotLeakOrLie`.
 
 ### Frontend
 
-Three files, 33 tests, `npm test` (Vitest + jsdom). There were none before, which
+Six files, 67 tests, `npm test` (Vitest + jsdom). There were none before, which
 is why every bug the review found here was found by reading.
 
-Deliberately narrow — these three modules hold logic rather than markup, and
-logic is what regresses silently:
+Deliberately narrow: these modules hold logic rather than markup, and logic is
+what regresses silently.
 
 - `tests/dates.test.ts` — the overdue boundaries and the local-vs-UTC parsing
   that decides whether the queue says "overdue".
@@ -1560,6 +1722,25 @@ logic is what regresses silently:
   browser-supplied `X-Doctor-*` is dropped and the session's own values are what
   reach FastAPI. Plus `X-Total-Count`, the verbatim multipart Content-Type, the
   bodiless 204, and 504-vs-502.
+- `tests/recording.test.ts` (§8.24) covers:
+  - `ExactChunker`: exact sizes across arbitrary blob sizes, an exact-multiple
+    ending, and joined bytes equal to the recording;
+  - `LiveUploader`: one piece at a time in order, retrying without skipping
+    ahead, stopping on a 409 with `drain` rejecting, and `stop` releasing a
+    waiter while a send is in flight. That last one was a real bug, caught here.
+- `tests/liveSession.test.tsx` runs the provider against a fake MediaRecorder:
+  - the End session order: every piece, then `/complete`, then `finish` with the
+    right count;
+  - a blocked microphone;
+  - the microphone released when the server refuses to start;
+  - one session at a time;
+  - a 409 mid-recording;
+  - an empty recording discarded;
+  - paused time not counted.
+- `tests/lifecycleState.test.ts` covers which card the visit page shows when two
+  states hold at once (recording here while the visit is already completed, an
+  interrupted recording versus an unfinished file upload, and so on), plus the
+  pre-completion file checks.
 
 `npm run lint` is ESLint with Next's config. It reports seven warnings, all
 `react-hooks/set-state-in-effect` and all the same shape — fetch on mount, then

@@ -66,6 +66,14 @@ export async function updateVisit(
   return unwrap(result);
 }
 
+/** scheduled -> in_progress. Idempotent; a completed or cancelled visit is a 409. */
+export async function startVisit(visitId: string): Promise<Visit> {
+  const result = await api.POST("/api/v1/visits/{visit_id}/start", {
+    params: { path: { visit_id: visitId } },
+  });
+  return unwrap(result);
+}
+
 export async function completeVisit(
   visitId: string,
   body?: VisitCompleteRequest,

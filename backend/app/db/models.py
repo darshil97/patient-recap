@@ -220,9 +220,11 @@ class AudioUploadRow:
     status: str
     filename: Optional[str]
     extension: str
-    total_bytes: int
+    # None only for a live recording still being recorded (or discarded before
+    # it finished): its size is not known until it stops (§8.24).
+    total_bytes: Optional[int]
     chunk_bytes: int
-    chunk_count: int
+    chunk_count: Optional[int]
     replace_transcript: bool
     storage_provider: str
     audio_path: Optional[str]
@@ -232,7 +234,12 @@ class AudioUploadRow:
     error_code: Optional[str]
     error_message: Optional[str]
     worker_id: Optional[str] = None
+    # 'file': a finished recording, size declared up front. 'live': recorded in
+    # the browser and sent while recording, size worked out at finish.
+    mode: str = "file"
     chunks_received: int = 0
+    bytes_received: int = 0
+    last_chunk_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
@@ -242,12 +249,26 @@ class AudioUploadRow:
         return self.status == "receiving"
 
     @property
+    def is_live(self) -> bool:
+        return self.mode == "live"
+
+    @property
+    def plan_known(self) -> bool:
+        return self.total_bytes is not None and self.chunk_count is not None
+
+    @property
     def recording_stored(self) -> bool:
         return bool(self.audio_path)
 
     @property
     def all_chunks_received(self) -> bool:
-        return self.recording_stored or self.chunks_received >= self.chunk_count
+        if self.recording_stored:
+            return True
+        # Without a plan there is nothing to compare against: a live recording
+        # is complete only once finish has worked its plan out.
+        if self.chunk_count is None:
+            return False
+        return self.chunks_received >= self.chunk_count
 
     @property
     def retryable(self) -> bool:

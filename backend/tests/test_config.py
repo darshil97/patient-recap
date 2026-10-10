@@ -247,5 +247,26 @@ class TestLoader(TempFiles):
         self.assertIn("transcripts.storage", output)
 
 
+class TestLiveChunkBytes(unittest.TestCase):
+    """speech.live_chunk_bytes: the piece size of a live recording (§8.24)."""
+
+    def test_committed_value_is_256_kib(self):
+        self.assertEqual(from_env().speech.live_chunk_bytes, 256 * 1024)
+
+    def test_default_matches_the_committed_value(self):
+        self.assertEqual(Settings().speech.live_chunk_bytes, 256 * 1024)
+
+    def test_it_cannot_exceed_a_file_chunk(self):
+        """Both cross the same BFF body cap, and the chunk route reads at most
+        chunk_bytes + 1 of a request, so a larger live chunk could never arrive."""
+        with self.assertRaises(Exception) as ctx:
+            Settings(speech={"chunk_bytes": 100_000, "live_chunk_bytes": 200_000})
+        self.assertIn("live_chunk_bytes", str(ctx.exception))
+
+    def test_it_has_a_floor(self):
+        with self.assertRaises(Exception):
+            Settings(speech={"live_chunk_bytes": 1024})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

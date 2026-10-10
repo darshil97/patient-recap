@@ -99,13 +99,16 @@ POST   /visits                         schedule              -> 201
 GET    /visits?status=&from=&to=       list, newest first    -> X-Total-Count
 GET    /visits/{id}                    single
 PATCH  /visits/{id}                    correct details
+POST   /visits/{id}/start              session under way     -> 200 (in_progress)
 POST   /visits/{id}/complete           mark done             -> 200
 POST   /visits/{id}/cancel             cancel                -> 200
 
 POST   /visits/{id}/transcript         upload .txt (multipart) -> 201
 POST   /visits/{id}/audio-uploads      or a recording: start   -> 201 + chunk plan
+POST   /visits/{id}/audio-uploads/live or record live: start   -> 201, no plan yet
 PUT    /audio-uploads/{id}/chunks/{i}  one chunk (multipart)
 POST   /audio-uploads/{id}/finish      transcribe              -> 202
+POST   /audio-uploads/{id}/discard     throw an unfinished one away
 GET    /audio-uploads/{id}             poll
 GET    /visits/{id}/audio-upload       latest (204 if none)
 GET    /visits/{id}/transcript         read it back
@@ -124,7 +127,7 @@ PATCH  /follow-ups/{id}                outcome of a call
 ### The lifecycle is explicit
 
 ```
-Schedule -> Complete -> Add Transcript -> Generate Insights
+Schedule -> [Start session] -> Complete -> Add Transcript -> Generate Insights
 ```
 
 A visit is created **before** the consultation, so it starts
@@ -133,13 +136,20 @@ A visit is created **before** the consultation, so it starts
 - `PATCH /visits/{id}` corrects **date, time and type only**. It does not accept
   `visit_status` or `transcript_path` — both are rejected with a 422 rather than
   ignored, because both used to be honoured and a silent 200 would be worse.
-  Only `/complete` and `/cancel` change status.
+  Only `/start`, `/complete` and `/cancel` change status.
+- `/start` moves a `scheduled` visit to `in_progress`: the consultation is under
+  way. It is optional, idempotent, and only needed for a live recording. A
+  completed or cancelled visit cannot be started (409).
 - **Upload requires the visit to be `completed`** — a 409 otherwise. That is what
   makes an Add Transcript button legitimately disabled until then.
 - `/complete` is idempotent, so no need to guard a double click.
 - `/cancel` reopens any follow-up that visit had resolved, and is refused (409)
   once insights exist. Its optional `reason` is stored on the visit and comes
-  back as `cancelled_reason` (NULL = not recorded).
+  back as `cancelled_reason` (NULL = not recorded). It also discards any
+  unfinished recording for the visit, so a live recorder still sending gets a
+  409 on its next chunk.
+- To upload to a visit that is not completed yet, call `/complete` first and
+  then upload: the UI does both in one gesture, the server sees two transitions.
 
 ### Transcripts are `.txt` only
 
@@ -205,11 +215,61 @@ retry, no re-upload. Its `error_message` is written for the doctor.
 
 | Status | When |
 | --- | --- |
-| 409 | visit not `completed`, transcript exists without `replace`, a recording is already processing, chunks missing, or the upload no longer accepts chunks |
+| 409 | visit not `completed`, transcript exists without `replace`, a recording is already processing, an unfinished live recording exists for the visit, chunks missing, or the upload no longer accepts chunks |
 | 413 | recording over the limit |
 | 422 | unsupported format, chunk index out of range, or a chunk not exactly its planned size |
 | 500 | `DEEPGRAM_API_KEY` or the LLM key missing on the server (at start) |
 | 503 | storage hiccup on a chunk — resend it |
+
+Every upload response carries `mode` (`file` or `live`), `bytes_received` and
+`last_chunk_at`. For a `file` upload `size_bytes` and `chunk_count` are always
+numbers.
+
+### Or record it live, sent while recording
+
+A recording made in the browser goes up **during** the consultation, so a closed
+tab costs at most the last piece rather than the whole consultation. Same chunk
+route, same BFF, same auth; the browser never talks to Deepgram.
+`features/recording/LiveSessionProvider.tsx` (mounted in the `(app)` layout, so
+recording survives navigation) does all of this. The cutting and sending are
+pure modules in `lib/recording/`.
+
+1. `POST /visits/{id}/start` — the visit must be `in_progress` to record.
+2. `POST /visits/{id}/audio-uploads/live` with `{filename, replace}`. The
+   filename's extension declares the recorder's format: `.webm` (Chrome, Edge,
+   Firefox), `.mp4` (Safari) or `.ogg`. There is no size. The response has
+   `mode: "live"`, `chunk_bytes` (262144) and **`size_bytes` / `chunk_count`
+   null** — nothing is planned yet. 409 if the session was not started, or a live
+   recording for this visit is already open (another tab): it is never replaced
+   silently, because it may still be recording.
+3. While recording, `PUT /audio-uploads/{upload_id}/chunks/{i}` with `i` from 0
+   upwards. **Every chunk must be exactly `chunk_bytes` except the last** — cut
+   the recorder's byte stream into exact pieces rather than sending
+   `MediaRecorder` blobs as they come. Each piece is 1 to `chunk_bytes` here; the
+   exact-size rule is enforced at finish. Send in order, one at a time, and retry
+   on network errors and 5xx for as long as recording continues. 413 means the
+   recording reached the 100 MB ceiling; 409 means it was discarded or the visit
+   cancelled elsewhere — stop recording.
+4. End session: send the last (short) piece, wait until every piece is
+   acknowledged, then `POST /visits/{id}/complete`, then
+   `POST /audio-uploads/{upload_id}/finish` with `{"chunk_count": n}`. The plan
+   is worked out from what arrived and must account for exactly `n` chunks; a 409
+   with `details.missing` lists pieces to resend. 409 if the visit is not
+   completed yet.
+5. From here it is the same as a file: poll, then follow the job.
+
+**After an interrupted session** (closed tab, crash), the latest upload is
+`mode: "live"`, `status: "receiving"`. `bytes_received` and
+`created_at`→`last_chunk_at` say what was saved. Offer two things:
+
+- process it: `/complete` if the visit is not completed, then `finish` with **no
+  body** — whatever arrived is the recording;
+- `POST /audio-uploads/{upload_id}/discard` (idempotent; 409 once processing or
+  transcribed), after which a new live recording or a file upload can start.
+
+While a live recording is `receiving`, **every** upload start for that visit —
+live or file — is a 409. An unfinished live recording is kept for 24 hours after
+its last chunk, then removed at the next backend restart.
 
 ### Follow-ups
 

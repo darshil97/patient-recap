@@ -26,8 +26,11 @@ from app.db.tenancy import DoctorScope, is_scoped
 
 ACTIVE = ("receiving", "processing")
 
+# The chunk rows are deleted once a recording is stitched, so after that the
+# progress figures come from the plan, and last_chunk_at (only meaningful while
+# receiving, to show when an interrupted live recording stopped) is NULL.
 _COLUMNS = """
-    u.upload_id::text, u.visit_id::text, u.status, u.filename, u.extension,
+    u.upload_id::text, u.visit_id::text, u.status, u.mode, u.filename, u.extension,
     u.total_bytes, u.chunk_bytes, u.chunk_count, u.replace_transcript,
     u.storage_provider, u.audio_path, u.duration_seconds, u.speakers, u.warnings,
     u.error_code, u.error_message, u.worker_id,
@@ -35,6 +38,12 @@ _COLUMNS = """
          ELSE (SELECT count(*)::int FROM audio_upload_chunks c
                WHERE c.upload_id = u.upload_id)
     END AS chunks_received,
+    CASE WHEN u.audio_path IS NOT NULL THEN coalesce(u.total_bytes, 0)
+         ELSE (SELECT coalesce(sum(c.size_bytes), 0)::bigint
+               FROM audio_upload_chunks c WHERE c.upload_id = u.upload_id)
+    END AS bytes_received,
+    (SELECT max(c.received_at) FROM audio_upload_chunks c
+     WHERE c.upload_id = u.upload_id) AS last_chunk_at,
     u.created_at, u.updated_at, u.completed_at
 """
 
@@ -71,23 +80,26 @@ def create(
     visit_id: str,
     filename: Optional[str],
     extension: str,
-    total_bytes: int,
+    total_bytes: Optional[int],
     chunk_bytes: int,
-    chunk_count: int,
+    chunk_count: Optional[int],
     replace_transcript: bool,
     storage_provider: str,
+    mode: str = "file",
 ) -> Optional[AudioUploadRow]:
     """Start an upload for a visit the scoped doctor owns.
 
     INSERT ... SELECT under the doctor filter, like jobs_repo.create, so another
-    doctor's visit id inserts nothing and returns None.
+    doctor's visit id inserts nothing and returns None. A live upload passes no
+    plan (`total_bytes` and `chunk_count` None); the table refuses that for a
+    file upload.
     """
     conditions = ["v.visit_id = %(visit_id)s"]
     params: Dict[str, Any] = {
         "visit_id": visit_id, "filename": filename, "extension": extension,
         "total_bytes": total_bytes, "chunk_bytes": chunk_bytes,
         "chunk_count": chunk_count, "replace_transcript": replace_transcript,
-        "storage_provider": storage_provider,
+        "storage_provider": storage_provider, "mode": mode,
     }
     if is_scoped(scope):
         conditions.append("p.doctor_id = %(scope_doctor_id)s")
@@ -96,11 +108,11 @@ def create(
     with conn.cursor() as cur:
         cur.execute(
             f"""INSERT INTO audio_uploads AS u
-                    (visit_id, filename, extension, total_bytes, chunk_bytes,
+                    (visit_id, mode, filename, extension, total_bytes, chunk_bytes,
                      chunk_count, replace_transcript, storage_provider)
-                SELECT v.visit_id, %(filename)s, %(extension)s, %(total_bytes)s,
-                       %(chunk_bytes)s, %(chunk_count)s, %(replace_transcript)s,
-                       %(storage_provider)s
+                SELECT v.visit_id, %(mode)s, %(filename)s, %(extension)s,
+                       %(total_bytes)s, %(chunk_bytes)s, %(chunk_count)s,
+                       %(replace_transcript)s, %(storage_provider)s
                 FROM visits v
                 JOIN patients p ON p.patient_id = v.patient_id
                 WHERE {' AND '.join(conditions)}
@@ -190,6 +202,42 @@ def claim(conn: psycopg.Connection, scope: DoctorScope, upload_id: str,
         cur.execute(
             f"""UPDATE audio_uploads u
                 SET status = 'processing', worker_id = %(worker_id)s,
+                    error_code = NULL, error_message = NULL, updated_at = now()
+                WHERE {' AND '.join(conditions)}
+                RETURNING {_COLUMNS}""",
+            params,
+        )
+        return _row(cur.fetchone())
+
+
+def claim_live(conn: psycopg.Connection, scope: DoctorScope, upload_id: str,
+               worker_id: str, *, total_bytes: int,
+               chunk_count: int) -> Optional[AudioUploadRow]:
+    """Fix a live recording's plan and move it to processing, atomically.
+
+    The plan was worked out from the chunk rows a moment ago; the WHERE checks
+    the rows still say exactly that -- the same count, the same total, nothing
+    past the last index -- in the statement that writes it. So a chunk that
+    lands in between makes this match nothing (None, a conflict the browser
+    retries) instead of producing a plan that disagrees with what is stored.
+    """
+    conditions, params = _scoped(
+        scope, "u.upload_id = %(upload_id)s", "u.status = 'receiving'",
+        "u.mode = 'live'", "u.chunk_count IS NULL",
+        """(SELECT count(*) FROM audio_upload_chunks c
+            WHERE c.upload_id = u.upload_id) = %(chunk_count)s""",
+        """(SELECT coalesce(sum(c.size_bytes), 0) FROM audio_upload_chunks c
+            WHERE c.upload_id = u.upload_id) = %(total_bytes)s""",
+        """NOT EXISTS (SELECT 1 FROM audio_upload_chunks c
+                       WHERE c.upload_id = u.upload_id
+                         AND c.chunk_index >= %(chunk_count)s)""")
+    params.update({"upload_id": upload_id, "worker_id": worker_id,
+                   "total_bytes": total_bytes, "chunk_count": chunk_count})
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""UPDATE audio_uploads u
+                SET status = 'processing', worker_id = %(worker_id)s,
+                    total_bytes = %(total_bytes)s, chunk_count = %(chunk_count)s,
                     error_code = NULL, error_message = NULL, updated_at = now()
                 WHERE {' AND '.join(conditions)}
                 RETURNING {_COLUMNS}""",

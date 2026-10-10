@@ -424,6 +424,28 @@ def clear_transcript(conn: psycopg.Connection, scope: DoctorScope,
     return get(conn, scope, visit_id)
 
 
+def mark_in_progress(conn: psycopg.Connection, scope: DoctorScope,
+                     visit_id: str) -> Optional[VisitRow]:
+    """Start a scheduled consultation.
+
+    The status condition is in the UPDATE itself rather than checked beforehand,
+    so a visit completed or cancelled in another tab between the service's read
+    and this write is left alone; the caller sees the unchanged status and
+    refuses. Re-starting an in-progress visit matches and changes nothing.
+    """
+    conditions, params = _write_conditions(scope, visit_id)
+    conditions.append("visit_status IN ('scheduled', 'in_progress')")
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""UPDATE visits
+                SET visit_status = 'in_progress',
+                    updated_at   = now()
+                WHERE {' AND '.join(conditions)}""",
+            params,
+        )
+    return get(conn, scope, visit_id)
+
+
 def mark_completed(
     conn: psycopg.Connection,
     scope: DoctorScope,

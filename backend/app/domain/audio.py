@@ -10,9 +10,14 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Mapping, Optional, Tuple
 
-from app.core.errors import TranscriptError, TranscriptTooLargeError
+from app.core.errors import (
+    ConflictError,
+    TranscriptError,
+    TranscriptTooLargeError,
+    ValidationError,
+)
 
 # Extension -> the Content-Type a recording is stored with and sent to Deepgram.
 # Derived from the extension, never from the browser's Content-Type, so no
@@ -83,3 +88,77 @@ def expected_chunk_size(index: int, total_bytes: int, chunk_bytes: int) -> int:
     if index < count - 1:
         return chunk_bytes
     return total_bytes - chunk_bytes * (count - 1)
+
+
+# --------------------------------------------------------------------------- #
+# Live recordings (§8.24): sent while recording, so the plan comes last
+# --------------------------------------------------------------------------- #
+
+def check_live_chunk(index: int, size: int, chunk_bytes: int, limit: int) -> None:
+    """What can be checked about a live chunk before the recording has ended.
+
+    Which chunk is the last is not known yet, so the exact-size rule cannot be
+    applied here; live_plan applies it at finish. What can be refused now is a
+    chunk that no plan could contain, and a recording that has outgrown the
+    ceiling. Every earlier chunk is `chunk_bytes`, so the recording's size after
+    this one is `index * chunk_bytes + size` without counting anything.
+    """
+    if size <= 0:
+        raise ValidationError(f"Chunk {index} is empty.",
+                              details={"index": index, "size_bytes": size})
+    if size > chunk_bytes:
+        raise ValidationError(
+            f"Chunk {index} is {size:,} bytes; live recording chunks are at most "
+            f"{chunk_bytes:,}.",
+            details={"index": index, "size_bytes": size, "max_bytes": chunk_bytes})
+    if index * chunk_bytes + size > limit:
+        raise TranscriptTooLargeError(
+            f"This recording has reached the {limit:,}-byte limit. End the session "
+            f"to process what has been recorded.",
+            details={"index": index, "max_bytes": limit})
+
+
+def live_plan(sizes: Mapping[int, int], chunk_bytes: int,
+              declared_count: Optional[int] = None) -> Tuple[int, int]:
+    """(total_bytes, chunk_count) of a live recording, from the chunks that arrived.
+
+    The same rule a file upload's plan imposes, checked after the fact: chunks
+    0..n-1 all present, every one but the last exactly `chunk_bytes`. Holding it
+    is what lets the stitched recording be verified byte-for-byte like any other.
+
+    `declared_count` is how many chunks the recorder says it sent. Without it --
+    an interrupted session, whose recorder is gone -- the chunks that arrived are
+    the recording.
+    """
+    if not sizes:
+        raise TranscriptError("Nothing was recorded: no audio reached the server.")
+
+    count = max(sizes) + 1
+    if declared_count is not None:
+        if count > declared_count:
+            raise ConflictError(
+                f"The server holds {count} chunks of this recording, but the "
+                f"recorder says it sent {declared_count}.",
+                details={"chunk_count": declared_count, "chunks_received": count})
+        count = declared_count
+
+    missing = [i for i in range(count) if i not in sizes]
+    if missing:
+        raise ConflictError(
+            f"{len(missing)} of {count} chunks have not arrived yet.",
+            details={"missing": missing[:100]})
+
+    short = [i for i in range(count - 1) if sizes[i] != chunk_bytes]
+    if short:
+        first = short[0]
+        raise ValidationError(
+            f"Chunk {first} is {sizes[first]:,} bytes; every chunk but the last "
+            f"must be exactly {chunk_bytes:,}.",
+            details={"short": short[:100], "chunk_bytes": chunk_bytes})
+
+    last = sizes[count - 1]
+    if not 0 < last <= chunk_bytes:
+        raise ValidationError(
+            f"The last chunk is {last:,} bytes; it must be 1 to {chunk_bytes:,}.",
+            details={"index": count - 1, "size_bytes": last})
+    return chunk_bytes * (count - 1) + last, count

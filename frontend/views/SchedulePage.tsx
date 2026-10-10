@@ -8,16 +8,26 @@ import { Menu } from "../components/Menu";
 import { ToolNote } from "../components/ToolNote";
 import { useStatsContext } from "../hooks/StatsContext";
 import { useToast } from "../components/Toast";
-import { listVisits, completeVisit, cancelVisit, uploadTranscript, type Visit } from "@/lib/api/visits";
+import {
+  listVisits,
+  completeVisit,
+  cancelVisit,
+  startVisit,
+  uploadTranscript,
+  type Visit,
+} from "@/lib/api/visits";
 import {
   finishAudioUpload,
   getAudioUpload,
   getLatestAudioUpload,
   isAudioFile,
+  isInterruptedLiveRecording,
   uploadRecording,
   type AudioUploadOut,
   type ChunkProgress,
 } from "@/lib/api/audioUploads";
+import { checkUploadFile } from "@/lib/api/uploadChecks";
+import { useLiveSession } from "../features/recording/LiveSessionProvider";
 import { generateInsights, getJob, getLatestJob, type JobOut } from "@/lib/api/insights";
 import { useTrackedByVisit, type Tracked } from "../hooks/useTrackedByVisit";
 import { formatDate } from "../lib/dates";
@@ -37,6 +47,7 @@ export function SchedulePage() {
   const { stats, reload: reloadStats } = useStatsContext();
   const { showToast } = useToast();
   const router = useRouter();
+  const recordingVisitId = useLiveSession().session?.visitId ?? null;
 
   const [visits, setVisits] = useState<Visit[]>([]);
   const [loading, setLoading] = useState(true);
@@ -70,10 +81,10 @@ export function SchedulePage() {
   const refreshRecordings = recordings.refresh;
   const refreshJobs = jobs.refresh;
 
-  // "Needs action" is three states: scheduled but not held, completed without a
-  // transcript, and transcript present without a brief. The first is a status
-  // filter; the other two are exactly what `pending_only` means server-side. So
-  // the whole filter is expressible in query params.
+  // "Needs action" is four states: scheduled but not held, in session, completed
+  // without a transcript, and transcript present without a brief. The first two
+  // are a status filter; the others are exactly what `pending_only` means
+  // server-side. So the whole filter is expressible in query params.
   //
   // It used to fetch 200 rows and filter them in the browser, which quietly made
   // the schedule wrong above 200 visits: rows that needed action were dropped
@@ -85,9 +96,9 @@ export function SchedulePage() {
       const page = await listVisits({
         status:
           filter === "scheduled_only"
-            ? ["scheduled"]
+            ? ["scheduled", "in_progress"]
             : filter === "needs_action"
-              ? ["scheduled", "completed"]
+              ? ["scheduled", "in_progress", "completed"]
               : undefined,
         pendingOnly: filter === "needs_action" ? true : undefined,
         sort: "date_asc",
@@ -96,7 +107,14 @@ export function SchedulePage() {
       setVisits(page.items);
       setTotal(page.total);
       const completed = page.items.filter((v) => v.visit_status === "completed");
-      void refreshRecordings(completed.filter((v) => !v.transcript_path));
+      // A visit in session may hold an interrupted live recording.
+      void refreshRecordings(
+        page.items.filter(
+          (v) =>
+            v.visit_status === "in_progress" ||
+            (v.visit_status === "completed" && !v.transcript_path),
+        ),
+      );
       void refreshJobs(completed.filter((v) => v.transcript_path && !v.has_insights));
     } catch {
       setError("Could not load the visit schedule.");
@@ -215,6 +233,21 @@ export function SchedulePage() {
     }
   }
 
+  /** Start the consultation and go to it, where the recorder is. */
+  async function handleStartSession(visit: Visit) {
+    setBusyId(visit.visit_id);
+    try {
+      await startVisit(visit.visit_id);
+      reloadStats();
+      router.push(`/visits/${visit.visit_id}`);
+    } catch (err) {
+      showToast(err instanceof ApiError ? err.message : "Could not start the session.", {
+        variant: "error",
+      });
+      setBusyId(null);
+    }
+  }
+
   async function handleCancel(visit: Visit) {
     setBusyId(visit.visit_id);
     try {
@@ -302,6 +335,28 @@ export function SchedulePage() {
 
   async function handleUpload(file: File) {
     if (!uploadFor) return;
+    // Uploading to a visit not held yet completes it first: two explicit calls,
+    // after checking the file so a wrong one does not complete the visit.
+    if (uploadFor.visit_status !== "completed") {
+      const problem = await checkUploadFile(file);
+      if (problem) {
+        showToast(problem, { variant: "error" });
+        return;
+      }
+      setBusyId(uploadFor.visit_id);
+      try {
+        await completeVisit(uploadFor.visit_id);
+      } catch (err) {
+        showToast(err instanceof ApiError ? err.message : "Could not complete the visit.", {
+          variant: "error",
+        });
+        setBusyId(null);
+        return;
+      }
+      // Completed whatever happens to the upload next, so show it as such.
+      load();
+      reloadStats();
+    }
     if (isAudioFile(file)) {
       await handleRecording(uploadFor, file);
       return;
@@ -346,7 +401,7 @@ export function SchedulePage() {
 
   const awaitingTranscript = stats?.visits.awaiting_transcript ?? 0;
   const awaitingInsights = stats?.visits.awaiting_insights ?? 0;
-  const scheduledCount = stats?.visits.scheduled ?? 0;
+  const scheduledCount = (stats?.visits.scheduled ?? 0) + (stats?.visits.in_progress ?? 0);
 
   return (
     <div className="page">
@@ -365,7 +420,7 @@ export function SchedulePage() {
       <div className="stat-row">
         <div className="stat-chip stat-chip--critical">
           <div className="stat-num">{scheduledCount}</div>
-          <div className="stat-label">Scheduled, not yet held</div>
+          <div className="stat-label">Not yet held, or in session</div>
         </div>
         <div className="stat-chip stat-chip--caution">
           <div className="stat-num">{awaitingTranscript}</div>
@@ -408,7 +463,7 @@ export function SchedulePage() {
               onChange={(e) => setFilter(e.target.value as NeedsAction)}
             >
               <option value="needs_action">Needs action</option>
-              <option value="scheduled_only">Scheduled only</option>
+              <option value="scheduled_only">Not yet held</option>
               <option value="all">All visits</option>
             </select>
           </div>
@@ -473,7 +528,9 @@ export function SchedulePage() {
                     items={group.items}
                     recordings={recordings.tracked}
                     jobs={jobs.tracked}
+                    recordingVisitId={recordingVisitId}
                     busyId={busyId}
+                    onStartSession={handleStartSession}
                     onComplete={handleComplete}
                     onCancel={handleCancel}
                     onGenerate={handleGenerate}
@@ -491,7 +548,13 @@ export function SchedulePage() {
 
       {uploadFor && (
         <Modal
-          title={uploadFor.transcript_path ? "Replace transcript" : "Add transcript"}
+          title={
+            uploadFor.transcript_path
+              ? "Replace transcript"
+              : uploadFor.visit_status === "completed"
+                ? "Add transcript"
+                : "Upload transcript"
+          }
           subtitle={`${uploadFor.patient_name} · visit ${uploadFor.visit_number}`}
           // Held open while a recording is going up: the progress lives here,
           // and closing would hide an upload that is still running.
@@ -509,6 +572,7 @@ export function SchedulePage() {
               />
             )}
             <p style={{ fontSize: 12.5, color: "var(--ink-2)", marginTop: 12 }}>
+              {uploadFor.visit_status !== "completed" && "Uploading marks the visit complete. "}
               A recording is stored with the visit, transcribed, and each voice is labelled
               as doctor, patient or someone else present. Word documents, PDFs and JSON are
               not accepted &mdash; a mis-read file would produce a confident but wrong
@@ -551,7 +615,9 @@ function VisitGroup({
   items,
   recordings,
   jobs,
+  recordingVisitId,
   busyId,
+  onStartSession,
   onComplete,
   onCancel,
   onGenerate,
@@ -562,7 +628,10 @@ function VisitGroup({
   items: Visit[];
   recordings: Record<string, Tracked<AudioUploadOut>>;
   jobs: Record<string, Tracked<JobOut>>;
+  /** The visit this tab is recording live, if any. */
+  recordingVisitId: string | null;
   busyId: string | null;
+  onStartSession: (v: Visit) => void;
   onComplete: (v: Visit) => void;
   onCancel: (v: Visit) => void;
   onGenerate: (v: Visit) => void;
@@ -600,6 +669,7 @@ function VisitGroup({
               visit={v}
               recording={recordings[v.visit_id]?.item}
               job={jobs[v.visit_id]?.item}
+              recordingHere={recordingVisitId === v.visit_id}
             />
           </td>
           <td className="actions">
@@ -607,7 +677,9 @@ function VisitGroup({
               visit={v}
               recording={recordings[v.visit_id]?.item}
               job={jobs[v.visit_id]?.item}
+              recordingHere={recordingVisitId === v.visit_id}
               busy={busyId === v.visit_id}
+              onStartSession={onStartSession}
               onComplete={onComplete}
               onCancel={onCancel}
               onGenerate={onGenerate}
@@ -632,12 +704,39 @@ function Stage({
   visit,
   recording,
   job,
+  recordingHere,
 }: {
   visit: Visit;
   recording?: AudioUploadOut;
   job?: JobOut;
+  recordingHere: boolean;
 }) {
   const briefJob = pendingBriefJob(visit, job);
+  if (recordingHere) {
+    return (
+      <>
+        <span className="status">
+          <span className="rec-dot rec-dot--live" aria-hidden="true" />
+          Recording
+        </span>
+        <div className="who-meta">In this tab</div>
+      </>
+    );
+  }
+  if (isInterruptedLiveRecording(recording)) {
+    return (
+      <>
+        <span className="status">
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
+            <path d="M8 2.8 14.2 13H1.8L8 2.8Z" />
+            <path d="M8 6.6v2.9M8 11.2h.01" />
+          </svg>
+          Recording interrupted
+        </span>
+        <div className="who-meta">Process or discard it</div>
+      </>
+    );
+  }
   if (recording?.status === "processing") {
     return (
       <>
@@ -669,6 +768,13 @@ function Stage({
     return (
       <span className="status">
         <span className="badge badge--accent badge--dot">Scheduled</span>
+      </span>
+    );
+  }
+  if (visit.visit_status === "in_progress") {
+    return (
+      <span className="status">
+        <span className="badge badge--soon badge--dot">In session</span>
       </span>
     );
   }
@@ -743,7 +849,9 @@ function RowActions({
   visit,
   recording,
   job,
+  recordingHere,
   busy,
+  onStartSession,
   onComplete,
   onCancel,
   onGenerate,
@@ -753,7 +861,9 @@ function RowActions({
   visit: Visit;
   recording?: AudioUploadOut;
   job?: JobOut;
+  recordingHere: boolean;
   busy: boolean;
+  onStartSession: (v: Visit) => void;
   onComplete: (v: Visit) => void;
   onCancel: (v: Visit) => void;
   onGenerate: (v: Visit) => void;
@@ -761,6 +871,22 @@ function RowActions({
   onRetryRecording: (v: Visit) => void;
 }) {
   const briefJob = pendingBriefJob(visit, job);
+  if (recordingHere) {
+    return (
+      <Link className="btn btn--sm btn--primary" href={`/visits/${visit.visit_id}`}>
+        Return to session
+      </Link>
+    );
+  }
+  // An interrupted live recording is resolved on the visit page, where what was
+  // saved is shown before choosing to process or discard it.
+  if (isInterruptedLiveRecording(recording)) {
+    return (
+      <Link className="btn btn--sm btn--primary" href={`/visits/${visit.visit_id}`}>
+        Open visit
+      </Link>
+    );
+  }
   if (recording?.status === "processing" || (briefJob && isActiveJob(briefJob))) {
     return (
       <Link className="btn btn--sm" href={`/visits/${visit.visit_id}`}>
@@ -789,15 +915,32 @@ function RowActions({
       </>
     );
   }
-  if (visit.visit_status === "scheduled") {
+  if (visit.visit_status === "scheduled" || visit.visit_status === "in_progress") {
+    const inSession = visit.visit_status === "in_progress";
     return (
       <>
-        <button className="btn btn--sm btn--primary" disabled={busy} onClick={() => onComplete(visit)}>
-          Complete visit
+        {inSession ? (
+          <Link className="btn btn--sm btn--primary" href={`/visits/${visit.visit_id}`}>
+            Open session
+          </Link>
+        ) : (
+          <button
+            className="btn btn--sm btn--primary"
+            disabled={busy}
+            onClick={() => onStartSession(visit)}
+          >
+            {busy ? "Starting…" : "Start session"}
+          </button>
+        )}
+        <button className="btn btn--sm" disabled={busy} onClick={() => onAddTranscript(visit)}>
+          Upload transcript
         </button>
         <Menu
           label="More actions"
-          items={[{ label: "Cancel visit", danger: true, onClick: () => onCancel(visit) }]}
+          items={[
+            { label: "Mark complete without a transcript", onClick: () => onComplete(visit) },
+            { label: "Cancel visit", danger: true, onClick: () => onCancel(visit) },
+          ]}
         />
       </>
     );

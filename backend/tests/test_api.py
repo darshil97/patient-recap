@@ -27,7 +27,13 @@ from app.core.errors import (  # noqa: E402
     NotFoundError,
     QuotaExhaustedError,
 )
-from app.db.models import DoctorRow, JobRow, PatientRow, VisitRow  # noqa: E402
+from app.db.models import (  # noqa: E402
+    AudioUploadRow,
+    DoctorRow,
+    JobRow,
+    PatientRow,
+    VisitRow,
+)
 
 PATIENT_ID = "11111111-1111-1111-1111-111111111111"
 VISIT_ID = "22222222-2222-2222-2222-222222222222"
@@ -85,6 +91,22 @@ def a_job(**over: Any) -> JobRow:
         error_code=None, error_message=None, total_tokens=None)
     fields.update(over)
     return JobRow(**fields)
+
+
+UPLOAD_ID = "55555555-5555-5555-5555-555555555555"
+
+
+def a_live_upload(**over: Any) -> AudioUploadRow:
+    """A live recording still being recorded: no plan yet (§8.24)."""
+    fields: Dict[str, Any] = dict(
+        upload_id=UPLOAD_ID, visit_id=VISIT_ID, status="receiving",
+        filename="consultation.webm", extension=".webm", total_bytes=None,
+        chunk_bytes=262144, chunk_count=None, replace_transcript=False,
+        storage_provider="neon_object_storage", audio_path=None,
+        duration_seconds=None, speakers=None, warnings=None, error_code=None,
+        error_message=None, mode="live")
+    fields.update(over)
+    return AudioUploadRow(**fields)
 
 
 class ApiTestCase(unittest.TestCase):
@@ -414,6 +436,137 @@ class TestVisitLifecycleIsTransitionsOnly(ApiTestCase):
     def test_empty_patch_rejected(self):
         response = self.client.patch(f"/api/v1/visits/{VISIT_ID}", json={})
         self.assertEqual(response.status_code, 422)
+
+    def test_starting_a_session_is_its_own_transition(self):
+        """`in_progress` is reached through /start, never through PATCH."""
+        response = self.client.patch(f"/api/v1/visits/{VISIT_ID}",
+                                     json={"visit_status": "in_progress"})
+        self.assertEqual(response.status_code, 422, response.text)
+
+
+class TestStartSession(ApiTestCase):
+    """POST /visits/{id}/start: scheduled -> in_progress (§8.24)."""
+
+    def test_returns_the_visit_in_progress(self):
+        with mock.patch("app.services.visit_service.start_visit",
+                        return_value=a_visit(visit_status="in_progress")) as start:
+            response = self.client.post(f"/api/v1/visits/{VISIT_ID}/start")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["visit_status"], "in_progress")
+        self.assertEqual(start.call_args.args[1:], (DOCTOR_A_ID, VISIT_ID))
+
+    def test_a_finished_visit_is_409(self):
+        with mock.patch("app.services.visit_service.start_visit",
+                        side_effect=ConflictError("This visit is completed.")):
+            response = self.client.post(f"/api/v1/visits/{VISIT_ID}/start")
+        self.assertEqual(response.status_code, 409)
+
+    def test_unknown_visit_is_404(self):
+        with mock.patch("app.services.visit_service.start_visit",
+                        side_effect=NotFoundError("No visit with that id.")):
+            response = self.client.post(f"/api/v1/visits/{ABSENT_ID}/start")
+        self.assertEqual(response.status_code, 404)
+
+    def test_malformed_id_is_422(self):
+        response = self.client.post(f"/api/v1/visits/{MALFORMED_ID}/start")
+        self.assertEqual(response.status_code, 422)
+
+    def test_complete_still_accepts_a_visit_in_progress(self):
+        """End session completes the visit through the ordinary transition."""
+        from app.services import visit_service
+
+        with mock.patch("app.services.visit_service.visits_repo") as repo:
+            repo.get.return_value = a_visit(visit_status="in_progress")
+            repo.mark_completed.return_value = a_visit(visit_status="completed")
+            visit = visit_service.complete_visit(mock.MagicMock(), DOCTOR_A_ID,
+                                                 VISIT_ID)
+        self.assertEqual(visit.visit_status, "completed")
+
+
+class TestLiveRecordingRoutes(ApiTestCase):
+    """The HTTP contract of a live recording. The rules are in
+    tests/test_audio_uploads.py."""
+
+    def test_start_returns_a_live_upload_without_a_plan(self):
+        with mock.patch("app.services.audio_upload_service.start_live_upload",
+                        return_value=a_live_upload()) as start:
+            response = self.client.post(
+                f"/api/v1/visits/{VISIT_ID}/audio-uploads/live",
+                json={"filename": "consultation.webm"})
+        self.assertEqual(response.status_code, 201, response.text)
+        body = response.json()
+        self.assertEqual(body["mode"], "live")
+        self.assertIsNone(body["size_bytes"])
+        self.assertIsNone(body["chunk_count"])
+        self.assertEqual(body["chunk_bytes"], 262144)
+        self.assertEqual(body["bytes_received"], 0)
+        self.assertEqual(start.call_args.kwargs,
+                         {"filename": "consultation.webm", "replace": False})
+
+    def test_start_needs_a_filename(self):
+        response = self.client.post(f"/api/v1/visits/{VISIT_ID}/audio-uploads/live",
+                                    json={})
+        self.assertEqual(response.status_code, 422)
+
+    def test_start_without_a_session_is_409(self):
+        with mock.patch("app.services.audio_upload_service.start_live_upload",
+                        side_effect=ConflictError("Start the session first.")):
+            response = self.client.post(
+                f"/api/v1/visits/{VISIT_ID}/audio-uploads/live",
+                json={"filename": "consultation.webm"})
+        self.assertEqual(response.status_code, 409)
+
+    def test_finish_passes_the_chunk_count_through(self):
+        with mock.patch("app.services.audio_upload_service.finish_upload",
+                        return_value=a_live_upload(status="processing",
+                                                   total_bytes=300000,
+                                                   chunk_count=2)) as finish, \
+             mock.patch("app.services.audio_upload_service.process_upload"):
+            response = self.client.post(f"/api/v1/audio-uploads/{UPLOAD_ID}/finish",
+                                        json={"chunk_count": 2})
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(finish.call_args.kwargs, {"chunk_count": 2})
+        self.assertEqual(response.json()["size_bytes"], 300000)
+
+    def test_finish_body_stays_optional(self):
+        """File uploads and interrupted sessions finish with no body."""
+        with mock.patch("app.services.audio_upload_service.finish_upload",
+                        return_value=a_live_upload(status="processing",
+                                                   total_bytes=10,
+                                                   chunk_count=1)) as finish, \
+             mock.patch("app.services.audio_upload_service.process_upload"):
+            response = self.client.post(f"/api/v1/audio-uploads/{UPLOAD_ID}/finish")
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(finish.call_args.kwargs, {"chunk_count": None})
+
+    def test_finish_rejects_a_nonsense_count(self):
+        response = self.client.post(f"/api/v1/audio-uploads/{UPLOAD_ID}/finish",
+                                    json={"chunk_count": 0})
+        self.assertEqual(response.status_code, 422)
+
+    def test_discard(self):
+        with mock.patch("app.services.audio_upload_service.discard_upload",
+                        return_value=a_live_upload(status="abandoned")) as discard:
+            response = self.client.post(f"/api/v1/audio-uploads/{UPLOAD_ID}/discard")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "abandoned")
+        self.assertEqual(discard.call_args.args[1:], (DOCTOR_A_ID, UPLOAD_ID))
+
+    def test_discarding_a_transcribed_recording_is_409(self):
+        with mock.patch("app.services.audio_upload_service.discard_upload",
+                        side_effect=ConflictError("Already transcribed.")):
+            response = self.client.post(f"/api/v1/audio-uploads/{UPLOAD_ID}/discard")
+        self.assertEqual(response.status_code, 409)
+
+    def test_a_chunk_past_the_ceiling_is_413(self):
+        from app.core.errors import TranscriptTooLargeError
+
+        with mock.patch("app.services.audio_upload_service.put_chunk",
+                        side_effect=TranscriptTooLargeError("Limit reached.")):
+            response = self.client.put(
+                f"/api/v1/audio-uploads/{UPLOAD_ID}/chunks/400",
+                files={"file": ("chunk-400", b"x" * 10, "application/octet-stream")})
+        self.assertEqual(response.status_code, 413)
 
 
 class TestGenerateInsights(ApiTestCase):
@@ -852,6 +1005,14 @@ class TestOpenApi(ApiTestCase):
             ("/api/v1/follow-ups/{follow_up_id}", "get"),
             ("/api/v1/follow-ups/{follow_up_id}", "patch"),
             ("/api/v1/stats", "get"),
+            ("/api/v1/visits/{visit_id}/start", "post"),
+            ("/api/v1/visits/{visit_id}/audio-uploads", "post"),
+            ("/api/v1/visits/{visit_id}/audio-uploads/live", "post"),
+            ("/api/v1/visits/{visit_id}/audio-upload", "get"),
+            ("/api/v1/audio-uploads/{upload_id}/chunks/{index}", "put"),
+            ("/api/v1/audio-uploads/{upload_id}/finish", "post"),
+            ("/api/v1/audio-uploads/{upload_id}/discard", "post"),
+            ("/api/v1/audio-uploads/{upload_id}", "get"),
         ]:
             self.assertIn(path, paths, path)
             self.assertIn(method, paths[path], f"{method.upper()} {path}")
@@ -1203,6 +1364,49 @@ class TestCrossTenantIsolation(unittest.TestCase):
         response = self.assert_scoped_to_b(
             "app.services.visit_service.get_visit",
             lambda: self.client.get(f"/api/v1/visits/{VISIT_ID}/job"))
+        self.assertEqual(response.status_code, 404)
+
+    # -- recordings and live sessions (§8.23, §8.24) ------------------------ #
+
+    def test_cannot_start_another_doctors_session(self):
+        response = self.assert_scoped_to_b(
+            "app.services.visit_service.start_visit",
+            lambda: self.client.post(f"/api/v1/visits/{VISIT_ID}/start"))
+        self.assertEqual(response.status_code, 404)
+
+    def test_cannot_record_into_another_doctors_visit(self):
+        response = self.assert_scoped_to_b(
+            "app.services.audio_upload_service.start_live_upload",
+            lambda: self.client.post(
+                f"/api/v1/visits/{VISIT_ID}/audio-uploads/live",
+                json={"filename": "consultation.webm"}))
+        self.assertEqual(response.status_code, 404)
+
+    def test_cannot_send_chunks_to_another_doctors_recording(self):
+        response = self.assert_scoped_to_b(
+            "app.services.audio_upload_service.put_chunk",
+            lambda: self.client.put(
+                f"/api/v1/audio-uploads/{UPLOAD_ID}/chunks/0",
+                files={"file": ("chunk-0", b"x", "application/octet-stream")}))
+        self.assertEqual(response.status_code, 404)
+
+    def test_cannot_finish_another_doctors_recording(self):
+        response = self.assert_scoped_to_b(
+            "app.services.audio_upload_service.finish_upload",
+            lambda: self.client.post(f"/api/v1/audio-uploads/{UPLOAD_ID}/finish",
+                                     json={"chunk_count": 1}))
+        self.assertEqual(response.status_code, 404)
+
+    def test_cannot_discard_another_doctors_recording(self):
+        response = self.assert_scoped_to_b(
+            "app.services.audio_upload_service.discard_upload",
+            lambda: self.client.post(f"/api/v1/audio-uploads/{UPLOAD_ID}/discard"))
+        self.assertEqual(response.status_code, 404)
+
+    def test_cannot_poll_another_doctors_recording(self):
+        response = self.assert_scoped_to_b(
+            "app.services.audio_upload_service.get_upload",
+            lambda: self.client.get(f"/api/v1/audio-uploads/{UPLOAD_ID}"))
         self.assertEqual(response.status_code, 404)
 
     # -- lists and counts --------------------------------------------------- #
@@ -1717,9 +1921,42 @@ class TestScopedRepositorySql(unittest.TestCase):
 
         self.assertIn("p.doctor_id = %(scope_doctor_id)s", repo._OWNED_BY_SCOPE)
         for name in ("update", "set_transcript", "clear_transcript",
-                     "mark_completed", "mark_cancelled"):
+                     "mark_in_progress", "mark_completed", "mark_cancelled"):
             with self.subTest(function=name):
                 self.assert_applies_tenancy(repo, name, "_write_conditions")
+
+    def test_audio_upload_queries_derive_tenancy_through_the_visit(self):
+        """Every lookup that starts from a client-supplied upload or visit id,
+        including the live recording's claim (§8.24)."""
+        from app.db.repositories import audio_uploads as repo
+
+        self.assertIn("JOIN patients p ON p.patient_id = v.patient_id",
+                      repo._OWNED_BY_SCOPE)
+        self.assertIn("p.doctor_id = %(scope_doctor_id)s", repo._OWNED_BY_SCOPE)
+        for name in ("get", "latest_for_visit", "unfinished_for_visit",
+                     "record_chunk", "claim", "claim_live"):
+            with self.subTest(function=name):
+                self.assert_applies_tenancy(repo, name, "_scoped")
+        self.assertIn("p.doctor_id = %(scope_doctor_id)s",
+                      self.source(repo, "create"))
+
+    def test_the_live_claim_rechecks_the_chunks_it_planned_from(self):
+        """A chunk landing between reading the chunks and claiming them must
+        make the claim match nothing, not produce a plan that is wrong."""
+        from app.db.repositories import audio_uploads as repo
+
+        sql = self.source(repo, "claim_live")
+        self.assertIn("u.chunk_count IS NULL", sql)
+        self.assertIn("count(*) FROM audio_upload_chunks", sql)
+        self.assertIn("sum(c.size_bytes)", sql)
+        self.assertIn("c.chunk_index >= %(chunk_count)s", sql)
+
+    def test_the_live_migration_keeps_the_cover_constraint(self):
+        """A live upload gets its plan late, not a weaker one."""
+        migration = pathlib.Path("sql/10_live_recordings.sql").read_text()
+        self.assertIn("audio_uploads_plan_known", migration)
+        self.assertIn("status IN ('receiving', 'abandoned')", migration)
+        self.assertNotIn("DROP CONSTRAINT", migration.upper())
 
     def test_visit_create_resolves_its_patient_under_the_filter(self):
         """INSERT ... SELECT FROM patients, so another doctor's patient_id

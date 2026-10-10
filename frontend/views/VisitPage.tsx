@@ -292,7 +292,7 @@ export function VisitPage({ visitId }: { visitId: string }) {
             recording={recording}
             recordingError={recordingError}
             onVisitChanged={load}
-            onRecordingStarted={trackRecording}
+            onRecordingChanged={trackRecording}
             onGenerationStarted={(jobId) => {
               startTracking(jobId);
               load();

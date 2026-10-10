@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { UserButton } from "@neondatabase/auth-ui";
 import { useStatsContext } from "@/hooks/StatsContext";
+import { RecordingBar } from "@/features/recording/RecordingBar";
 
 /**
  * The top-navbar app shell from the approved design (frontend/design-history/
@@ -27,7 +28,8 @@ export function Shell({ children }: { children: React.ReactNode }) {
   const scheduleNeedsAction =
     (stats?.visits.awaiting_transcript ?? 0) +
     (stats?.visits.awaiting_insights ?? 0) +
-    (stats?.visits.scheduled ?? 0);
+    (stats?.visits.scheduled ?? 0) +
+    (stats?.visits.in_progress ?? 0);
   const patientCount = stats?.patients;
 
   // "/" and "/follow-ups" render the same queue page, but they are still two
@@ -42,52 +44,58 @@ export function Shell({ children }: { children: React.ReactNode }) {
       <a className="skip-link" href="#main">
         Skip to main content
       </a>
-      <header className="sidebar">
-        <div className="brand">
-          <div>
-            <div className="brand-name">Consultation Insights</div>
+      {/* Header and recording bar stick together, so a recording in progress
+          stays visible however far the doctor scrolls a patient's history. */}
+      <div className="app-top">
+        <header className="sidebar">
+          <div className="brand">
+            <div>
+              <div className="brand-name">Consultation Insights</div>
+            </div>
           </div>
-        </div>
-        <nav className="nav" aria-label="Main">
-          <Link href="/" className={isTodayActive ? "active" : ""}>
-            Today
-            {openFollowUps !== undefined && (
-              <span className="count">{openFollowUps}</span>
-            )}
-          </Link>
-          <Link
-            href="/patients"
-            className={pathname.startsWith("/patients") ? "active" : ""}
-          >
-            Patients
-            {patientCount !== undefined && <span className="count">{patientCount}</span>}
-          </Link>
-          <div className="nav-label">Records</div>
-          <Link
-            href="/schedule"
-            className={pathname.startsWith("/schedule") ? "active" : ""}
-          >
-            Visit schedule
-            {stats?.visits !== undefined && (
-              <span className="count">{scheduleNeedsAction}</span>
-            )}
-          </Link>
-          <Link href="/follow-ups" className={isFollowUpsActive ? "active" : ""}>
-            Follow-ups
-            {openFollowUps !== undefined && <span className="count">{openFollowUps}</span>}
-          </Link>
-        </nav>
-        <div className="sidebar-foot">
-          {/* authClient comes from NeonAuthUIProvider in app/providers.tsx;
-              UserButton reads it from context rather than taking a prop. */}
-          <UserButton />
-          <p style={{ marginTop: 10 }}>
-            Records what was said.
-            <br />
-            Does not diagnose.
-          </p>
-        </div>
-      </header>
+          <nav className="nav" aria-label="Main">
+            <Link href="/" className={isTodayActive ? "active" : ""}>
+              Today
+              {openFollowUps !== undefined && (
+                <span className="count">{openFollowUps}</span>
+              )}
+            </Link>
+            <Link
+              href="/patients"
+              className={pathname.startsWith("/patients") ? "active" : ""}
+            >
+              Patients
+              {patientCount !== undefined && <span className="count">{patientCount}</span>}
+            </Link>
+            <div className="nav-label">Records</div>
+            <Link
+              href="/schedule"
+              className={pathname.startsWith("/schedule") ? "active" : ""}
+            >
+              Visit schedule
+              {stats?.visits !== undefined && (
+                <span className="count">{scheduleNeedsAction}</span>
+              )}
+            </Link>
+            <Link href="/follow-ups" className={isFollowUpsActive ? "active" : ""}>
+              Follow-ups
+              {openFollowUps !== undefined && <span className="count">{openFollowUps}</span>}
+            </Link>
+          </nav>
+          <div className="sidebar-foot">
+            {/* authClient comes from NeonAuthUIProvider in app/providers.tsx;
+                UserButton reads it from context rather than taking a prop. */}
+            <UserButton />
+            <p style={{ marginTop: 10 }}>
+              Records what was said.
+              <br />
+              Does not diagnose.
+            </p>
+          </div>
+        </header>
+
+        <RecordingBar />
+      </div>
 
       <main className="main" id="main">
         {children}

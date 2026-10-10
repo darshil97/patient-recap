@@ -169,10 +169,17 @@ POST   /api/v1/visits                         schedule a consultation
 GET    /api/v1/visits                         list (status/date filters, sort)
 GET    /api/v1/visits/{id}                    single visit
 PATCH  /api/v1/visits/{id}                    correct details
+POST   /api/v1/visits/{id}/start              start the session (in_progress)
 POST   /api/v1/visits/{id}/complete           mark the consultation done
 POST   /api/v1/visits/{id}/cancel             cancel, reopening its follow-ups
 
 POST   /api/v1/visits/{id}/transcript         upload the .txt (multipart)
+POST   /api/v1/visits/{id}/audio-uploads      or a recording: start, get chunk plan
+POST   /api/v1/visits/{id}/audio-uploads/live or record live: sent while recording
+PUT    /api/v1/audio-uploads/{id}/chunks/{i}  one chunk, idempotent
+POST   /api/v1/audio-uploads/{id}/finish      stitch + transcribe -> 202
+POST   /api/v1/audio-uploads/{id}/discard     throw an unfinished one away
+GET    /api/v1/audio-uploads/{id}             poll until completed | failed
 GET    /api/v1/visits/{id}/transcript         read it back
 DELETE /api/v1/visits/{id}/transcript         remove it
 
@@ -385,7 +392,7 @@ checked on every read, write and delete. `transcript_path` is not a request fiel
 on any endpoint — uploading is the only way a transcript is attached (§8.19).
 
 **Status is a transition, not a field.** `PATCH /visits/{id}` corrects date, time
-and type only. `/complete` and `/cancel` are the only ways `visit_status` changes,
+and type only. `/start`, `/complete` and `/cancel` are the only ways `visit_status` changes,
 because each does more than set a column — `/cancel` reopens the follow-ups that
 visit had resolved, and refuses once insights exist (§8.17).
 

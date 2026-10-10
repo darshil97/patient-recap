@@ -264,6 +264,30 @@ export interface paths {
         patch: operations["update_visit_api_v1_visits__visit_id__patch"];
         trace?: never;
     };
+    "/api/v1/visits/{visit_id}/start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a consultation session
+         * @description Move a scheduled visit to `in_progress`: the consultation is under way.
+         *
+         *     Required before a live recording (`POST /visits/{visit_id}/audio-uploads/live`).
+         *     Idempotent: starting a visit already in progress returns it unchanged. Finish
+         *     the consultation with `/complete`, as for any other visit.
+         */
+        post: operations["start_visit_api_v1_visits__visit_id__start_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/visits/{visit_id}/complete": {
         parameters: {
             query?: never;
@@ -369,9 +393,41 @@ export interface paths {
          *     then `POST /audio-uploads/{upload_id}/finish`.
          *
          *     Everything that would make the recording unusable is checked now, before any
-         *     bytes are sent. Starting again discards any unfinished upload for this visit.
+         *     bytes are sent. Starting again discards any unfinished upload for this visit,
+         *     except an unfinished live recording, which is a 409 until it is finished or
+         *     discarded.
          */
         post: operations["start_audio_upload_api_v1_visits__visit_id__audio_uploads_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/visits/{visit_id}/audio-uploads/live": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a live recording, sent while it is recorded
+         * @description Open a recording made in the browser during the consultation (§8.24).
+         *
+         *     The visit must be `in_progress` (`POST /visits/{visit_id}/start`). Send the
+         *     recording as it is made with `PUT /audio-uploads/{upload_id}/chunks/{index}`:
+         *     every chunk exactly `chunk_bytes`, except the last. When the consultation
+         *     ends, `POST /visits/{visit_id}/complete`, then
+         *     `POST /audio-uploads/{upload_id}/finish` with `{"chunk_count": n}`.
+         *
+         *     Unlike a file upload, this does not discard an unfinished live recording for
+         *     the visit: that is a conflict, because it may still be recording. Finish or
+         *     discard it first.
+         */
+        post: operations["start_live_recording_api_v1_visits__visit_id__audio_uploads_live_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -587,7 +643,9 @@ export interface paths {
          *     whose response was lost can simply be resent.
          *
          *     Every chunk but the last must be exactly `chunk_bytes`; the last is the
-         *     remainder of `size_bytes`.
+         *     remainder of `size_bytes`. For a live recording, whose size is not known yet,
+         *     a chunk may be 1 to `chunk_bytes` here and the rule is enforced at finish;
+         *     413 once the recording reaches the size ceiling.
          */
         put: operations["put_chunk_api_v1_audio_uploads__upload_id__chunks__index__put"];
         post?: never;
@@ -608,13 +666,49 @@ export interface paths {
         put?: never;
         /**
          * Finish a recording upload and start transcription
-         * @description Stitch the chunks into one stored recording and transcribe it.
+         * @description Stitch the chunks into one stored recording, transcribe it, and generate
+         *     insights from the transcript.
          *
          *     202, then poll `GET /audio-uploads/{upload_id}`: stitching, speech-to-text
-         *     and speaker labelling together run past request timeouts. Also how a `failed`
-         *     upload is retried — its chunks or recording are kept, so nothing is re-sent.
+         *     and speaker labelling together run past request timeouts. When it reaches
+         *     `completed`, the insight job has already been queued — follow it with
+         *     `GET /visits/{visit_id}/job`; there is no need to call `POST /insights`.
+         *
+         *     A live recording needs its visit completed first, and sends
+         *     `{"chunk_count": n}`: the plan is worked out from the chunks that arrived and
+         *     must account for exactly that many. Omit it to process whatever arrived from
+         *     an interrupted session.
+         *
+         *     Also how a `failed` upload is retried — its chunks or recording are kept, so
+         *     nothing is re-sent.
          */
         post: operations["finish_upload_api_v1_audio_uploads__upload_id__finish_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/audio-uploads/{upload_id}/discard": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Discard an unfinished recording
+         * @description Delete an unfinished upload's chunks and any stitched recording, and mark
+         *     it `abandoned`.
+         *
+         *     For an interrupted live recording the doctor chooses not to process, or a
+         *     failed upload they will not retry. Idempotent. Refused while processing and
+         *     once transcribed: a completed recording is the source of the visit's
+         *     transcript.
+         */
+        post: operations["discard_upload_api_v1_audio_uploads__upload_id__discard_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -668,14 +762,32 @@ export interface components {
             replace: boolean;
         };
         /**
+         * AudioUploadFinish
+         * @description Optional body for finishing an upload.
+         */
+        AudioUploadFinish: {
+            /**
+             * Chunk Count
+             * @description How many chunks were sent. Fixes a live recording's plan; omit it to process whatever arrived (an interrupted session). Must match the plan for a file upload.
+             */
+            chunk_count?: number | null;
+        };
+        /**
          * AudioUploadOut
          * @description A chunked recording upload: its chunk plan, progress, and outcome.
          *
-         *     Send chunk `i` as bytes `[i * chunk_bytes, min((i + 1) * chunk_bytes,
-         *     size_bytes))` of the file. `speakers` and `warnings` are filled in once
-         *     `status` is `completed`; non-empty `warnings` mean the labels deserve a read
-         *     before insights are generated. A `failed` upload with `retryable` true can be
-         *     finished again without re-sending anything.
+         *     A `file` upload: send chunk `i` as bytes `[i * chunk_bytes, min((i + 1) *
+         *     chunk_bytes, size_bytes))` of the file.
+         *
+         *     A `live` upload is sent while it is recorded: every chunk is exactly
+         *     `chunk_bytes` except the last. `size_bytes` and `chunk_count` are null until
+         *     finish works them out from what arrived; `bytes_received` and `last_chunk_at`
+         *     show how much has been saved and when, which is also what an interrupted
+         *     session has to offer.
+         *
+         *     `speakers` and `warnings` are filled in once `status` is `completed`;
+         *     non-empty `warnings` mean the labels deserve a read. A `failed` upload with
+         *     `retryable` true can be finished again without re-sending anything.
          */
         AudioUploadOut: {
             /** Upload Id */
@@ -687,16 +799,34 @@ export interface components {
              * @enum {string}
              */
             status: "receiving" | "processing" | "completed" | "failed" | "abandoned" | "superseded";
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "file" | "live";
             /** Filename */
             filename?: string | null;
-            /** Size Bytes */
-            size_bytes: number;
+            /**
+             * Size Bytes
+             * @description The whole recording. Null only while a live recording is being recorded.
+             */
+            size_bytes: number | null;
             /** Chunk Bytes */
             chunk_bytes: number;
-            /** Chunk Count */
-            chunk_count: number;
+            /**
+             * Chunk Count
+             * @description Null only while a live recording is being recorded.
+             */
+            chunk_count: number | null;
             /** Chunks Received */
             chunks_received: number;
+            /** Bytes Received */
+            bytes_received: number;
+            /**
+             * Last Chunk At
+             * @description When the latest chunk arrived; null once the chunks have been stitched
+             */
+            last_chunk_at?: string | null;
             /**
              * Recording Stored
              * @description The chunks have been stitched into one stored recording
@@ -1083,6 +1213,25 @@ export interface components {
              * @default
              */
             detail: string;
+        };
+        /**
+         * LiveRecordingCreate
+         * @description Start a live recording, sent in chunks while it is being recorded (§8.24).
+         *
+         *     No size: it is not known until the recording stops.
+         */
+        LiveRecordingCreate: {
+            /**
+             * Filename
+             * @description A name for the recording, e.g. consultation.webm; its extension declares the recorder's format. Display only.
+             */
+            filename: string;
+            /**
+             * Replace
+             * @description Required to overwrite an existing transcript
+             * @default false
+             */
+            replace: boolean;
         };
         /**
          * PatientCreate
@@ -1958,6 +2107,55 @@ export interface operations {
             };
         };
     };
+    start_visit_api_v1_visits__visit_id__start_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                visit_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VisitOut"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Visit is completed or cancelled */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     complete_visit_api_v1_visits__visit_id__complete_post: {
         parameters: {
             query?: never;
@@ -2257,6 +2455,68 @@ export interface operations {
             };
             /** @description Recording too large */
             413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unsupported format */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Speech-to-text or the model provider is not configured on the server */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    start_live_recording_api_v1_visits__visit_id__audio_uploads_live_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                visit_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LiveRecordingCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioUploadOut"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Session not started, transcript already attached without replace=true, a live recording is already open, or a recording is being processed */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2705,6 +2965,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
+            /** @description A live recording has reached the size ceiling */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
             /** @description Index out of range, or not exactly the planned size */
             422: {
                 headers: {
@@ -2734,7 +3003,11 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["AudioUploadFinish"] | null;
+            };
+        };
         responses: {
             /** @description Successful Response */
             202: {
@@ -2754,7 +3027,65 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
-            /** @description Chunks missing (listed in details.missing), or the upload is already processing, completed or replaced */
+            /** @description Chunks missing (listed in details.missing), the visit is not completed (live recording), or the upload is already processing, completed, discarded or replaced */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Recording too large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description chunk_count does not match, a chunk other than the last is short, or nothing was recorded */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    discard_upload_api_v1_audio_uploads__upload_id__discard_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                upload_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioUploadOut"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Processing, or already transcribed */
             409: {
                 headers: {
                     [name: string]: unknown;
