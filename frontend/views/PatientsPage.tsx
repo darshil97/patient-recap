@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { ToolNote } from "../components/ToolNote";
 import { useStatsContext } from "../hooks/StatsContext";
@@ -13,11 +13,15 @@ import { listFollowUps, type FollowUp } from "@/lib/api/followUps";
 
 type SortOption = "name" | "created_desc";
 
+/** Matches the backend's default page size (app/services/pagination.py). */
+const PAGE_SIZE = 100;
+
 export function PatientsPage() {
   const { stats, reload: reloadStats } = useStatsContext();
   const { showToast } = useToast();
 
   const [patients, setPatients] = useState<Patient[]>([]);
+  const [total, setTotal] = useState(0);
   const [followUpByPatient, setFollowUpByPatient] = useState<Map<string, FollowUp>>(new Map());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -26,50 +30,50 @@ export function PatientsPage() {
   const [showNewPatient, setShowNewPatient] = useState(false);
   const [scheduleFor, setScheduleFor] = useState<Patient | null>(null);
 
-  async function load() {
+  // Sorting is the server's job now. Ordering the page in the browser sorted
+  // whichever 100 rows happened to come back, so "Name (A-Z)" meant "the first
+  // 100 by the server's order, then alphabetised" — which is not A-Z, and gets
+  // less like it the more patients there are.
+  const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const [{ items }, { items: openFollowUps }] = await Promise.all([
-        listPatients({ q: search || undefined }),
+      const [patientPage, followUpPage] = await Promise.all([
+        listPatients({ q: search || undefined, sort, limit: PAGE_SIZE }),
         listFollowUps({ status: "open", limit: 500 }),
       ]);
-      const sorted = [...items].sort((a, b) => {
-        if (sort === "created_desc") {
-          return (b.created_at ?? "").localeCompare(a.created_at ?? "");
-        }
-        return a.patient_name.localeCompare(b.patient_name);
-      });
-      setPatients(sorted);
-      setFollowUpByPatient(new Map(openFollowUps.map((f) => [f.patient_id, f])));
+      setPatients(patientPage.items);
+      setTotal(patientPage.total);
+      setFollowUpByPatient(
+        new Map(followUpPage.items.map((f) => [f.patient_id, f])),
+      );
     } catch {
       setError("Could not load patients.");
     } finally {
       setLoading(false);
     }
-  }
+  }, [search, sort]);
 
-  useEffect(() => {
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sort]);
-
+  // One effect, not two. Both used to call load() on mount, so every visit to
+  // this page fired the pair of requests twice. Debounced throughout: 250ms is
+  // imperceptible when changing the sort and is what keeps a search from
+  // requesting on every keystroke.
   useEffect(() => {
     const handle = setTimeout(load, 250);
     return () => clearTimeout(handle);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search]);
+  }, [load]);
 
   const asOf = stats ? parseDateOnly(stats.as_of) : new Date();
 
-  const rows = useMemo(() => patients, [patients]);
+  const rows = patients;
+  const truncated = rows.length < total;
 
   return (
     <div className="page">
       <div className="page-head">
         <div>
           <h1 className="page-title">Patients</h1>
-          <p className="page-sub">{stats?.patients ?? rows.length} registered</p>
+          <p className="page-sub">{total || stats?.patients || 0} registered</p>
         </div>
         <button className="btn btn--primary" onClick={() => setShowNewPatient(true)}>
           <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
@@ -104,7 +108,8 @@ export function PatientsPage() {
         </div>
         <div className="spacer" />
         <span className="muted" style={{ fontSize: 12.5 }}>
-          Showing {rows.length} of {stats?.patients ?? rows.length}
+          Showing {rows.length} of {total}
+          {truncated && " — refine the search to narrow this list"}
         </span>
       </div>
 

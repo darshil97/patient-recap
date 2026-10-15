@@ -78,6 +78,7 @@ class VisitRow:
     transcript_uploaded_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     cancelled_at: Optional[datetime] = None
+    cancelled_reason: Optional[str] = None
     updated_at: Optional[datetime] = None
     # Joined from patients, not stored on visits. A visit's tenant is derived
     # through its patient (§6), so this is read-only provenance: knowing which
@@ -208,3 +209,68 @@ class JobRow:
     @property
     def is_terminal(self) -> bool:
         return self.status in ("succeeded", "failed", "failed_quota")
+
+
+@dataclass
+class AudioUploadRow:
+    """One chunked audio upload and, once stitched, the recording it produced."""
+
+    upload_id: str
+    visit_id: str
+    status: str
+    filename: Optional[str]
+    extension: str
+    # None only for a live recording still being recorded (or discarded before
+    # it finished): its size is not known until it stops (§8.24).
+    total_bytes: Optional[int]
+    chunk_bytes: int
+    chunk_count: Optional[int]
+    replace_transcript: bool
+    storage_provider: str
+    audio_path: Optional[str]
+    duration_seconds: Optional[float]
+    speakers: Optional[Any]
+    warnings: Optional[Any]
+    error_code: Optional[str]
+    error_message: Optional[str]
+    worker_id: Optional[str] = None
+    # 'file': a finished recording, size declared up front. 'live': recorded in
+    # the browser and sent while recording, size worked out at finish.
+    mode: str = "file"
+    chunks_received: int = 0
+    bytes_received: int = 0
+    last_chunk_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+    @property
+    def is_receiving(self) -> bool:
+        return self.status == "receiving"
+
+    @property
+    def is_live(self) -> bool:
+        return self.mode == "live"
+
+    @property
+    def plan_known(self) -> bool:
+        return self.total_bytes is not None and self.chunk_count is not None
+
+    @property
+    def recording_stored(self) -> bool:
+        return bool(self.audio_path)
+
+    @property
+    def all_chunks_received(self) -> bool:
+        if self.recording_stored:
+            return True
+        # Without a plan there is nothing to compare against: a live recording
+        # is complete only once finish has worked its plan out.
+        if self.chunk_count is None:
+            return False
+        return self.chunks_received >= self.chunk_count
+
+    @property
+    def retryable(self) -> bool:
+        """A failed upload whose bytes are all still here can be processed again."""
+        return self.status == "failed" and self.all_chunks_received

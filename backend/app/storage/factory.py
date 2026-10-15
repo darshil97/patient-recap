@@ -7,7 +7,7 @@ Two entry points, and the distinction between them is the whole point:
     store_for_visit(visit)  where an EXISTING one lives   — from the visit row
 
 Reads must never consult the setting. A visit stored on local disk has to stay
-readable after `TRANSCRIPT_STORAGE` flips to object storage, or switching the
+readable after `transcripts.storage` flips to object storage, or switching the
 setting would silently break every brief generated before the switch. The row is
 the authority for where its own bytes are; the setting only decides where the next
 ones go.
@@ -37,7 +37,7 @@ PROVIDERS = (LOCAL, NEON_OBJECT_STORAGE)
 
 def default_provider() -> str:
     """The provider new uploads are written to."""
-    return get_settings().transcript_storage
+    return get_settings().transcripts.storage
 
 
 @lru_cache(maxsize=None)
@@ -47,14 +47,14 @@ def _object_store() -> ObjectTranscriptStore:
     Cached because a boto3 client is relatively expensive to construct and is
     thread-safe to share. Clear with `get_store.cache_clear()` in tests.
     """
-    settings = get_settings()
-    if not settings.object_storage_configured:
+    config = get_settings().transcripts.object_storage
+    if not config.configured:
         missing = [
             name for name, value in (
-                ("AWS_ENDPOINT_URL_S3", settings.s3_endpoint_url),
-                ("AWS_ACCESS_KEY_ID", settings.s3_access_key_id),
-                ("AWS_SECRET_ACCESS_KEY", settings.s3_secret_access_key),
-                ("TRANSCRIPT_BUCKET", settings.transcript_bucket),
+                ("AWS_ENDPOINT_URL_S3", config.endpoint_url),
+                ("AWS_ACCESS_KEY_ID", config.access_key_id),
+                ("AWS_SECRET_ACCESS_KEY", config.secret_access_key),
+                ("transcripts.object_storage.bucket", config.bucket),
             ) if not value
         ]
         # Named explicitly, because the alternative is a NoCredentialsError from
@@ -63,22 +63,22 @@ def _object_store() -> ObjectTranscriptStore:
             "Neon Object Storage is selected but not configured. Missing: "
             + ", ".join(missing)
             + ". Create a credential with storage:read and storage:write on this "
-              "branch, or set TRANSCRIPT_STORAGE=local.",
+              "branch, or set transcripts.storage to local in config.yaml.",
             details={"missing": missing},
         )
 
     client = build_s3_client(
-        endpoint_url=str(settings.s3_endpoint_url),
-        access_key_id=str(settings.s3_access_key_id),
-        secret_access_key=str(settings.s3_secret_access_key),
-        region=settings.s3_region,
+        endpoint_url=str(config.endpoint_url),
+        access_key_id=str(config.access_key_id),
+        secret_access_key=str(config.secret_access_key),
+        region=config.region,
     )
-    return ObjectTranscriptStore(bucket=settings.transcript_bucket, client=client)
+    return ObjectTranscriptStore(bucket=config.bucket, client=client)
 
 
 @lru_cache(maxsize=None)
 def _local_store() -> LocalTranscriptStore:
-    return LocalTranscriptStore(root=get_settings().transcripts_dir)
+    return LocalTranscriptStore(root=get_settings().transcripts.local_dir)
 
 
 def get_store(provider: Optional[str] = None) -> TranscriptStore:

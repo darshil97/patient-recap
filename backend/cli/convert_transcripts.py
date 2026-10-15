@@ -219,7 +219,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
-    transcripts_dir = get_settings().transcripts_dir
+    transcripts_dir = get_settings().transcripts.local_dir
 
     with connection() as conn:
         with conn.cursor() as cur:

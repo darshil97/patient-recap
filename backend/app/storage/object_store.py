@@ -65,7 +65,8 @@ def build_s3_client(
     except ImportError as exc:  # pragma: no cover - depends on the environment
         raise StorageError(
             "boto3 is required for Neon Object Storage but is not installed. "
-            "Run `pip install -r requirements.txt`, or set TRANSCRIPT_STORAGE=local.",
+            "Run `pip install -r requirements.txt`, or set transcripts.storage to "
+            "local in config.yaml.",
         ) from exc
 
     return boto3.client(

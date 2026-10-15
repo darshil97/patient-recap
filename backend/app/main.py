@@ -52,9 +52,13 @@ async def lifespan(app: FastAPI):
 
     reap_orphans()
 
-    logger.info("Ready. model=%s api_keys=%d transcripts=%s",
-                settings.gemini_model, len(settings.api_keys),
-                settings.transcripts_dir)
+    logger.info("Ready. provider=%s model=%s api_key=%s transcripts=%s "
+                "audio=%s",
+                settings.llm.provider, settings.llm.model,
+                "set" if settings.llm.api_key_configured else "MISSING",
+                settings.transcripts.storage,
+                f"deepgram/{settings.speech.deepgram.model}"
+                if settings.speech.deepgram.configured else "off (DEEPGRAM_API_KEY unset)")
     try:
         yield
     finally:
@@ -71,8 +75,8 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Permissive by default for local UI development. Narrow CORS_ORIGINS before
-    # this is exposed anywhere real.
+    # Permissive by default for local UI development. Narrow api.cors_origins
+    # (CORS_ORIGINS) before this is exposed anywhere real.
     #
     # allow_credentials is off: auth is a plain X-API-Key header, which is not a
     # CORS credential, and 'Allow-Credentials: true' alongside 'Allow-Origin: *'
@@ -83,14 +87,14 @@ def create_app() -> FastAPI:
     # cross-origin by default, so paginated lists would arrive with no total.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.cors_origins,
+        allow_origins=settings.api.cors_origins,
         allow_methods=["*"],
         allow_headers=["*"],
         expose_headers=["X-Total-Count"],
     )
 
     register_error_handlers(app)
-    app.include_router(api_router, prefix=settings.api_prefix)
+    app.include_router(api_router, prefix=settings.api.prefix)
     return app
 
 

@@ -2,6 +2,13 @@
 
 import { useState } from "react";
 import type { InsightOut } from "@/lib/api/insights";
+import type {
+  DataGap,
+  Layer1,
+  Layer2,
+  Layer3,
+  ResolvedFollowUp,
+} from "@/lib/types/insightsJson";
 import type { Visit } from "@/lib/api/visits";
 import { formatDate, formatDateTime, dueUrgency } from "../../lib/dates";
 import { TranscriptSection } from "./TranscriptSection";
@@ -29,7 +36,28 @@ export function InsightBrief({
   asOf: Date;
   onScheduleFollowUp: () => void;
 }) {
-  const { layer_1, layer_2, layer_3, follow_up } = insight.insights_json;
+  const payload = insight.insights_json ?? {};
+  const layer_1: Layer1 = payload.layer_1 ?? {};
+  const layer_2: Layer2 = payload.layer_2 ?? {};
+  const layer_3: Layer3 = payload.layer_3 ?? {};
+  const follow_up: ResolvedFollowUp = payload.follow_up ?? {};
+
+  // Collections default to empty and nested objects to {}, so a section whose
+  // data did not arrive renders as absent rather than throwing. `insights_json`
+  // is stored as whatever the model returned — nothing validates its shape at
+  // any boundary — so "this key is always there" was never true, only unasked.
+  const watchOuts = layer_3.critical_watch_outs ?? [];
+  const nextQuestions = layer_3.follow_up_questions_for_next_visit ?? [];
+  const lifestyle = layer_3.lifestyle_recommendations ?? [];
+  const remedy = layer_3.prescribed_remedy ?? {};
+  const picture = layer_3.homeopathic_picture ?? {};
+  const gaps = layer_1.data_gaps_or_ambiguities ?? [];
+
+  // Layer 3 is the brief. Without it there is nothing to skim, and an empty
+  // shell of headings would read as "this consultation had no findings" rather
+  // than "this record is incomplete". The API always runs all three layers now,
+  // so this covers rows written before that was true.
+  const hasCarePlan = Boolean(payload.layer_3);
 
   // Stale-brief detection per frontend/README.md: if the transcript was
   // replaced after this brief was generated, the brief describes a different
@@ -43,6 +71,21 @@ export function InsightBrief({
   return (
     <div className="brief">
       <div>
+        {!hasCarePlan && (
+          <div className="notice notice--critical">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
+              <path d="M8 2.8 14.2 13H1.8L8 2.8Z" />
+              <path d="M8 6.6v2.9M8 11.2h.01" />
+            </svg>
+            <span>
+              <span className="notice-title">This brief is incomplete.</span> The
+              care plan is missing from the stored record, so what follows is
+              only part of the consultation. Read the transcript below, and
+              regenerate to rebuild the brief from it.
+            </span>
+          </div>
+        )}
+
         {isStale && (
           <div className="notice notice--critical">
             <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
@@ -69,18 +112,18 @@ export function InsightBrief({
           </div>
         </div>
 
-        {layer_3.critical_watch_outs.length > 0 && (
+        {watchOuts.length > 0 && (
           <div className="card watch">
             <div className="card-head">
               <h2 className="card-title">Watch for</h2>
               <span className="muted" style={{ fontSize: 12 }}>
-                {layer_3.critical_watch_outs.length} item
-                {layer_3.critical_watch_outs.length === 1 ? "" : "s"}
+                {watchOuts.length} item
+                {watchOuts.length === 1 ? "" : "s"}
               </span>
             </div>
             <div className="card-body card-body--tight">
               <ul className="watch-list">
-                {layer_3.critical_watch_outs.map((item, i) => (
+                {watchOuts.map((item, i) => (
                   <li key={i}>
                     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
                       <path d="M8 2.8 14.2 13H1.8L8 2.8Z" />
@@ -102,30 +145,36 @@ export function InsightBrief({
           <div className="card-body">
             <dl className="kv kv--stack">
               <dt>Remedy</dt>
-              <dd>{layer_3.prescribed_remedy.name}</dd>
+              <dd className={remedy.name ? undefined : "none"}>
+                {remedy.name || "Not recorded"}
+              </dd>
               <dt>Potency</dt>
-              <dd className={layer_3.prescribed_remedy.potency ? undefined : "none"}>
-                {layer_3.prescribed_remedy.potency || "Not specified"}
+              <dd className={remedy.potency ? undefined : "none"}>
+                {remedy.potency || "Not specified"}
               </dd>
               <dt>Dosing</dt>
-              <dd>{layer_3.prescribed_remedy.frequency}</dd>
+              <dd className={remedy.frequency ? undefined : "none"}>
+                {remedy.frequency || "Not recorded"}
+              </dd>
               <dt>Next step</dt>
-              <dd>{layer_3.prescribed_remedy.next_step}</dd>
+              <dd className={remedy.next_step ? undefined : "none"}>
+                {remedy.next_step || "Not recorded"}
+              </dd>
             </dl>
           </div>
         </div>
 
-        {layer_3.follow_up_questions_for_next_visit.length > 0 && (
+        {nextQuestions.length > 0 && (
           <div className="card">
             <div className="card-head">
               <h2 className="card-title">Ask next time</h2>
               <span className="muted" style={{ fontSize: 12 }}>
-                {layer_3.follow_up_questions_for_next_visit.length} questions
+                {nextQuestions.length} questions
               </span>
             </div>
             <div className="card-body">
               <ul className="qa">
-                {layer_3.follow_up_questions_for_next_visit.map((q, i) => (
+                {nextQuestions.map((q, i) => (
                   <li key={i}>
                     <p className="q">{q.question}</p>
                     <p className="why">
@@ -139,14 +188,14 @@ export function InsightBrief({
           </div>
         )}
 
-        {layer_3.lifestyle_recommendations.length > 0 && (
+        {lifestyle.length > 0 && (
           <div className="card">
             <div className="card-head">
               <h2 className="card-title">Lifestyle advice given</h2>
             </div>
             <div className="card-body">
               <ul className="reco">
-                {layer_3.lifestyle_recommendations.map((r, i) => (
+                {lifestyle.map((r, i) => (
                   <li key={i}>
                     <div className="area">{r.area}</div>
                     <div className="action">{r.action}</div>
@@ -177,11 +226,13 @@ export function InsightBrief({
             <h2 className="card-title">Pattern</h2>
           </div>
           <div className="card-body">
-            <p style={{ color: "var(--ink-2)" }}>{layer_3.homeopathic_picture.primary_theme}</p>
+            <p style={{ color: "var(--ink-2)" }}>
+              {picture.primary_theme ?? "Not recorded"}
+            </p>
             <dl className="kv" style={{ marginTop: 10 }}>
               <dt>Constitutional type</dt>
-              <dd className={layer_3.homeopathic_picture.constitutional_type ? undefined : "none"}>
-                {layer_3.homeopathic_picture.constitutional_type || "Not determined"}
+              <dd className={picture.constitutional_type ? undefined : "none"}>
+                {picture.constitutional_type || "Not determined"}
               </dd>
             </dl>
           </div>
@@ -215,9 +266,7 @@ export function InsightBrief({
       <div style={{ gridColumn: "1 / -1" }}>
         <ClinicalRecordSection layer1={layer_1} />
         <AnalysisSection layer2={layer_2} />
-        {layer_1.data_gaps_or_ambiguities.length > 0 && (
-          <GapsSection gaps={layer_1.data_gaps_or_ambiguities} />
-        )}
+        {gaps.length > 0 && <GapsSection gaps={gaps} />}
         <TranscriptSection visitId={visit.visit_id} filename={visit.transcript_filename} />
       </div>
     </div>
@@ -229,10 +278,11 @@ function FollowUpRail({
   asOf,
   onSchedule,
 }: {
-  followUp: InsightOut["insights_json"]["follow_up"];
+  followUp: ResolvedFollowUp;
   asOf: Date;
   onSchedule: () => void;
 }) {
+  const comeSoonerIf = followUp.come_sooner_if ?? [];
   return (
     <div className="card">
       <div className="card-head">
@@ -271,10 +321,10 @@ function FollowUpRail({
           </p>
         )}
 
-        {followUp.come_sooner_if.length > 0 && (
+        {comeSoonerIf.length > 0 && (
           <div className="trigger">
             <div className="trigger-label">Come sooner if</div>
-            {followUp.come_sooner_if.map((trigger, i) => (
+            {comeSoonerIf.map((trigger, i) => (
               <div key={i} style={{ marginTop: 4 }}>
                 {trigger.condition}
               </div>
@@ -296,8 +346,12 @@ function FollowUpRail({
   );
 }
 
-function ClinicalRecordSection({ layer1 }: { layer1: InsightOut["insights_json"]["layer_1"] }) {
+function ClinicalRecordSection({ layer1 }: { layer1: Layer1 }) {
   const [open, setOpen] = useState(false);
+  const complaints = layer1.chief_complaints ?? [];
+  const timeline = layer1.symptom_timeline ?? {};
+  const state = layer1.mental_emotional_state ?? {};
+  const living = layer1.lifestyle_factors ?? {};
   return (
     <details className="section" open={open} onToggle={(e) => setOpen(e.currentTarget.open)}>
       <summary>
@@ -308,7 +362,7 @@ function ClinicalRecordSection({ layer1 }: { layer1: InsightOut["insights_json"]
         <span className="section-note">what was said on the call, without interpretation</span>
       </summary>
       <div className="section-body">
-        {layer1.chief_complaints.length > 0 && (
+        {complaints.length > 0 && (
           <>
             <h3 style={{ fontSize: 12.5, marginBottom: 8 }}>Complaints</h3>
             <table className="complaints">
@@ -321,7 +375,7 @@ function ClinicalRecordSection({ layer1 }: { layer1: InsightOut["insights_json"]
                 </tr>
               </thead>
               <tbody>
-                {layer1.chief_complaints.map((c, i) => (
+                {complaints.map((c, i) => (
                   <tr key={i}>
                     <td>{c.symptom}</td>
                     <td>{c.location}</td>
@@ -339,31 +393,37 @@ function ClinicalRecordSection({ layer1 }: { layer1: InsightOut["insights_json"]
             <h3 style={{ fontSize: 12.5, marginBottom: 8 }}>Course</h3>
             <dl className="kv kv--stack">
               <dt>Onset</dt>
-              <dd>{layer1.symptom_timeline.onset}</dd>
+              <dd className={timeline.onset ? undefined : "none"}>
+                {timeline.onset || "Not recorded"}
+              </dd>
               <dt>Pattern</dt>
-              <dd>{layer1.symptom_timeline.pattern}</dd>
+              <dd className={timeline.pattern ? undefined : "none"}>
+                {timeline.pattern || "Not recorded"}
+              </dd>
               <dt>Progression</dt>
-              <dd>{layer1.symptom_timeline.progression}</dd>
+              <dd className={timeline.progression ? undefined : "none"}>
+                {timeline.progression || "Not recorded"}
+              </dd>
             </dl>
           </div>
           <div>
             <h3 style={{ fontSize: 12.5, marginBottom: 8 }}>Sleep, energy and mood</h3>
             <dl className="kv kv--stack">
               <dt>Sleep</dt>
-              <dd className={layer1.mental_emotional_state.sleep_pattern ? undefined : "none"}>
-                {layer1.mental_emotional_state.sleep_pattern || "Not recorded"}
+              <dd className={state.sleep_pattern ? undefined : "none"}>
+                {state.sleep_pattern || "Not recorded"}
               </dd>
               <dt>Energy</dt>
-              <dd className={layer1.mental_emotional_state.energy_level ? undefined : "none"}>
-                {layer1.mental_emotional_state.energy_level || "Not recorded"}
+              <dd className={state.energy_level ? undefined : "none"}>
+                {state.energy_level || "Not recorded"}
               </dd>
               <dt>Patient reported</dt>
-              <dd className={layer1.mental_emotional_state.patient_reported_emotions ? undefined : "none"}>
-                {layer1.mental_emotional_state.patient_reported_emotions || "Not recorded"}
+              <dd className={state.patient_reported_emotions ? undefined : "none"}>
+                {state.patient_reported_emotions || "Not recorded"}
               </dd>
               <dt>Mood observed by doctor</dt>
-              <dd className={layer1.mental_emotional_state.mood_observed ? undefined : "none"}>
-                {layer1.mental_emotional_state.mood_observed || "Not recorded"}
+              <dd className={state.mood_observed ? undefined : "none"}>
+                {state.mood_observed || "Not recorded"}
               </dd>
             </dl>
           </div>
@@ -371,34 +431,34 @@ function ClinicalRecordSection({ layer1 }: { layer1: InsightOut["insights_json"]
 
         <h3 style={{ fontSize: 12.5, margin: "20px 0 8px" }}>Lifestyle as reported</h3>
         <dl className="kv">
-          {layer1.lifestyle_factors.diet && (
+          {living.diet && (
             <>
               <dt>Diet</dt>
-              <dd>{layer1.lifestyle_factors.diet}</dd>
+              <dd>{living.diet}</dd>
             </>
           )}
-          {layer1.lifestyle_factors.caffeine_alcohol && (
+          {living.caffeine_alcohol && (
             <>
               <dt>Caffeine / alcohol</dt>
-              <dd>{layer1.lifestyle_factors.caffeine_alcohol}</dd>
+              <dd>{living.caffeine_alcohol}</dd>
             </>
           )}
-          {layer1.lifestyle_factors.exercise && (
+          {living.exercise && (
             <>
               <dt>Exercise</dt>
-              <dd>{layer1.lifestyle_factors.exercise}</dd>
+              <dd>{living.exercise}</dd>
             </>
           )}
-          {layer1.lifestyle_factors.home_environment && (
+          {living.home_environment && (
             <>
               <dt>Home</dt>
-              <dd>{layer1.lifestyle_factors.home_environment}</dd>
+              <dd>{living.home_environment}</dd>
             </>
           )}
-          {layer1.lifestyle_factors.work_stress && (
+          {living.work_stress && (
             <>
               <dt>Work stress</dt>
-              <dd>{layer1.lifestyle_factors.work_stress}</dd>
+              <dd>{living.work_stress}</dd>
             </>
           )}
         </dl>
@@ -407,10 +467,15 @@ function ClinicalRecordSection({ layer1 }: { layer1: InsightOut["insights_json"]
   );
 }
 
-function AnalysisSection({ layer2 }: { layer2: InsightOut["insights_json"]["layer_2"] }) {
+function AnalysisSection({ layer2 }: { layer2: Layer2 }) {
   const [open, setOpen] = useState(false);
-  const doctor = layer2.doctor_stated_analysis;
-  const model = layer2.llm_inferred_patterns;
+  const doctor = layer2.doctor_stated_analysis ?? {};
+  const model = layer2.llm_inferred_patterns ?? {};
+  const doctorRemedies = doctor.remedies_prescribed_or_discussed ?? [];
+  const modalities = doctor.modalities_doctor_noted ?? {};
+  const alternatives = model.alternative_remedies_to_consider ?? [];
+  const modelQuestions = model.questions_for_next_visit ?? [];
+  const themes = model.pattern_themes ?? {};
   return (
     <details className="section" open={open} onToggle={(e) => setOpen(e.currentTarget.open)}>
       <summary>
@@ -435,7 +500,9 @@ function AnalysisSection({ layer2 }: { layer2: InsightOut["insights_json"]["laye
           <div className="panel-body">
             <dl className="kv kv--stack">
               <dt>Reasoning</dt>
-              <dd>{doctor.doctor_reasoning}</dd>
+              <dd className={doctor.doctor_reasoning ? undefined : "none"}>
+                {doctor.doctor_reasoning || "Not recorded"}
+              </dd>
               <dt>Constitutional type</dt>
               <dd className={doctor.constitutional_type_mentioned ? undefined : "none"}>
                 {doctor.constitutional_type_mentioned || "Not mentioned"}
@@ -445,13 +512,17 @@ function AnalysisSection({ layer2 }: { layer2: InsightOut["insights_json"]["laye
                 {doctor.miasm_or_themes_mentioned || "Not discussed"}
               </dd>
               <dt>Cautions given</dt>
-              <dd>{doctor.contraindications_or_cautions_doctor_stated}</dd>
+              <dd className={
+                doctor.contraindications_or_cautions_doctor_stated ? undefined : "none"
+              }>
+                {doctor.contraindications_or_cautions_doctor_stated || "None given"}
+              </dd>
             </dl>
 
-            {doctor.remedies_prescribed_or_discussed.length > 0 && (
+            {doctorRemedies.length > 0 && (
               <>
                 <h4 style={{ fontSize: 12, margin: "14px 0 8px" }}>Remedies prescribed or discussed</h4>
-                {doctor.remedies_prescribed_or_discussed.map((r, i) => (
+                {doctorRemedies.map((r, i) => (
                   <div className="remedy-opt" key={i}>
                     <div className="remedy-opt-head">
                       <span className="remedy-name">{r.remedy_name}</span>
@@ -469,7 +540,7 @@ function AnalysisSection({ layer2 }: { layer2: InsightOut["insights_json"]["laye
               <div>
                 <div className="mod-title">Worse from</div>
                 <ul className="mod-list">
-                  {doctor.modalities_doctor_noted.worse_from.map((m, i) => (
+                  {(modalities.worse_from ?? []).map((m, i) => (
                     <li key={i}>{m}</li>
                   ))}
                 </ul>
@@ -477,7 +548,7 @@ function AnalysisSection({ layer2 }: { layer2: InsightOut["insights_json"]["laye
               <div>
                 <div className="mod-title">Better from</div>
                 <ul className="mod-list">
-                  {doctor.modalities_doctor_noted.better_from.map((m, i) => (
+                  {(modalities.better_from ?? []).map((m, i) => (
                     <li key={i}>{m}</li>
                   ))}
                 </ul>
@@ -494,11 +565,11 @@ function AnalysisSection({ layer2 }: { layer2: InsightOut["insights_json"]["laye
           <div className="panel-body">
             <p className="disclaimer">{model.confidence_disclaimer}</p>
 
-            {model.alternative_remedies_to_consider.map((r, i) => (
+            {alternatives.map((r, i) => (
               <div className="remedy-opt" key={i}>
                 <div className="remedy-opt-head">
                   <span className="remedy-name">{r.remedy_name}</span>
-                  <span className={`conf ${CONFIDENCE_CLASS[r.confidence] ?? ""}`}>
+                  <span className={`conf ${CONFIDENCE_CLASS[r.confidence ?? ""] ?? ""}`}>
                     {r.confidence === "high"
                       ? "Strong match"
                       : r.confidence === "low"
@@ -514,11 +585,11 @@ function AnalysisSection({ layer2 }: { layer2: InsightOut["insights_json"]["laye
               </div>
             ))}
 
-            {model.questions_for_next_visit.length > 0 && (
+            {modelQuestions.length > 0 && (
               <>
                 <h4 style={{ fontSize: 12, margin: "16px 0 6px" }}>Questions to consider</h4>
                 <ul className="qa">
-                  {model.questions_for_next_visit.map((q, i) => (
+                  {modelQuestions.map((q, i) => (
                     <li key={i}>
                       <p className="q">{q.question}</p>
                       <p className="why">
@@ -534,9 +605,13 @@ function AnalysisSection({ layer2 }: { layer2: InsightOut["insights_json"]["laye
             <h4 style={{ fontSize: 12, margin: "16px 0 6px" }}>Themes</h4>
             <dl className="kv kv--stack">
               <dt>Dominant</dt>
-              <dd>{model.pattern_themes.dominant_theme}</dd>
+              <dd className={themes.dominant_theme ? undefined : "none"}>
+                {themes.dominant_theme || "Not identified"}
+              </dd>
               <dt>Emotional core</dt>
-              <dd>{model.pattern_themes.emotional_core}</dd>
+              <dd className={themes.emotional_core ? undefined : "none"}>
+                {themes.emotional_core || "Not identified"}
+              </dd>
             </dl>
           </div>
         </div>
@@ -545,11 +620,7 @@ function AnalysisSection({ layer2 }: { layer2: InsightOut["insights_json"]["laye
   );
 }
 
-function GapsSection({
-  gaps,
-}: {
-  gaps: InsightOut["insights_json"]["layer_1"]["data_gaps_or_ambiguities"];
-}) {
+function GapsSection({ gaps }: { gaps: DataGap[] }) {
   const [open, setOpen] = useState(false);
   return (
     <details className="section" open={open} onToggle={(e) => setOpen(e.currentTarget.open)}>

@@ -10,6 +10,9 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "gen:api": "openapi-typescript ${BACKEND_URL:-http://127.0.0.1:8000}/openapi.json -o lib/types/api.d.ts"
   },
   "dependencies": {
@@ -22,15 +25,26 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.3.3",
+    "@testing-library/dom": "^10.4.2",
+    "@testing-library/react": "^16.3.3",
     "@types/node": "^24.10.1",
     "@types/react": "^19.2.2",
     "@types/react-dom": "^19.2.1",
+    "@vitejs/plugin-react": "^6.1.1",
+    "eslint": "^9.39.5",
+    "eslint-config-next": "^16.3.4",
+    "jsdom": "^30.1.1",
     "openapi-typescript": "^7.13.0",
     "tailwindcss": "^4.3.3",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
   },
   "//": "Neon Auth is beta-only on npm and auth-ui pins auth to an exact version, so both are pinned exactly rather than with carets.",
   "//dev": "`dev` runs HTTPS on purpose. Neon Auth's session-challenge cookie is __Secure- prefixed with the Secure flag, and Safari refuses to store Secure cookies over plain HTTP even on localhost (Chrome and Firefox make an exception). Over http:// the cookie is dropped, so the OAuth callback fails with SESSION_CHALLENGE_COOKIE_NOT_FOUND and you land back on the sign-in screen with no visible error and nothing in the backend logs. The SDK's SessionCookieConfig exposes secret/sessionDataTtl/domain/sameSite only, so the flag cannot be turned off — the origin has to be genuinely secure.",
   "//dev-certs": "certificates/*.pem is a self-signed cert generated with openssl, gitignored, and NOT trusted by the system, so the browser warns once per origin. It is used instead of `dev:mkcert` (next dev --experimental-https) because mkcert needs sudo to install a local CA into the system trust store, which cannot be automated. Run `dev:mkcert` yourself once if you would rather have a trusted cert and no warning. `dev:http` is kept for Chrome-only work, and for `gen:api` which does not care.",
-  "//dev-regen-certs": "openssl req -x509 -newkey rsa:2048 -sha256 -days 825 -nodes -keyout certificates/localhost-key.pem -out certificates/localhost.pem -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'"
+  "//dev-regen-certs": "openssl req -x509 -newkey rsa:2048 -sha256 -days 825 -nodes -keyout certificates/localhost-key.pem -out certificates/localhost.pem -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'",
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "unrs-resolver@1.12.2": true
+  }
 }

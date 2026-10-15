@@ -15,7 +15,12 @@ from typing import Any, Dict, List, Optional
 import psycopg
 
 from app.config import get_settings
-from app.core.errors import ConflictError, NotFoundError, QuotaExhaustedError
+from app.core.errors import (
+    ConflictError,
+    LayerOutputError,
+    NotFoundError,
+    QuotaExhaustedError,
+)
 from app.db.models import InsightRow, VisitRow
 from app.db.repositories import insights as insights_repo
 from app.db.repositories import visits as visits_repo
@@ -24,8 +29,9 @@ from app.db.tenancy import DoctorScope
 from app.domain.follow_up.models import SCHEDULED, ResolvedFollowUp
 from app.domain.transcripts import Transcript
 from app.storage import store_for_visit
-from app.llm.errors import AllKeysExhausted, is_quota_failure
-from app.llm.gemini import ChatClient, build_llm
+from app.llm.base import ChatClient
+from app.llm.errors import is_quota_failure
+from app.llm.factory import build_llm
 from app.pipeline.layers import LAYERS
 from app.pipeline.results import PatientContext, PipelineResult
 from app.pipeline.runner import ProgressFn, run_pipeline
@@ -43,7 +49,7 @@ def prompt_version() -> str:
     settings = get_settings()
     digest = hashlib.sha256()
     for spec in sorted(LAYERS.values(), key=lambda s: s.number):
-        path = settings.prompts_dir / spec.template
+        path = settings.llm.prompts_dir / spec.template
         digest.update(path.read_bytes() if path.is_file() else b"")
     return digest.hexdigest()[:12]
 
@@ -132,6 +138,37 @@ def build_insight_row(
 # Generation
 # --------------------------------------------------------------------------- #
 
+def require_complete_brief(result: PipelineResult) -> None:
+    """Refuse to persist a run that did not produce a usable care plan.
+
+    Layer 3 is the doctor-facing part: `chief_issue`, the remedy, the watch-outs,
+    the questions for next time. The frontend renders it directly out of
+    `insights_json`, so a payload without it is not a thin brief, it is a brief
+    that cannot be displayed at all.
+
+    That mattered because `insights_repo.save` sets `visits.insights_generated`
+    TRUE in the same transaction (§8.7). A partial run therefore produced a visit
+    that *claims* to have a brief, and opening it threw on `layer_3.chief_issue`.
+    The HTTP API no longer offers `stop_after` at all, but the CLI still does —
+    it is the right tool for iterating on an early prompt — so the guarantee has
+    to live here, at the write, rather than in the absence of a request field.
+
+    Raises LayerOutputError, which the CLI already reports per visit and the API
+    maps like any other pipeline failure. Nothing is written, so the visit stays
+    pending and a later full run picks it up.
+    """
+    layer_3 = result.layer_3
+    if layer_3 is None:
+        raise LayerOutputError(
+            "The run stopped before Layer 3, so there is no care plan to store. "
+            "Insights are only saved once all three layers have completed.")
+    if not isinstance(layer_3.data, dict):
+        raise LayerOutputError(
+            "Layer 3 did not return a JSON object, so the care plan cannot be "
+            "stored.",
+            raw_response=layer_3.raw_response)
+
+
 def load_visit_transcript(visit: VisitRow) -> Transcript:
     """Load the transcript a visit points at, from whichever backend holds it.
 
@@ -196,7 +233,7 @@ def generate_for_visit(
     """Run the chain for one visit and persist the result.
 
     Raises ConflictError if insights already exist and regenerate is False, and
-    QuotaExhaustedError when every API key is rate limited. Nothing is written
+    QuotaExhaustedError when the model provider is rate limiting. Nothing is written
     unless all requested layers succeed, so a mid-chain failure leaves
     visits.insights_generated FALSE and the visit still pending.
 
@@ -223,17 +260,19 @@ def generate_for_visit(
             transcript=transcript,
             patient=patient_context(visit),
             llm=client,
-            prompts_dir=get_settings().prompts_dir,
+            prompts_dir=get_settings().llm.prompts_dir,
             stop_after=stop_after,
             strict_json=strict_json,
             progress=progress,
         )
-    except AllKeysExhausted as exc:
-        raise QuotaExhaustedError(str(exc), details={"keys": exc.status}) from exc
     except Exception as exc:
+        # The provider's client has already retried; a throttle that outlasted
+        # those retries is worth trying again later, unchanged.
         if is_quota_failure(exc):
             raise QuotaExhaustedError(str(exc)) from exc
         raise
+
+    require_complete_brief(result)
 
     # No diagnosis is recorded. `disease` existed only as a prop for generating
     # the synthetic transcripts, so it must not reach the doctor; with it gone,

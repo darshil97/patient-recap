@@ -29,6 +29,10 @@
  *   3. Empty bodies. GET /api/v1/visits/{id}/job returns 204 when a visit has
  *      never had a job. 204/205/304 must carry no body at all, so constructing
  *      a Response with one throws.
+ *
+ *   4. A timeout. Without one, a backend that accepts the connection and then
+ *      stalls holds the request until the platform kills it, which the UI cannot
+ *      explain. See BACKEND_TIMEOUT_MS.
  */
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth/server";
@@ -36,10 +40,30 @@ import { auth } from "@/lib/auth/server";
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-const METHODS = ["GET", "POST", "PATCH", "PUT", "DELETE"] as const;
-
 /** Responses that must not carry a body. */
 const BODILESS_STATUSES = new Set([204, 205, 304]);
+
+/**
+ * How long to wait on the backend before giving up.
+ *
+ * There was no timeout, so a backend that accepted the connection and then went
+ * quiet held the request until the platform killed it — which surfaces as an
+ * opaque function error rather than anything the UI can explain.
+ *
+ * 25s is chosen against the two real numbers: a Render free instance cold-starts
+ * in 30-60s when it has been allowed to sleep, and a Vercel function has its own
+ * hard ceiling. Waiting the full cold start would exceed that ceiling anyway, so
+ * the useful thing is to fail *first*, with a message that names waking up as
+ * the likely cause. UptimeRobot polls /api/v1/health every 12 minutes precisely
+ * so this stays rare (§9.5).
+ *
+ * Neither insight generation nor recording transcription sits behind this:
+ * POST /insights and POST /audio-uploads/{id}/finish return 202 in milliseconds
+ * and the work happens on a background task the client polls. Recordings are
+ * sent in chunks under Vercel's 4.5 MB request body limit, so no single request
+ * here carries more than one chunk (backend speech.chunk_bytes).
+ */
+const BACKEND_TIMEOUT_MS = 25_000;
 
 /**
  * Request headers worth forwarding. An allowlist rather than a copy-everything:
@@ -169,13 +193,24 @@ async function handle(
       body: body && body.byteLength > 0 ? body : undefined,
       redirect: "manual",
       cache: "no-store",
+      signal: AbortSignal.timeout(BACKEND_TIMEOUT_MS),
     });
-  } catch {
-    return jsonError(
-      502,
-      "backend_unreachable",
-      "The clinical records service is not responding.",
-    );
+  } catch (err) {
+    // A timeout and a refused connection are different things to a reader: one
+    // is "it is probably waking up, try again", the other is "it is not there".
+    const timedOut = err instanceof DOMException && err.name === "TimeoutError";
+    return timedOut
+      ? jsonError(
+          504,
+          "backend_timeout",
+          "The clinical records service did not respond in time. It may be " +
+            "starting up — try again in a moment.",
+        )
+      : jsonError(
+          502,
+          "backend_unreachable",
+          "The clinical records service is not responding.",
+        );
   }
 
   const responseHeaders = new Headers();
@@ -203,5 +238,3 @@ export const POST = handle;
 export const PATCH = handle;
 export const PUT = handle;
 export const DELETE = handle;
-
-export type ProxyMethod = (typeof METHODS)[number];

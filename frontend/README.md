@@ -12,8 +12,9 @@ server-side BFF proxy in front of the FastAPI backend.
 ```
 frontend/
 ├── app/
+│   ├── (home)/             "/" -> the public home page (no sign-in needed)
 │   ├── (app)/              authenticated area, wrapped in the clinical shell
-│   │   ├── page.tsx        "/" -> the follow-up queue
+│   │   ├── today/          "/today" -> the follow-up queue, where sign-in lands
 │   │   ├── follow-ups/     same queue under its own name
 │   │   ├── schedule/       visit schedule
 │   │   ├── patients/       list, and [patientId] detail/timeline
@@ -31,7 +32,7 @@ frontend/
 │   ├── auth/               server.ts (secrets) and client.ts (browser)
 │   └── types/api.d.ts      generated — do not hand-edit
 ├── certificates/           self-signed dev cert, gitignored (see HTTPS below)
-├── proxy.ts                route protection (middleware.ts on Next < 16)
+├── proxy.ts                route protection; "/" public, signed-in visitors sent to /today
 ├── legacy-vite/            the previous Vite SPA, reference only
 └── design-history/         mockups and design alternatives
 ```
@@ -47,7 +48,10 @@ Three details in that proxy are load-bearing:
 - multipart bodies are forwarded as **raw bytes** with the incoming `Content-Type`
   copied verbatim — re-encoding would mint a boundary that no longer matches the
   body, breaking transcript upload
-- `X-Total-Count` is copied onto the response, or paginated lists lose their totals
+- `X-Total-Count` is copied onto the response, or paginated lists lose their totals.
+  It counts the same filters as the list, so a total larger than the array means
+  there are more pages — send `limit` / `offset`, do not assume you have them all.
+  Default page size is 100, maximum 500.
 - `204`/`205`/`304` are returned without a body, because constructing one throws
 
 ## Generate the client, don't hand-write it
@@ -96,10 +100,18 @@ POST   /visits                         schedule              -> 201
 GET    /visits?status=&from=&to=       list, newest first    -> X-Total-Count
 GET    /visits/{id}                    single
 PATCH  /visits/{id}                    correct details
+POST   /visits/{id}/start              session under way     -> 200 (in_progress)
 POST   /visits/{id}/complete           mark done             -> 200
 POST   /visits/{id}/cancel             cancel                -> 200
 
 POST   /visits/{id}/transcript         upload .txt (multipart) -> 201
+POST   /visits/{id}/audio-uploads      or a recording: start   -> 201 + chunk plan
+POST   /visits/{id}/audio-uploads/live or record live: start   -> 201, no plan yet
+PUT    /audio-uploads/{id}/chunks/{i}  one chunk (multipart)
+POST   /audio-uploads/{id}/finish      transcribe              -> 202
+POST   /audio-uploads/{id}/discard     throw an unfinished one away
+GET    /audio-uploads/{id}             poll
+GET    /visits/{id}/audio-upload       latest (204 if none)
 GET    /visits/{id}/transcript         read it back
 DELETE /visits/{id}/transcript         remove it             -> 204
 
@@ -116,18 +128,29 @@ PATCH  /follow-ups/{id}                outcome of a call
 ### The lifecycle is explicit
 
 ```
-Schedule -> Complete -> Add Transcript -> Generate Insights
+Schedule -> [Start session] -> Complete -> Add Transcript -> Generate Insights
 ```
 
 A visit is created **before** the consultation, so it starts
 `visit_status: "scheduled"` with no transcript. Each step is its own action:
 
-- `PATCH /visits/{id}` does **not** complete a visit. Only `/complete` does.
+- `PATCH /visits/{id}` corrects **date, time and type only**. It does not accept
+  `visit_status` or `transcript_path` — both are rejected with a 422 rather than
+  ignored, because both used to be honoured and a silent 200 would be worse.
+  Only `/start`, `/complete` and `/cancel` change status.
+- `/start` moves a `scheduled` visit to `in_progress`: the consultation is under
+  way. It is optional, idempotent, and only needed for a live recording. A
+  completed or cancelled visit cannot be started (409).
 - **Upload requires the visit to be `completed`** — a 409 otherwise. That is what
   makes an Add Transcript button legitimately disabled until then.
 - `/complete` is idempotent, so no need to guard a double click.
 - `/cancel` reopens any follow-up that visit had resolved, and is refused (409)
-  once insights exist.
+  once insights exist. Its optional `reason` is stored on the visit and comes
+  back as `cancelled_reason` (NULL = not recorded). It also discards any
+  unfinished recording for the visit, so a live recorder still sending gets a
+  409 on its next chunk.
+- To upload to a visit that is not completed yet, call `/complete` first and
+  then upload: the UI does both in one gesture, the server sees two transitions.
 
 ### Transcripts are `.txt` only
 
@@ -148,6 +171,106 @@ address is the same either way. The name you send is kept only for display in
 
 `GET /visits/{id}/transcript` returns the text with a `character_count`, so a
 brief can be shown next to its source.
+
+### Or a recording, sent in chunks
+
+Every request goes through the BFF, and on Vercel a request body is capped at
+4.5 MB, so a recording goes up in pieces. `lib/api/audioUploads.ts`
+(`uploadRecording`) does all of this; the steps are:
+
+1. `POST /visits/{id}/audio-uploads` with `{filename, size_bytes, replace}`.
+   Accepts `.mp3 .m4a .mp4 .aac .wav .flac .ogg .oga .opus .webm` up to 100 MB.
+   Everything that would make the recording unusable is checked here, before any
+   bytes move. The response is the plan: `upload_id`, `chunk_bytes`,
+   `chunk_count`.
+2. `PUT /audio-uploads/{upload_id}/chunks/{i}` for each `i`, multipart `file` =
+   bytes `[i * chunk_bytes, min((i + 1) * chunk_bytes, size_bytes))` —
+   `File.slice` does it. Sizes must be exact. Resending a chunk replaces it, so
+   retry a chunk on network errors, 5xx and 504; a 4xx will fail the same way
+   again.
+3. `POST /audio-uploads/{upload_id}/finish` -> 202. A 409 with
+   `details.missing` lists chunks to resend.
+4. Poll `GET /audio-uploads/{upload_id}` until `completed` or `failed`. On a
+   reload, `GET /visits/{id}/audio-upload` finds it again.
+
+The backend stitches the chunks into one stored recording, deletes the chunks,
+transcribes it, labels each voice `DOCTOR`, `PATIENT` or `OTHER (description)`,
+and stores the text as the visit's transcript — afterwards indistinguishable from
+a `.txt` upload.
+
+**Do not call `POST /insights` after a recording.** The backend queues the
+insight job itself, before it marks the upload `completed`, so on `completed`
+follow `GET /visits/{id}/job` straight into the compiling state. This is the one
+difference from `.txt`, where the frontend chains the generate call. It means a
+brief is compiled even if the uploading tab was closed. A failed job is retried
+with `POST /insights` as usual.
+
+`warnings` on a completed upload do not hold generation back. Show them above
+the brief (and its progress) as something to check against the transcript.
+They are stored, so they survive a reload; stop showing them once the visit's
+`transcript_uploaded_at` is later than the upload's `completed_at` (a different
+transcript replaced it).
+
+A `failed` upload with `retryable: true` still has its bytes: `finish` again to
+retry, no re-upload. Its `error_message` is written for the doctor.
+
+| Status | When |
+| --- | --- |
+| 409 | visit not `completed`, transcript exists without `replace`, a recording is already processing, an unfinished live recording exists for the visit, chunks missing, or the upload no longer accepts chunks |
+| 413 | recording over the limit |
+| 422 | unsupported format, chunk index out of range, or a chunk not exactly its planned size |
+| 500 | `DEEPGRAM_API_KEY` or the LLM key missing on the server (at start) |
+| 503 | storage hiccup on a chunk — resend it |
+
+Every upload response carries `mode` (`file` or `live`), `bytes_received` and
+`last_chunk_at`. For a `file` upload `size_bytes` and `chunk_count` are always
+numbers.
+
+### Or record it live, sent while recording
+
+A recording made in the browser goes up **during** the consultation, so a closed
+tab costs at most the last piece rather than the whole consultation. Same chunk
+route, same BFF, same auth; the browser never talks to Deepgram.
+`features/recording/LiveSessionProvider.tsx` (mounted in the `(app)` layout, so
+recording survives navigation) does all of this. The cutting and sending are
+pure modules in `lib/recording/`.
+
+1. `POST /visits/{id}/start` — the visit must be `in_progress` to record.
+2. `POST /visits/{id}/audio-uploads/live` with `{filename, replace}`. The
+   filename's extension declares the recorder's format: `.webm` (Chrome, Edge,
+   Firefox), `.mp4` (Safari) or `.ogg`. There is no size. The response has
+   `mode: "live"`, `chunk_bytes` (262144) and **`size_bytes` / `chunk_count`
+   null** — nothing is planned yet. 409 if the session was not started, or a live
+   recording for this visit is already open (another tab): it is never replaced
+   silently, because it may still be recording.
+3. While recording, `PUT /audio-uploads/{upload_id}/chunks/{i}` with `i` from 0
+   upwards. **Every chunk must be exactly `chunk_bytes` except the last** — cut
+   the recorder's byte stream into exact pieces rather than sending
+   `MediaRecorder` blobs as they come. Each piece is 1 to `chunk_bytes` here; the
+   exact-size rule is enforced at finish. Send in order, one at a time, and retry
+   on network errors and 5xx for as long as recording continues. 413 means the
+   recording reached the 100 MB ceiling; 409 means it was discarded or the visit
+   cancelled elsewhere — stop recording.
+4. End session: send the last (short) piece, wait until every piece is
+   acknowledged, then `POST /visits/{id}/complete`, then
+   `POST /audio-uploads/{upload_id}/finish` with `{"chunk_count": n}`. The plan
+   is worked out from what arrived and must account for exactly `n` chunks; a 409
+   with `details.missing` lists pieces to resend. 409 if the visit is not
+   completed yet.
+5. From here it is the same as a file: poll, then follow the job.
+
+**After an interrupted session** (closed tab, crash), the latest upload is
+`mode: "live"`, `status: "receiving"`. `bytes_received` and
+`created_at`→`last_chunk_at` say what was saved. Offer two things:
+
+- process it: `/complete` if the visit is not completed, then `finish` with **no
+  body** — whatever arrived is the recording;
+- `POST /audio-uploads/{upload_id}/discard` (idempotent; 409 once processing or
+  transcribed), after which a new live recording or a file upload can start.
+
+While a live recording is `receiving`, **every** upload start for that visit —
+live or file — is a 409. An unfinished live recording is kept for 24 hours after
+its last chunk, then removed at the next backend restart.
 
 ### Follow-ups
 
@@ -201,7 +324,9 @@ distinct — do not collapse them:
 
 Product decision: the doctor should not have to press a second button. A
 successful upload is immediately followed by `POST /visits/{id}/insights`, and the
-UI moves straight into the progress state.
+UI moves straight into the progress state. (A recording goes one step further:
+the backend starts generation itself once it is transcribed — see "Or a
+recording, sent in chunks".)
 
 The chaining lives in the **frontend**, not the upload endpoint, on purpose.
 Storing bytes always succeeds; generation costs money and hits a daily cap. Keeping
@@ -260,6 +385,28 @@ indicator can show real movement rather than a spinner.
 rate limited, which is expected on the free tier and worth retrying unchanged
 tomorrow — not a bug to report. Distinguish it from `failed`, which needs looking
 at.
+
+The request body takes `regenerate` and `model`. There is **no `stop_after`**:
+all three layers always run, because Layer 3 is the part this UI renders and a
+run that stopped earlier produced a brief with nothing to show.
+
+**A failed job does not invalidate the brief that is already stored.** Insights
+are upserted one row per visit, so a failed *re*generation leaves the previous
+brief exactly as it was. Show the failure as a banner above it, not instead of
+it — gate the brief on `queued`/`running`, not on the last job having succeeded.
+
+### `insights_json` is not validated
+
+The column is `Dict[str, Any]` on the backend and comes through
+openapi-typescript as an opaque object, so `lib/types/insightsJson.ts` is a
+hand-written assertion, not a guarantee. **Every field in it is optional**, and
+that is deliberate: declaring them required did not make them present, it only
+stopped the compiler asking, and one missing key threw on first render and
+blanked the page. Prompts are data and can be edited, so the shape can change
+without any code changing.
+
+Treat anything under `insights_json` as possibly absent, and keep `InsightBrief`
+inside its error boundary. `app/error.tsx` catches the rest.
 
 ## Errors
 
@@ -552,7 +699,7 @@ absent). It deliberately omits `insights_json`, which is 20-30 KB per visit.
 polling, or `204` when the visit has never had one — distinguishable from a `404`
 for an unknown visit.
 
-Never poll `GET /health/api-keys`: each call spends one request from every key's
-daily quota.
+Never poll `GET /health/api-keys`: each call spends one model request with the
+backend's API key (on Gemini's free tier, 1 of 20 a day).
 
 **Vercel Deployment:** https://patient-recap.vercel.app

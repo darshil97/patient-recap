@@ -4,6 +4,7 @@ import { useState } from "react";
 import { Modal, ModalBody, ModalFoot } from "../../components/Modal";
 import { scheduleVisit } from "@/lib/api/visits";
 import { ApiError } from "@/lib/api/client";
+import { useStatsContext } from "../../hooks/StatsContext";
 
 /**
  * Schedule Visit. Per PROJECT_CONTEXT.md §8.5, visit_date is required and
@@ -23,7 +24,14 @@ export function ScheduleVisitModal({
   onClose: () => void;
   onScheduled: () => void;
 }) {
-  const today = new Date().toISOString().slice(0, 10);
+  const { stats } = useStatsContext();
+  // The server's date, via /stats. `new Date().toISOString()` is UTC, so east of
+  // Greenwich it returns yesterday for the first hours of every local day.
+  //
+  // This one matters more than the others. visit_date anchors every relative
+  // follow-up (§8.5): "come back in three weeks" is resolved against it, so a
+  // date that is a day out moves the appointment it computes by a day.
+  const today = stats?.as_of ?? new Date().toISOString().slice(0, 10);
   const [visitDate, setVisitDate] = useState(today);
   const [visitTime, setVisitTime] = useState("");
   const [visitType, setVisitType] = useState<"initial" | "follow_up" | "">("");

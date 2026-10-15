@@ -19,6 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app.config import Settings, load_settings  # noqa: E402
 from app.core.errors import NotFoundError  # noqa: E402
 from app.db.models import VisitRow  # noqa: E402
 from app.storage import (  # noqa: E402
@@ -448,9 +449,8 @@ class TestProviderRouting(unittest.TestCase):
 
     def test_store_for_visit_follows_the_row_not_the_setting(self):
         """A visit on local disk stays readable after the default flips."""
-        settings = mock.MagicMock()
-        settings.transcript_storage = NEON_OBJECT_STORAGE
-        settings.transcripts_dir = Path("/tmp/transcripts")
+        settings = Settings(transcripts={"storage": NEON_OBJECT_STORAGE,
+                                         "local_dir": "/tmp/transcripts"})
         with mock.patch.object(factory, "get_settings", return_value=settings):
             store = factory.store_for_visit(a_visit(transcript_provider=LOCAL))
         self.assertEqual(store.provider, LOCAL)
@@ -458,9 +458,8 @@ class TestProviderRouting(unittest.TestCase):
     def test_a_null_provider_reads_as_local(self):
         """transcript_provider is NULL when nothing is attached, and older rows
         predate the column being written, so NULL must not be an error."""
-        settings = mock.MagicMock()
-        settings.transcripts_dir = Path("/tmp/transcripts")
-        settings.transcript_storage = LOCAL
+        settings = Settings(transcripts={"storage": LOCAL,
+                                         "local_dir": "/tmp/transcripts"})
         with mock.patch.object(factory, "get_settings", return_value=settings):
             store = factory.store_for_visit(a_visit(transcript_provider=None))
         self.assertEqual(store.provider, LOCAL)
@@ -475,13 +474,7 @@ class TestProviderRouting(unittest.TestCase):
 
     def test_object_storage_without_credentials_names_the_missing_variables(self):
         """Better than a NoCredentialsError from three frames inside botocore."""
-        settings = mock.MagicMock()
-        settings.transcript_storage = NEON_OBJECT_STORAGE
-        settings.transcript_bucket = "consultation-transcripts"
-        settings.s3_endpoint_url = None
-        settings.s3_access_key_id = None
-        settings.s3_secret_access_key = None
-        settings.object_storage_configured = False
+        settings = Settings(transcripts={"storage": NEON_OBJECT_STORAGE})
 
         with mock.patch.object(factory, "get_settings", return_value=settings):
             with self.assertRaises(StorageError) as ctx:
@@ -492,55 +485,56 @@ class TestProviderRouting(unittest.TestCase):
         self.assertIn("AWS_ACCESS_KEY_ID", message)
         self.assertIn("AWS_SECRET_ACCESS_KEY", message)
         # And it says how to carry on without it.
-        self.assertIn("TRANSCRIPT_STORAGE=local", message)
+        self.assertIn("transcripts.storage to local", message)
 
 
 class TestStorageSettings(unittest.TestCase):
-    """Settings validation, with the environment scrubbed (§10 convention)."""
+    """Storage settings, from the real config.yaml with a controlled environment."""
 
-    def _settings(self, **env: str):
-        import os
+    @staticmethod
+    def _settings(**env: str):
+        return load_settings(env_file=None, environ=env)
 
-        from app.config import Settings
+    @staticmethod
+    def _storage(value: str):
+        return Settings(transcripts={"storage": value}).transcripts.storage
 
-        clean = {k: v for k, v in os.environ.items()
-                 if not k.startswith(("GOOGLE_API_KEY", "AWS_", "TRANSCRIPT_"))}
-        clean.update(env)
-        with mock.patch.dict(os.environ, clean, clear=True):
-            return Settings(_env_file=None)
+    def test_code_default_is_local(self):
+        """Settings() with no config file needs no credentials."""
+        self.assertEqual(Settings().transcripts.storage, LOCAL)
 
-    def test_default_is_local(self):
-        self.assertEqual(self._settings().transcript_storage, LOCAL)
-
-    def test_object_storage_can_be_selected(self):
-        s = self._settings(TRANSCRIPT_STORAGE="neon_object_storage")
-        self.assertEqual(s.transcript_storage, NEON_OBJECT_STORAGE)
+    def test_config_yaml_selects_object_storage(self):
+        """The deployment has no persistent disk, so the committed config must
+        not quietly flip back to local."""
+        self.assertEqual(self._settings().transcripts.storage, NEON_OBJECT_STORAGE)
 
     def test_case_and_whitespace_are_tolerated(self):
-        s = self._settings(TRANSCRIPT_STORAGE="  Neon_Object_Storage  ")
-        self.assertEqual(s.transcript_storage, NEON_OBJECT_STORAGE)
+        self.assertEqual(self._storage("  Neon_Object_Storage  "), NEON_OBJECT_STORAGE)
 
     def test_a_typo_fails_at_startup_not_at_the_first_upload(self):
         with self.assertRaises(Exception) as ctx:
-            self._settings(TRANSCRIPT_STORAGE="neon-object-storage")
-        self.assertIn("TRANSCRIPT_STORAGE", str(ctx.exception))
+            self._storage("neon-object-storage")
+        self.assertIn("storage", str(ctx.exception))
 
     def test_configured_flag_requires_all_four_values(self):
-        self.assertFalse(self._settings().object_storage_configured)
+        self.assertFalse(self._settings().transcripts.object_storage.configured)
         partial = self._settings(AWS_ENDPOINT_URL_S3="https://x.neon.tech",
                                  AWS_ACCESS_KEY_ID="nak_live_x")
-        self.assertFalse(partial.object_storage_configured)
+        self.assertFalse(partial.transcripts.object_storage.configured)
         full = self._settings(AWS_ENDPOINT_URL_S3="https://x.neon.tech",
                               AWS_ACCESS_KEY_ID="nak_live_x",
                               AWS_SECRET_ACCESS_KEY="nsk_live_x")
-        self.assertTrue(full.object_storage_configured)
+        self.assertTrue(full.transcripts.object_storage.configured)
 
     def test_aws_standard_names_are_used(self):
-        """So `neon env pull` populates them and boto3 would find them anyway."""
+        """So `neon env pull` populates them directly."""
         s = self._settings(AWS_ENDPOINT_URL_S3="https://x.neon.tech",
                            AWS_REGION="eu-central-1")
-        self.assertEqual(s.s3_endpoint_url, "https://x.neon.tech")
-        self.assertEqual(s.s3_region, "eu-central-1")
+        self.assertEqual(s.transcripts.object_storage.endpoint_url, "https://x.neon.tech")
+        self.assertEqual(s.transcripts.object_storage.region, "eu-central-1")
+
+    def test_region_defaults_when_unset(self):
+        self.assertEqual(self._settings().transcripts.object_storage.region, "us-east-2")
 
 
 if __name__ == "__main__":

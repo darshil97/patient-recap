@@ -164,7 +164,7 @@ class TestUploadValidation(unittest.TestCase):
 
     def test_size_ceiling(self):
         with mock.patch.object(transcript_service, "get_settings") as settings:
-            settings.return_value.max_transcript_bytes = 1024
+            settings.return_value.transcripts.max_upload_bytes = 1024
             with self.assertRaises(TranscriptTooLargeError) as ctx:
                 transcript_service.validate_upload("big.txt", b"x" * 2048)
             self.assertEqual(ctx.exception.details["size_bytes"], 2048)
@@ -172,7 +172,7 @@ class TestUploadValidation(unittest.TestCase):
 
     def test_at_the_ceiling_is_allowed(self):
         with mock.patch.object(transcript_service, "get_settings") as settings:
-            settings.return_value.max_transcript_bytes = 16
+            settings.return_value.transcripts.max_upload_bytes = 16
             self.assertEqual(
                 transcript_service.validate_upload("ok.txt", b"a" * 16), "a" * 16)
 

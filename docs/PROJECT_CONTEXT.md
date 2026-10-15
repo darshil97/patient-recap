@@ -62,11 +62,19 @@ GET    /api/v1/patients/{patient_id}/timeline whole record in one request
 POST   /api/v1/visits                         schedule a consultation
 GET    /api/v1/visits                         list (status/date filters, sort)
 GET    /api/v1/visits/{visit_id}              single visit
-PATCH  /api/v1/visits/{visit_id}              correct details
+PATCH  /api/v1/visits/{visit_id}              correct date/time/type only (§8.17)
+POST   /api/v1/visits/{visit_id}/start        start the session -> in_progress (§8.24)
 POST   /api/v1/visits/{visit_id}/complete     mark the consultation done
 POST   /api/v1/visits/{visit_id}/cancel       cancel, reopening its follow-ups
 
 POST   /api/v1/visits/{visit_id}/transcript   upload the .txt (multipart)
+POST   /api/v1/visits/{visit_id}/audio-uploads   or a recording: start, get chunk plan (§8.23)
+POST   /api/v1/visits/{visit_id}/audio-uploads/live   or record live, sent while recording (§8.24)
+PUT    /api/v1/audio-uploads/{upload_id}/chunks/{index}   one chunk, idempotent
+POST   /api/v1/audio-uploads/{upload_id}/finish   stitch + transcribe -> 202 (also retries)
+POST   /api/v1/audio-uploads/{upload_id}/discard  throw an unfinished one away
+GET    /api/v1/audio-uploads/{upload_id}          poll until completed | failed
+GET    /api/v1/visits/{visit_id}/audio-upload     latest, to resume polling (204 if none)
 GET    /api/v1/visits/{visit_id}/transcript   read it back
 DELETE /api/v1/visits/{visit_id}/transcript   remove it
 
@@ -84,6 +92,17 @@ A visit is created *before* the consultation, so it starts with no transcript an
 `visit_status: scheduled`. Completion is explicit: uploading a transcript
 deliberately does **not** complete a visit (§8.17), and a transcript can only be
 attached to a visit that is already `completed`.
+
+`PATCH /visits/{id}` corrects a visit's own details — date, time, type — and
+**cannot** change `visit_status` or touch the transcript. `/start`, `/complete`
+and `/cancel` are the only status transitions (§8.17); `/start` (scheduled →
+`in_progress`) is optional and exists for live recording (§8.24). A transcript is
+attached only by uploading one — `POST /transcript`, or a recording that becomes
+one (§8.19, §8.23).
+
+Every list endpoint returns the total in `X-Total-Count`, and it counts the same
+filters as the list (§7). A total larger than the array means there are more
+pages, not that something is missing.
 
 Interactive docs at `/docs` once the server is running.
 
@@ -132,8 +151,8 @@ follow-up are stored under `visit_insights.insights_json`.
 | Language | Python 3.11 |
 | Environment | conda env **`reels`** (`/opt/anaconda3/envs/reels/bin/python`) |
 | API | FastAPI + uvicorn |
-| Validation / settings | Pydantic 2, pydantic-settings |
-| LLM | Google Gemini via `langchain-google-genai` |
+| Validation / settings | Pydantic 2; `config.yaml` (PyYAML) + `.env` secrets (python-dotenv) |
+| LLM | Google Gemini via `langchain-google-genai`, or Amazon Bedrock via `langchain-aws` (`llm.provider`) |
 | LLM framework | `langchain-core` (messages only — see §8.1) |
 | Prompt templating | Jinja2 |
 | Database | Neon serverless Postgres 18 |
@@ -197,7 +216,7 @@ sometimes a wrapper whose child outlives it.
 backend/
 ├── app/
 │   ├── main.py                  FastAPI app factory, lifespan, CORS
-│   ├── config.py                all settings in one typed place
+│   ├── config.py                loads config.yaml (+ .env secrets) into typed settings
 │   ├── api/
 │   │   ├── deps.py              DI: pooled connection, API key + doctor identity
 │   │   ├── errors.py            AppError -> HTTP status, in one place
@@ -206,14 +225,18 @@ backend/
 │   ├── domain/                  pure logic, zero I/O
 │   │   ├── follow_up/           models.py + resolver.py
 │   │   ├── transcripts.py       loading + path-traversal guard
+│   │   ├── diarization.py       speaker turns -> DOCTOR:/PATIENT:/OTHER: text (§8.23)
 │   │   └── identity.py          external_id, name/phone normalisation
 │   ├── pipeline/                layers, prompts, parsing, results, runner
 │   ├── storage/                 where the .txt lives: local disk or a Neon bucket
 │   │   ├── base.py              the store contract + the locator guard
 │   │   ├── local.py             backend/transcripts/{visit_id}.txt
 │   │   ├── object_store.py      Neon Object Storage via boto3
-│   │   └── factory.py           picks a backend from visits.transcript_provider
-│   ├── llm/                     gemini.py (multi-key client), errors.py
+│   │   ├── factory.py           picks a backend from visits.transcript_provider
+│   │   └── audio.py             upload chunks + recordings (bytes), same two backends
+│   ├── speech/deepgram.py       recording -> diarized utterances, over REST (§8.23)
+│   ├── llm/                     factory.py (reads llm.provider), errors.py, base.py
+│   │   └── providers/           gemini.py, bedrock.py: LangChain chat models
 │   ├── db/
 │   │   ├── pool.py              connection pool
 │   │   ├── models.py            row dataclasses
@@ -230,7 +253,7 @@ backend/
 │   ├── load_insights.py         batch runner over the same services
 │   ├── migrate_transcripts.py   move transcripts between storage backends
 │   ├── render_prompt.py         render a prompt, no model, no DB
-│   ├── check_keys.py            which API keys are usable
+│   ├── check_keys.py            does the model provider's key work
 │   └── convert_transcripts.py   one-off JSON -> .txt migration (already run)
 │
 ├── archive/transcripts_json/    the 16 original synthetic transcripts, tracked
@@ -245,11 +268,15 @@ backend/
 │   ├── 5_api_support.sql        migration: external_id, insight_jobs
 │   ├── 6_frontend_support.sql   migration: lifecycle columns, follow_ups
 │   ├── 7_multi_tenancy.sql      migration: doctors, patients.doctor_id
+│   ├── 8_cancellation_reason.sql migration: visits.cancelled_reason
+│   ├── 9_audio_uploads.sql      migration: audio_uploads, audio_upload_chunks
+│   ├── 10_live_recordings.sql   migration: audio_uploads.mode, plan nullable while live
 │   └── extra.sql                future tables, all commented out
 ├── tests/                       unittest suites
 ├── legacy/                      pre-refactor scripts, safe to delete
 ├── requirements.txt
-└── .env / .env.example
+├── config.yaml                  all non-secret settings, committed
+└── .env / .env.example          secrets only, referenced from config.yaml as ${NAME}
 ```
 
 `app/config.py` derives `BASE_DIR` as its own parent's parent, which is
@@ -264,8 +291,9 @@ design history:
 ```
 frontend/
 ├── app/                    App Router
+│   ├── (home)/             "/" -> the public home page: what the product is, sign-in/sign-up CTAs
 │   ├── (app)/              authenticated area, wrapped in the clinical shell
-│   │   ├── page.tsx        "/" -> the follow-up queue
+│   │   ├── today/          "/today" -> the follow-up queue, where sign-in lands
 │   │   ├── follow-ups/     same queue under its own name
 │   │   ├── schedule/       visit schedule
 │   │   ├── patients/       list, and [patientId] detail/timeline
@@ -274,14 +302,22 @@ frontend/
 │   ├── api/
 │   │   ├── auth/[...path]/ Neon Auth handler
 │   │   └── [...path]/      the BFF proxy to FastAPI
+│   ├── error.tsx           route-level error boundary
+│   ├── global-error.tsx    for a throw in the root layout itself
 │   ├── globals.css         Tailwind + auth-ui theme + design-system.css
 │   └── design-system.css   the approved clinical design (accent tokens in :root)
 ├── views/                  the six page components, ported from the Vite app
 ├── features/  components/  hooks/
+│   └── features/recording/ the live recorder: provider (in the (app) layout), panel, bar (§8.24)
 ├── lib/
+│   ├── recording/          pure: format picker, exact-size chunker, uploader, level meter maths
 │   ├── api/                openapi-fetch wrappers, same-origin only
 │   ├── auth/               server.ts (secrets) and client.ts (browser)
+│   ├── routes.ts           PUBLIC_HOME, APP_HOME, SIGN_IN, SIGN_UP: paths several modules must agree on
 │   └── types/api.d.ts      generated from /openapi.json
+├── tests/                  Vitest: dates, the polling hook, the BFF proxy
+├── eslint.config.mjs       Next's rule set; `npm run lint`
+├── vitest.config.ts
 ├── proxy.ts                route protection (middleware.ts on Next < 16)
 ├── legacy-vite/            the previous Vite SPA, kept for reference
 ├── design-history/         mockups and the design alternatives
@@ -302,15 +338,35 @@ because constructing one throws.
 
 Auth is Neon Auth (Managed Better Auth, `@neondatabase/auth`), already enabled on
 this project with Google OAuth on shared development credentials. `proxy.ts`
-protects every route except `/auth/*` and `/api/auth/*`; the BFF repeats the
+protects every route except `/`, `/auth/*` and `/api/auth/*`; the BFF repeats the
 session check for its own requests, since middleware guards navigation and says
 nothing about a later fetch.
 
-Two things this depends on staying true: the OpenAPI schema at `/openapi.json` is
-the source of truth for types (`npm run gen:api`, don't hand-write), and
-`cors_origins` in `app/config.py` still allows everything. CORS no longer matters
-for the app itself now that traffic is same-origin through the BFF, but it must
-still be narrowed before deployment.
+**`/` is public, but still runs through Neon Auth's middleware.** That middleware
+is what completes Google sign-in: the OAuth callback returns to the provider's
+`redirectTo` with a session verifier in the query string, and the middleware
+exchanges it on whatever page it lands on. Excluding `/` from the matcher would
+break any callback that arrives there. Neon Auth's Next adapter cannot be given
+extra public routes, so `proxy.ts` interprets its answer for `/` instead: a
+redirect to the sign-in page means signed out (serve the home page), being let
+through means signed in (redirect to `/today`), and any other redirect is the
+OAuth exchange (pass through). `NeonAuthUIProvider`'s `redirectTo` is `/today`
+(`APP_HOME` in `lib/routes.ts`), so sign-in lands on the queue directly rather
+than bouncing off the home page.
+
+`NeonAuthUIProvider`'s `.neon-auth-ui` wrapper encloses the whole app, not just
+auth-ui's components, so an element selector under it in `globals.css` reaches
+every page. A `.neon-auth-ui a` rule once outranked `.btn--primary` and drew teal
+text on every teal `<Link>` button; it is now scoped to auth-ui's
+`[data-slot="card"]`.
+
+One thing this depends on staying true: the OpenAPI schema at `/openapi.json` is
+the source of truth for types (`npm run gen:api`, don't hand-write).
+
+`cors_origins` still defaults to `*` for local development, but the deployment
+narrows it to the Vercel origin (§9.5). CORS does not matter for the app itself
+— traffic is same-origin through the BFF — so this is defence for the browser
+path nothing currently uses, not something the app relies on.
 
 `legacy-vite/` is the previous Vite SPA. It is kept only for reference and is
 excluded from the Next build and typecheck. It cannot reach the API any more,
@@ -354,8 +410,8 @@ generating the synthetic transcripts, so neither survives (§8.3).
 
 ## 6. Data model
 
-Six tables. `doctors` 1—N `patients` 1—N `visits` 1—1 `visit_insights`, plus
-`follow_ups` and `insight_jobs`.
+Eight tables. `doctors` 1—N `patients` 1—N `visits` 1—1 `visit_insights`, plus
+`follow_ups`, `insight_jobs`, and `audio_uploads` with its `audio_upload_chunks`.
 
 **`doctors` is the tenancy root, and it is the only place a doctor id is
 stored.** Everything else reaches its owner by following foreign keys it already
@@ -433,7 +489,8 @@ One row per consultation, i.e. per transcript file.
 | `visit_date` | **Anchors all follow-up resolution.** Must be the real date. |
 | `visit_status` | scheduled / in_progress / completed / cancelled |
 | `transcript_path` | always `transcripts/<visit_id>.txt`; null until attached |
-| `insights_generated` | TRUE only after all layers succeed *and* the row is written |
+| `insights_generated` | TRUE only after all *three* layers succeed *and* the row is written |
+| `cancelled_reason` | why, in the doctor's words. NULL means not recorded, which is every visit cancelled before `sql/8_cancellation_reason.sql` |
 
 ### visit_insights
 One row per visit, `UNIQUE(visit_id)`. Promoted scalar columns for querying,
@@ -480,6 +537,21 @@ unique index on `(visit_id) WHERE status IN ('queued','running')` means one visi
 cannot be processed twice at once, which would pay for two sets of API calls.
 `worker_id` identifies the process that claimed a job so orphans are detectable.
 
+### audio_uploads, audio_upload_chunks
+One row per recording upload (§8.23), tenancy derived through `visit_id` like
+`insight_jobs`. `status` is receiving / processing / completed / failed /
+abandoned / superseded. Two partial unique indexes: one upload in flight per visit,
+and one stored recording per visit (`completed` with `audio_path`). The completed
+row is *the* visit recording; `speakers` and `warnings` hold its labelling for the
+UI. `audio_upload_chunks` lists the pieces received and is emptied once they are
+stitched.
+
+`mode` is `file` or `live` (§8.24). A live recording has `total_bytes` and
+`chunk_count` NULL while it is receiving; finish writes them. The
+`audio_uploads_plan_known` CHECK allows a NULL plan only for a live row that is
+`receiving` or `abandoned`, so nothing reaches processing without one, and the
+existing cover constraint still holds once it is set.
+
 ---
 
 ## 7. Layering rules
@@ -493,6 +565,22 @@ cli  ->  services
 `storage` are the edges that touch the outside world. `services` is the only place
 they meet — which is why the HTTP API and the batch CLI cannot drift apart in
 behaviour: they call the same functions.
+
+**That rule now holds for reads as well as writes.** Every list endpoint used to
+import its repository and call it directly, doing its own `count` for
+`X-Total-Count` alongside. Nothing was leaking — the repositories are scoped
+either way — but it left the page size, the cap, and the pairing of a list with
+its count written out once per endpoint and held together by nothing, which is
+how three screens each ended up choosing their own limit and filtering the
+remainder in the browser. Lists go through `services` now and return a `Page`
+(`app/services/pagination.py`): the rows, and the total for the *same* filters.
+`tests/test_api.py::test_routers_go_through_services_not_repositories` greps for
+regressions.
+
+`app/api/deps.py` is the one module under `api` that may touch a repository, and
+it is not a route: `require_doctor` is what *establishes* the scope every service
+below it takes as an argument, so it has to reach `doctors` before any service
+exists to ask.
 
 A `doctor_id` travels down that whole chain as an ordinary argument. `api`
 extracts it from the authenticated request context, `services` pass it through,
@@ -624,24 +712,25 @@ The pending query keys off the flag but also treats a visit as pending if the
 flag is TRUE with no insight row — otherwise a deleted row would make a visit
 invisible forever.
 
-### 8.8 Multi-key rotation with three-way error classification
+### 8.8 Two providers, one key each, three-way error classification
 
-Free-tier Gemini keys are capped per day per model, and one full backfill needs
-more than a single key allows. `app/llm/gemini.py` holds several keys and sorts
-errors three ways, because they need different responses:
+`llm.provider` in `config.yaml` picks Gemini or Amazon Bedrock. Both are LangChain
+chat models built in `app/llm/providers/` (`ChatGoogleGenerativeAI`,
+`ChatBedrockConverse`), and `app/llm/factory.py` is the only code that reads the
+setting. Each provider has a single API key; the earlier multi-key rotation for
+Gemini's free tier is gone. Retries on throttling are left to each provider's own
+client (`llm.max_retries`).
+
+`app/llm/errors.py` still sorts failures three ways, by message text:
 
 | Kind | Example | Response |
 | --- | --- | --- |
-| quota / transient | 429, 503, deadline exceeded | try the next key |
-| key rejected | `API_KEY_INVALID`, 403, 401 | disable that key, try next |
-| request problem | unknown model, safety block | raise — another key fails alike |
+| quota / transient | 429, `RESOURCE_EXHAUSTED`, `ThrottlingException`, 503 | `QuotaExhaustedError` → 429, job `failed_quota` |
+| key rejected | `API_KEY_INVALID`, `AccessDeniedException`, 401 | reported as `bad_key` by `cli.check_keys` |
+| request problem | unknown model, safety block | raised as-is |
 
-The middle row is the important one. An invalid key is a problem with the *key*,
-not the request, so it must not abort a run that other keys could finish.
-
-Rotation is **sticky**: once a key works it keeps being used, wrapping around
-only when it fails. Restarting from key 1 every call would waste a round trip
-rediscovering that key 1 is exhausted.
+Bedrock's gpt-oss returns its reasoning as separate `reasoning_content` blocks.
+`AIMessage.text` leaves those out, so JSON parsing sees only the answer.
 
 ### 8.9 Insight generation is asynchronous
 
@@ -658,6 +747,21 @@ a real queue.
 
 `failed_quota` is a distinct status from `failed` because it is worth retrying
 unchanged once the daily limit resets, rather than investigating.
+
+**The API always runs all three layers.** `GenerateInsightsRequest` has no
+`stop_after`, and `insight_service.require_complete_brief()` refuses to persist a
+run that did not reach Layer 3. Both are needed and they guard different things.
+
+Layer 3 is the doctor-facing part and the frontend renders it straight out of
+`insights_json`, so a partial run wrote a row with no `layer_3` while
+`insights_repo.save` set `visits.insights_generated` TRUE in the same transaction
+(§8.7) — a visit that *claimed* to have a brief, and blanked the page when
+opened. Removing the request field closes the route a client could take; the
+guard at the write is what makes it true for the CLI too, which still has
+`--stop-after` and should, because iterating on an early prompt without paying
+for the whole chain is exactly what it is for. A partial CLI run now fails with
+`layer_output_error` and writes nothing, which is the honest outcome — the layer
+output is still printed as it goes.
 
 ### 8.10 Patient uniqueness is layered, and each layer has a different scope
 
@@ -741,6 +845,18 @@ sign-in, which is what let `sql/7_multi_tenancy.sql` seed the first doctor. So:
 resolve by `auth_user_id`, fall back to email, and stamp the auth id onto the row
 the first time the two meet (§6).
 
+**The email fallback is one-way, and that matters more than it looks.** It may
+*claim* an unclaimed row; it may not serve a row already bound to a different
+`auth_user_id`. Without the second half, the fallback quietly inverted the whole
+preference order: a request presenting auth id B with doctor A's email resolved
+as doctor A, so anyone naming the right address got the tenant regardless of
+which account they were signed in as, and `auth_user_id` was decorative. `claim()`
+had `AND auth_user_id IS NULL` and so refused to re-*point* a claimed row — but
+nothing stopped that row being *read*. A mismatch is now `None`, which the
+dependency turns into 401, and is logged at warning: it means either an address
+moved between accounts or someone is presenting an email that is not theirs, and
+both need a human.
+
 Neither is ever accepted as a body or query param — `doctor_id` appears in no
 request schema, and a structural test asserts that.
 
@@ -818,12 +934,34 @@ This gives a free end-to-end correctness check: a visit's resolved
 
 ---
 
-### 8.17 Attaching a transcript does not complete a visit
+### 8.17 Status is a transition, not a field
 
 `PATCH /visits/{id}` used to force `visit_status = 'completed'` as a side effect
 of setting `transcript_path`. That contradicts an explicit Complete button and
 makes the real state depend on the order of two unrelated actions, so it was
 removed. Status changes go through `/complete` and `/cancel` only.
+
+**`visit_status` itself stayed settable through PATCH long after that, which
+undid most of the above.** `VisitUpdate` accepted it, the service forwarded it,
+and the repository's whitelist included it — directly under a docstring saying it
+deliberately did not. So `{"visit_status": "cancelled"}` reached the column while
+skipping everything `/cancel` exists to do: the refusal once insights exist, the
+reopening of the follow-ups that visit had resolved, and `cancelled_at`. A
+patient who still needed calling dropped off the queue with no error anywhere.
+`{"visit_status": "completed"}` left `completed_at` NULL and could revive a
+cancelled visit that `/complete` would have refused.
+
+It is gone from all three places. `VisitUpdate` is `visit_date`, `visit_time` and
+`visit_type`, and is the **one model in the API with `extra="forbid"`**: every
+field removed from it was previously *honoured*, so silently ignoring one would
+answer 200 to "cancel this visit" and do nothing. Elsewhere an unknown field is
+still ignored, which is right where it was never honoured (`transcript_provider`
+on `VisitCreate`).
+
+The test that should have caught this mocked `visit_service.update_visit`
+wholesale, so it only ever proved the *route* did not invent a status.
+`TestVisitLifecycleIsTransitionsOnly` asserts on the service, the schema, the
+OpenAPI document and the repository's whitelist source.
 
 The dependency runs the other way instead: **upload requires
 `visit_status = 'completed'`**, which is what makes an Add Transcript button
@@ -871,6 +1009,22 @@ The file is written to `transcripts/{visit_id}.txt` and **never** under the
 client's filename, which is attacker controlled. Deriving the path from the visit
 id removes the whole class of problem rather than trying to sanitise it.
 
+**And the address is no longer client-supplied at all.** `VisitCreate` and
+`VisitUpdate` both used to accept a `transcript_path`, checked by resolving it
+inside the transcripts directory and stat-ing the file. That proves a file
+exists; it does not prove it is *yours*. The locator is
+`transcripts/<visit-uuid>.txt` with no `doctor_id` in it, deliberately (§8.22),
+so every valid visit uuid passes the check — including another doctor's. Pointing
+your own visit at their locator and reading it back through
+`GET /visits/{id}/transcript` returned their verbatim consultation.
+
+It was not reachable in the deployed configuration: object storage is the
+provider there and the local transcripts directory does not survive a Render
+restart, so the `is_file()` check failed. But that is an accident of deployment,
+not a boundary, and it would come back the first time a second doctor used
+local transcript storage. Both fields are removed. Uploading is the only way a
+transcript is attached, and it derives the key from the visit id.
+
 One subtlety in the decoder: `utf-8-sig` is tried **before** `utf-8`. A byte-order
 mark is itself valid UTF-8, so plain `utf-8` succeeds and silently leaves a
 U+FEFF at the start of the text, which would then be sent to the model as
@@ -907,11 +1061,12 @@ someone else. A 403 would confirm the id is real. The repositories return `None`
 for both "unknown" and "not yours", so the service layer cannot tell them apart
 even if it wanted to.
 
-Three places are cross-doctor on purpose, and only three:
+These places are cross-doctor on purpose, and only these:
 
 | Where | Why |
 | --- | --- |
 | `jobs_repo.fail_orphans` | runs at startup, no request, no doctor. Reaping one doctor's jobs would leave every other doctor's stuck in `running`. |
+| `audio_uploads_repo.fail_orphans`, `.stale_receiving` | the same startup sweep (called from `job_service.reap_orphans`) for recording uploads, §8.23. |
 | `jobs_repo.owner_doctor_id` | it is what *establishes* a scope — see below. |
 | `cli/load_insights.py` | §8.21 |
 
@@ -961,7 +1116,7 @@ worse, were the *live* ones shared by every branch, where a test upload would
 overwrite production evidence.
 
 **Reads follow the row; writes follow the setting.** `store_for_visit(visit)` routes
-on `visit.transcript_provider`; `default_provider()` reads `TRANSCRIPT_STORAGE`.
+on `visit.transcript_provider`; `default_provider()` reads `transcripts.storage`.
 That asymmetry is the design: a transcript stored before the setting changed stays
 readable, and the two backends coexist, so a migration runs in batches, can be
 interrupted, and resumes. A read that consulted the setting would have made
@@ -995,6 +1150,223 @@ copy is verifiably readable.
 Nothing outside the local loader reads it — the pipeline uses `text` and
 `relative_path` — but a new caller must not assume a filesystem location.
 
+### 8.23 Recordings: sent in chunks, stored once, transcribed into an ordinary transcript
+
+A recording ends up as exactly what a `.txt` upload produces —
+`transcripts/{visit_id}.txt` in the `DOCTOR:` / `PATIENT:` format — so reading
+back, the three-layer chain and delete have no audio branch. The recording itself
+is kept too, as one file per visit.
+
+```
+browser  POST /visits/{id}/audio-uploads   checks + chunk plan        -> receiving
+         PUT  /audio-uploads/{id}/chunks/i  x N, 4 MB each, retried
+         POST /audio-uploads/{id}/finish    202                        -> processing
+backend  stitch chunks -> recordings/<visit>/<upload><ext>, verify size, delete chunks
+         Deepgram (diarize_model=latest) -> utterances by "Speaker 0/1/2"
+         LLM, prompts/speaker_identification.md -> a role per voice
+         app/domain/diarization.py -> DOCTOR: / PATIENT: / OTHER (patient's mother):
+         transcript_service.save_transcript_text
+         job_service.enqueue (insight job queued)           -> completed | failed
+         job_service.run_job, same background task, own connection
+browser  GET  /audio-uploads/{id}  polls; on completed, follows GET /visits/{id}/job
+```
+
+**Insights start on the server, with no click.** Unlike a `.txt` upload, where
+the browser chains `POST /insights`, the background task queues the job itself
+once the transcript is stored, then runs it. So a brief is compiled even if the
+uploading tab is closed. The job is queued *before* the upload is marked
+`completed`, so a poller that sees `completed` always finds the job. Queueing is
+best-effort: if it is refused (a job already running), the upload still
+completes and the visit offers Generate insights. A failed or quota-limited job
+is retried from the UI as for any other brief.
+
+**Why chunks.** Every browser request goes through the BFF, and on Vercel a
+function's request body is capped at 4.5 MB; consultation recordings are larger.
+`speech.chunk_bytes` (4,000,000) stays under it with room for the multipart
+envelope. Each chunk must be *exactly* its planned size — every one
+`chunk_bytes` except the remainder — and the plan must cover the file (a CHECK
+constraint), so "every chunk arrived" means "the stitched file is byte-for-byte
+the original". Resending a chunk replaces it, which is what makes the browser's
+per-chunk retry safe.
+
+**Stitching** happens in a temporary file on disk and goes up as one PUT, not an
+S3 multipart upload: the chunks are below S3's 5 MB part minimum, and a single PUT
+does not depend on the endpoint supporting multipart. The stored size is checked
+against the plan before any chunk is deleted, because until then the chunks are
+the only copy.
+
+**One recording per visit**, enforced by a partial unique index. The key carries
+the upload id, so a replacement is written beside the current recording, and the
+old one is deleted only once the new upload has completed. A failed replacement
+therefore never costs the visit the recording its transcript came from.
+
+**Processing is a background task**, the §8.9 pattern: state in `audio_uploads`,
+`finish` returns 202, the worker resolves the owning doctor from the upload id and
+works under that scope. Stitching plus speech-to-text plus a model call can
+outlast both the BFF's 25 s timeout and a Vercel function's duration limit. A
+failed upload keeps its chunks or recording, so Finish again retries without a
+re-upload (`retryable`). Startup (`job_service.reap_orphans`) fails uploads a dead
+process left in `processing` and discards ones nobody has sent a chunk to for a
+day. Starting a new upload for a visit discards any unfinished one.
+
+**Everything checkable is checked before a byte is sent**: visit completed,
+`replace`, format, size, and that `DEEPGRAM_API_KEY` and the LLM key are set. The
+LLM client is built before Deepgram is called, the 256 KB text ceiling is checked
+before the identification call, and the visit is re-read before writing.
+
+**The model labels voices; it never writes the transcript.** It returns
+`{speaker, role, description, confidence}` per voice and Python assembles the text
+from Deepgram's words. A confused or prompt-injected answer can mislabel a voice
+but cannot add, drop or reword speech — the same instinct as §8.2. Descriptions
+are sanitised before they become a label.
+
+**OTHER is a real role, and PATIENT is not required.** A parent speaking for a
+child is `OTHER (patient's mother)`. What is refused (stored as `failed`, no
+transcript written): one voice only, no doctor, or nobody but the doctor — each
+means the conversation was not separated. Doubtful-but-usable labellings complete
+with `warnings`, stored on the upload. They do not hold generation back (a
+product decision: the doctor should never have to press Generate after a
+recording); the visit page shows them above the brief as a "check the speaker
+labels" notice, until a different transcript replaces this one. Two voices mapped to the
+same person are merged, which repairs Deepgram splitting one speaker in two.
+
+Errors by who can fix them: unsupported format or unreadable audio 422, missing
+or rejected `DEEPGRAM_API_KEY` 500, storage hiccup on a chunk 503 (resend),
+Deepgram throttled/down 503, other Deepgram failure 502, LLM throttled 429. During
+processing these become the upload's `error_code` / `error_message`.
+
+### 8.24 Live recordings: sent while recording, planned at the end
+
+A doctor can record the consultation in the browser instead of uploading a file
+afterwards. Every scheduled visit offers **Start session** and **Upload
+transcript**. Upload completes the visit and then uploads: two explicit calls,
+with the file checked in the browser first (`lib/api/uploadChecks.ts`).
+
+```
+browser  POST /visits/{id}/start                  scheduled -> in_progress
+         POST /visits/{id}/audio-uploads/live     mode=live, no plan  -> receiving
+         PUT  /audio-uploads/{id}/chunks/i        every ~minute while recording
+         POST /visits/{id}/complete               End session
+         POST /audio-uploads/{id}/finish {chunk_count: n}   plan fixed -> processing
+backend  unchanged from §8.23: stitch -> Deepgram -> speakers -> transcript -> job
+```
+
+**Chunks go up during the consultation, not after it.** A consultation cannot be
+repeated. Kept only in the tab's memory until the end, it would be lost to a
+closed tab, a crash, or a laptop going to sleep. Sent as it is recorded, a crash
+costs at most the piece not yet sent. A Render restart mid-consultation costs
+nothing: the browser keeps retrying until the backend is back.
+
+**Same security, by construction.** Each chunk is an ordinary authenticated
+`PUT` through the BFF, the same route a file upload uses, so the session check,
+`X-API-Key` and `X-Doctor-*` all apply (§8.12). Deepgram is still called only by
+FastAPI. A WebSocket was ruled out: Vercel cannot proxy one, and connecting the
+browser straight to Render would bypass the BFF.
+
+**The plan is written last, not weakened.** A file upload declares its size and
+gets its plan at start. A live one cannot, so `total_bytes` and `chunk_count`
+are NULL while it is receiving. The pieces are still exact-size —
+`speech.live_chunk_bytes`, 256 KiB, about a minute at 32 kbps, every one except
+the last. The browser cuts the recorder's byte stream to that size rather than
+sending `MediaRecorder` blobs as they come.
+
+At finish, `domain/audio.live_plan` works the plan out from the chunk rows:
+- indices 0..n-1 all present (409 `details.missing` otherwise);
+- every chunk except the last full size;
+- `n` equal to the `chunk_count` the browser declares.
+
+`claim_live` then writes the plan and moves the upload to `processing` in one
+UPDATE. Its WHERE re-checks the chunk count, the byte total and that nothing sits
+past index n-1, so a chunk landing in between matches nothing rather than
+producing a wrong plan. From there the row is an ordinary upload, with no live
+branch: the cover constraint, `_stitch`'s byte-for-byte check, retry and the
+reaper all see a known plan. A short middle chunk is refused because it would
+make the stitched file differ from the recording.
+
+The ceiling is enforced as the recording grows. Every earlier chunk is full, so
+chunk `i` ends at `i * chunk_bytes + size`, and anything past
+`speech.max_upload_bytes` is a 413 without counting rows.
+
+**`in_progress` is what recording needs.** Uploads still require `completed`
+(§8.17). Recording is the one thing allowed before that, because it happens
+during the consultation. `/start` is the explicit transition into that state.
+Finish still applies `check_can_attach`, so End session completes the visit and
+then finishes. Finishing on an in-progress visit is a 409 while the chunks are
+still intact, not a failure after paying for speech-to-text.
+
+**A live recording is never silently replaced.** Starting a file upload used to
+discard anything unfinished for the visit. Applied to a live recording, that
+would delete a consultation still being recorded in another tab. Now any upload
+start, live or file, is a 409 while a live recording is `receiving`. The doctor
+resolves it explicitly:
+- *process*: finish with no `chunk_count`, so whatever arrived is the recording;
+- *discard*: `POST /audio-uploads/{id}/discard`.
+
+`/cancel` discards the visit's unfinished uploads after it commits, so a
+recorder still sending gets a 409 on its next chunk and stops. An interrupted
+recording nobody resolves is kept for 24 hours after its last chunk, then
+removed by the startup reaper, like any stale `receiving` upload.
+
+**Formats.** `.webm` (Chrome, Edge, Firefox), `.mp4` (Safari) and `.ogg` were
+already in the allowlist. The extension of the filename sent at start declares
+the recorder's format, as for a file.
+
+**The recorder lives in the `(app)` layout, not on the visit page.**
+`features/recording/LiveSessionProvider.tsx` owns the microphone, the
+MediaRecorder, the chunker and the uploader. A layout survives client-side
+navigation, so the doctor can open the patient's previous brief
+mid-consultation without stopping the recording. `RecordingBar`, in the sticky
+header, shows the session on every other page. There is one session at a time,
+because there is one microphone and one consultation in the room. A full reload
+or sign-out ends the session, and the `beforeunload` warning asks first.
+
+**Browser half of the plan rule.** The recorder emits a blob every 10 s at
+32 kbps mono (`lib/recording/format.ts`). Browser defaults are several times
+higher, which would reach the 100 MB ceiling in a long consultation.
+`ExactChunker` joins those blobs and re-cuts them into exact 256 KiB pieces. The
+pieces join back into the same bytes, so the stitched file is the recording.
+
+`LiveUploader` sends pieces one at a time and in order, which is what keeps the
+server's chunk rows gap-free. It retries transient failures forever with backoff
+capped at 30 s: giving up would only throw away audio that will get through
+later, and recording carries on meanwhile. It stops on a failure the server
+means:
+- 409 (discarded, or the visit cancelled elsewhere): the session fails with an
+  explanation;
+- 413 (the size ceiling): recording stops and End session processes what was
+  acknowledged.
+
+**End session order:** stop the recorder, flush the last piece, wait for every
+piece, `/complete`, then `finish {chunk_count}`, using `finishWithRecovery`'s
+lost-response handling. If either of the last two fails, the session stays
+open, nothing is lost, and End session retries only those two steps. An empty
+recording is discarded rather than finished.
+
+**Microphone settings.** Echo cancellation and noise suppression are off: they
+are tuned for calls and can clip the far voice in a room, which is the
+patient's. Automatic gain stays on. A level meter and a 30-second silence
+warning catch a muted or wrong microphone. A screen wake lock is taken while
+recording and re-taken when the tab becomes visible again, because a sleeping
+laptop suspends the recorder.
+
+**Interrupted sessions** are worked out from the server's row, not remembered:
+the latest upload is `mode: live, status: receiving` and not this tab's
+(`features/visits/lifecycleState.ts`). The visit page shows when it ran
+(`created_at` → `last_chunk_at`) and offers *Process what was saved* (complete
+if needed, then finish with no count) or *Discard*. If the last piece arrived in
+the past three minutes, it warns that the recording may still be running in
+another tab, where processing it here would stop it.
+
+**Consent** is a checkbox in the UI ("The patient has agreed to this
+consultation being recorded") that enables Start recording. It is not stored on
+the server; storing it would be a small follow-up.
+
+**Not verified in a real browser yet** (Vitest covers the logic with a fake
+MediaRecorder): that Deepgram decodes the joined WebM from Chrome and Firefox and
+the joined MP4 from Safari, including a recording cut off part-way. If a cut-off
+Safari MP4 cannot be decoded, crash recovery on Safari falls back to Discard
+only. A normal End session is unaffected.
+
 ## 9. Commands
 
 All with the `reels` interpreter, run from `backend/`.
@@ -1022,8 +1394,12 @@ python -m cli.migrate_transcripts --to neon_object_storage
 python -m cli.migrate_transcripts --verify
 python -m cli.migrate_transcripts --prune-local      # only after --verify passes
 
-# Which API keys are usable (one small request each)
+# Does the configured provider's key work (one small request)
 python -m cli.check_keys
+
+# Two-voice test recording from a transcript, via Deepgram text-to-speech (§8.23)
+python -m cli.synthesize_transcript archive/shalin_1.txt          # -> archive/shalin_1.wav
+python -m cli.synthesize_transcript archive/shalin_1.txt --dry-run  # character count only
 
 # Render a prompt without calling the model — best way to iterate on prompts
 python -m cli.render_prompt --transcript transcripts/<visit_id>.txt \
@@ -1041,8 +1417,10 @@ daily quota bucket), `--stop-after`, `--stop-on-error`.
 Ctrl-C once stops after the visit in flight; twice abandons it immediately. Either
 way nothing partial is written and re-running skips completed visits.
 
-Schema is applied in numeric order, and migrations 1 through 7 are all applied
-to the current database. `sql/7_multi_tenancy.sql` seeds the first doctor from an email set at the
+Schema is applied in numeric order. Migrations 1 through 9 are applied to the
+current database. `sql/10_live_recordings.sql` is required by the code from
+§8.24 onwards: every audio upload query selects `mode`. Its `DO` blocks need a
+real client (psql or psycopg), not a tool that splits on semicolons. `sql/7_multi_tenancy.sql` seeds the first doctor from an email set at the
 top of its section 2 and aborts on the placeholder, so a fresh database needs that
 line edited before running.
 
@@ -1058,6 +1436,8 @@ npm install
 npm run dev          # https://localhost:3000  — note the s
 npm run build        # production build
 npm run typecheck    # tsc --noEmit
+npm run lint         # eslint
+npm test             # vitest run
 npm run gen:api      # regenerate lib/types/api.d.ts from the live schema
 ```
 
@@ -1135,21 +1515,29 @@ the path Render must poll is the full `/api/v1/health`. This tripped the first
 deploy: Render's health check 404'd against the bare `/health` path even though
 the service was running correctly.
 
-**List-typed settings need JSON syntax in Render's env var UI, not comma or bare
-values.** `cors_origins` is `List[str]` in `app/config.py`, and pydantic-settings
-parses list-typed env vars as JSON before falling back to anything else. Setting
-`CORS_ORIGINS=*` fails at startup with a `SettingsError` /
-`JSONDecodeError: Expecting value`, because `*` is not valid JSON. The working
-value is `CORS_ORIGINS=["*"]`. This applies to any other list-typed setting
-(e.g. a multi-key `GOOGLE_API_KEY` list, §8.8) — same fix pattern.
+**Configuration on Render.** `config.yaml` is committed and deployed with the
+code, so provider, models and the storage backend come from it. Render's
+environment carries only what `config.yaml` references as `${NAME}`: the secrets
+(`GOOGLE_API_KEY`, `AWS_BEARER_TOKEN_BEDROCK` if Bedrock is selected, `CONNSTR`,
+`API_KEY`, the four Neon `AWS_*` storage values) and `CORS_ORIGINS`. Variables
+from the old flat configuration (`TRANSCRIPT_STORAGE`, `GEMINI_MODEL`,
+`GOOGLE_API_KEY_1..8`, ...) are ignored, and startup logs a warning for each one
+still set, so they can be removed from the dashboard. A Render service still
+holding only `GOOGLE_API_KEY_1` needs `GOOGLE_API_KEY` added.
+
+`CORS_ORIGINS` accepts a bare value (`*`), a comma-separated list (`a,b`) and JSON
+(`["a","b"]`) alike, and trailing slashes are stripped (`ApiConfig._split_origins`
+in `app/config.py`). The old pydantic-settings trap, where a list-typed setting
+ran `json.loads()` on the raw value and `CORS_ORIGINS=*` crashed startup, no
+longer exists: the YAML loader hands the string to that validator directly.
 
 **Free-tier constraints that interact with this project's design:**
 
 - No persistent disk. `backend/transcripts/` (the 18 kept-for-reference original
   files, §11) does not survive a restart or redeploy on Render — this is fine
-  only because `TRANSCRIPT_STORAGE=neon_object_storage` is set for the
-  deployment, so no runtime read or write depends on that local directory.
-  Don't set `TRANSCRIPT_STORAGE=local` here.
+  only because `transcripts.storage` in `config.yaml` is `neon_object_storage`,
+  so no runtime read or write depends on that local directory. Don't commit it
+  as `local`.
 - Free instances spin down after ~15 minutes idle and cold-start (30–60s) on the
   next request. Mitigated with UptimeRobot pinging
   `https://YOUR-SERVICE.onrender.com/api/v1/health` every 12 minutes, which
@@ -1160,7 +1548,7 @@ value is `CORS_ORIGINS=["*"]`. This applies to any other list-typed setting
   recycle a free instance independent of idle-based sleep (periodic restarts,
   monthly hour caps), and a restart mid-job leaves an `insight_jobs` row that
   `reap_orphans()` marks failed on the next boot rather than resuming it — that
-  row's 3 model calls are wasted against the 20/day/key quota (§11). Prefer
+  row's 3 model calls are wasted against Gemini's 20/day quota (§11). Prefer
   running `cli.load_insights` batch jobs from a local machine against the same
   Neon database rather than triggering bulk generation through the deployed API
   while on the free tier.
@@ -1257,7 +1645,23 @@ allowlist enforcement is expected to start mattering.
 
 ## 10. Testing approach
 
-Six files, 295 tests, all offline — no API calls, no database, no object storage.
+### Backend
+
+Eight files, 429 tests, all offline — no API calls, no database, no object storage.
+
+`test_audio_uploads.py` covers live recordings (§8.24). The pure part is
+`live_plan` and `check_live_chunk`, including a check that every plan
+`live_plan` returns satisfies the file-upload rules. The service rules are
+tested against a mocked repository:
+- start needs a session;
+- a second live recording is a conflict, not a replacement;
+- a file upload cannot discard a live recording;
+- finish needs a completed visit and names missing chunks;
+- discard and cancel.
+
+One test stitches real files from a live plan and compares them byte-for-byte
+with what was sent. The routes, cross-tenant isolation and SQL scoping of the
+new endpoints are in `test_api.py` beside the others.
 
 `test_transcripts.py` covers the loader, the traversal guard, and upload
 validation, including the BOM case and that the client filename never reaches a
@@ -1278,9 +1682,11 @@ preserves human decisions, and the resolve/reopen transitions.
 contains, with hand-checked expected dates, plus malformed input, bad anchor
 dates, and prompt wiring.
 
-`test_gemini_llm.py` covers key rotation with stubbed clients: fall-through,
-stickiness, permanent disabling of rejected keys, request errors not touching
-other keys, and total exhaustion.
+`test_llm.py` covers error classification for both providers, building each
+provider's LangChain model from config (no network), the missing-key error, and
+the Bedrock path end to end against a stubbed botocore client. `test_config.py`
+covers config.yaml loading: `${...}` substitution, `.env` precedence, unknown
+keys rejected, and `CORS_ORIGINS` parsing.
 
 `test_api.py` covers routing, validation, status codes and error mapping with the
 DB dependency overridden and the services patched. It also holds the four
@@ -1301,15 +1707,76 @@ auth/tenancy suites, which are structured so they fail for the right reasons:
 - **`TestScopedRepositorySql`** — the other half of that boundary, asserting the
   queries themselves carry a doctor filter, so a refactor that keeps the argument
   but drops it from the `WHERE` fails here. Sources are read with whitespace
-  collapsed, because these helpers are called across line breaks.
+  collapsed, because these helpers are called across line breaks. It also holds
+  `test_routers_go_through_services_not_repositories` (§7).
+
+Four suites were added with the review fixes, each pinning a failure that had
+already happened rather than a hypothetical one:
+
+- **`TestVisitLifecycleIsTransitionsOnly`** — §8.17. Asserts on the service, the
+  schema, the OpenAPI document and the repository whitelist, because the test it
+  replaces mocked the service out and therefore could not see the bug.
+- **`TestTranscriptLocationIsServerDecided`** — §8.19 and §8.22 together: neither
+  `transcript_path` nor `transcript_provider` is a request field.
+- **`TestPartialBriefIsNotPersisted`** — §8.9. Includes an ordering assertion
+  that the guard runs before the upsert, since it is useless after it.
+- **`TestDoctorResolutionPrefersTheStableId`** — §8.12, both directions: an
+  unclaimed row is still claimed, a row claimed by another account is refused.
+
+Plus `TestCancellationReasonIsStored` and `TestHealthDoesNotLeakOrLie`.
+
+### Frontend
+
+Six files, 67 tests, `npm test` (Vitest + jsdom). There were none before, which
+is why every bug the review found here was found by reading.
+
+Deliberately narrow: these modules hold logic rather than markup, and logic is
+what regresses silently.
+
+- `tests/dates.test.ts` — the overdue boundaries and the local-vs-UTC parsing
+  that decides whether the queue says "overdue".
+- `tests/useInsightJob.test.tsx` — that polling stops: on a terminal status, on
+  unmount (including when a request resolves *after* unmount, which is the actual
+  regression), after repeated failures, and immediately on a 401.
+- `tests/bffProxy.test.ts` — the header allowlist above all: that a
+  browser-supplied `X-Doctor-*` is dropped and the session's own values are what
+  reach FastAPI. Plus `X-Total-Count`, the verbatim multipart Content-Type, the
+  bodiless 204, and 504-vs-502.
+- `tests/recording.test.ts` (§8.24) covers:
+  - `ExactChunker`: exact sizes across arbitrary blob sizes, an exact-multiple
+    ending, and joined bytes equal to the recording;
+  - `LiveUploader`: one piece at a time in order, retrying without skipping
+    ahead, stopping on a 409 with `drain` rejecting, and `stop` releasing a
+    waiter while a send is in flight. That last one was a real bug, caught here.
+- `tests/liveSession.test.tsx` runs the provider against a fake MediaRecorder:
+  - the End session order: every piece, then `/complete`, then `finish` with the
+    right count;
+  - a blocked microphone;
+  - the microphone released when the server refuses to start;
+  - one session at a time;
+  - a 409 mid-recording;
+  - an empty recording discarded;
+  - paused time not counted.
+- `tests/lifecycleState.test.ts` covers which card the visit page shows when two
+  states hold at once (recording here while the visit is already completed, an
+  interrupted recording versus an unfinished file upload, and so on), plus the
+  pre-completion file checks.
+
+`npm run lint` is ESLint with Next's config. It reports seven warnings, all
+`react-hooks/set-state-in-effect` and all the same shape — fetch on mount, then
+setState — which is how all six views load their data. The rule is right; fixing
+it means moving to Suspense with `use()` or a query library, which is a change to
+every view and not one to make in passing. Downgraded to a warning with that
+reasoning in `eslint.config.mjs` rather than silenced per line.
 
 Conventions:
 
 - stdlib `unittest`; `tests/__init__.py` must exist for discovery to work
 - tests insert the project root on `sys.path`
-- when reading settings in a test, pass `_env_file=None` **and** scrub
-  `GOOGLE_API_KEY*`, `AWS_*` and `TRANSCRIPT_*` from `os.environ`; a value exported
-  in the developer's shell will otherwise make assertions machine-dependent
+- when a test needs settings, build them explicitly: `Settings()` for code
+  defaults, or `load_settings(env_file=None, environ={...})` for config.yaml with a
+  controlled environment. A value exported in the developer's shell or a real
+  `.env` will otherwise make assertions machine-dependent
 - fixtures carry a `doctor_id`. `test_api.py` defines two tenants, `DOCTOR_A_*` and
   `DOCTOR_B_*`, plus the header dicts the BFF would send for each
 - database write semantics are verified against a **throwaway Neon branch**, never
@@ -1336,6 +1803,16 @@ from "backend is broken", so the empty states matter more than they did when the
 only user had every patient.
 
 **`API_KEY` is tenancy-bearing** (§8.12). Rotating it is no longer just hygiene.
+
+**`insights_json` has no runtime validation anywhere, and the frontend now
+assumes that.** It is `Dict[str, Any]` in Pydantic, `Record<string, never>` out
+of openapi-typescript, and hand-typed in `frontend/lib/types/insightsJson.ts`
+from a real row. Every field in that file is optional on purpose: declaring them
+required did not make them present, it only stopped the compiler asking, and one
+absent key threw on first render and blanked the page. Prompts are data (§12), so
+editing one is enough to change what arrives. `InsightBrief` is additionally
+wrapped in an error boundary, so a payload it cannot render degrades to a card
+instead of taking the visit page — and its transcript — down with it.
 
 **Object storage is per-branch, and so is its credential.**
 `AWS_ENDPOINT_URL_S3` differs per branch, and a credential minted on the default
@@ -1373,7 +1850,7 @@ the move to object storage briefly flagged all 18. It now uses
 **`backend/transcripts/` still holds the 18 originals.** All 18 transcripts were
 migrated to object storage and verified byte-for-byte; the local copies are
 redundant but deliberately kept, and `--prune-local` removes them when you decide
-to. `TRANSCRIPT_STORAGE` governs only *new* uploads (§8.22), so changing it moves
+to. `transcripts.storage` governs only *new* uploads (§8.22), so changing it moves
 nothing.
 
 **`npm run dev` serves HTTPS, and Safari is why** (§9). Reverting to HTTP gives a
@@ -1393,7 +1870,9 @@ redirect URI `{NEON_AUTH_BASE_URL}/callback/google` — not the app's URL.
 Deliberately deferred; a new client also starts in Testing status where only listed
 test users can sign in.
 
-**`CORS_ORIGINS` defaults to `*`** on local and **["https://patient-recap.vercel.app"]** on Render.
+**`CORS_ORIGINS` defaults to `*`** locally and is narrowed to
+`https://patient-recap.vercel.app` on Render. Any of the three syntaxes works
+now (§9.5), so a bare origin is fine — it does not have to be JSON.
 
 **Corpus blind spot.** Every follow-up in the seeded transcripts is *relative*
 ("three weeks"), so the absolute-date branch of the resolver has unit-test coverage
@@ -1423,6 +1902,17 @@ you extract changes.
 
 - Prompts are data, not code. Change behaviour by editing `prompts/*.md` where
   possible.
+- **The public home page states what reaches the model.** Its privacy section
+  (`AI_WORKS_FROM`, `AI_KEPT_FROM` and `PRIVACY_POINTS` in
+  `frontend/app/(home)/page.tsx`) is a statement to practitioners about patient
+  data. Any change to what a prompt or the speech-to-text request receives must
+  update it in the same change. The lists are present tense and must stay
+  true; planned work is the note's "Next, we're..." sentence (name and
+  contact masking, removing `patient_name` / `doctor_name`, Deepgram's
+  `mip_opt_out`). Move each into the lists only when it ships (README To
+  Dos). "The AI model we use does not train on your consultations" holds for
+  Bedrock and not for Gemini's free tier, so revisit it if `llm.provider`
+  changes.
 - Anything deterministic — dates, arithmetic, validation, id lookups — belongs in
   Python, not in a prompt.
 - The database is the source of truth for patient facts (age, gender, dates).
@@ -1444,6 +1934,14 @@ you extract changes.
   `TranscriptStore` and is registered in `factory.get_store`; everything
   provider-independent (upload validation, the completed-visit rule, the
   insights-exist rule) stays in `transcript_service` (§8.22).
+- A new list endpoint goes through a service and returns a `Page`
+  (`app/services/pagination.py`), never a bare list plus a separate count in the
+  route. A test greps for routers importing repositories (§7).
+- A field a client may send must be one the server will *honour*. If a request
+  field is removed because it was dangerous, prefer refusing it to ignoring it —
+  a 200 that silently did nothing is worse than a 422 (§8.17).
+- Anything the model produced is optional on the frontend until something
+  validates it. See §11 on `insights_json`.
 - Comment the *why*, not the *what*, especially for the counter-intuitive items
   in §8. Several of them look like mistakes without their rationale.
 

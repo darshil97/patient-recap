@@ -616,6 +616,45 @@ details.section[open] .chev { transform: rotate(90deg); }
 }
 .bar span { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-light)); transition: width 0.3s ease; }
 
+/* --- live recording (§8.24) ------------------------------------------------ */
+
+/* The header and the recording bar stick to the top together. */
+.app-top { position: sticky; top: 0; z-index: 20; }
+
+.rec-bar {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 8px 26px; font-size: 13px;
+  background: var(--critical-bg); border-bottom: 1px solid var(--critical-border);
+  color: var(--ink);
+}
+.rec-bar .spacer { flex: 1; }
+.rec-bar--offline { background: var(--caution-bg); border-bottom-color: var(--caution-border); }
+
+.rec-status { display: inline-flex; align-items: center; gap: 7px; font-weight: 600; }
+.rec-dot {
+  width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto;
+  background: var(--critical); display: inline-block;
+}
+.btn--primary .rec-dot { background: #fff; }
+.rec-dot--live { animation: rec-pulse 1.4s ease-in-out infinite; }
+@keyframes rec-pulse { 50% { opacity: 0.25; } }
+@media (prefers-reduced-motion: reduce) {
+  .rec-dot--live { animation: none; }
+}
+
+.rec-time { font-variant-numeric: tabular-nums; font-weight: 600; }
+.rec-time--large { font-size: 22px; }
+.rec-saved { color: var(--ink-2); }
+.rec-panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+
+.meter {
+  height: 6px; background: var(--border); border-radius: 999px; overflow: hidden;
+}
+.meter span { display: block; height: 100%; background: var(--good); transition: width 0.12s linear; }
+
+.consent { display: flex; align-items: flex-start; gap: 9px; font-size: 13.5px; cursor: pointer; }
+.consent input { margin-top: 3px; width: 15px; height: 15px; accent-color: var(--accent); }
+
 /* --- empty state -------------------------------------------------------- */
 
 .empty { text-align: center; padding: 52px 24px; }

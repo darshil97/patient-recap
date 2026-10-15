@@ -4,24 +4,31 @@
 fastapi==0.121.2
 uvicorn[standard]==0.40.0
 pydantic==2.12.5
-pydantic-settings==2.13.0
 email-validator==2.3.0
 python-multipart==0.0.20
 
-# LLM
+# LLM providers, both through LangChain (app/llm/providers/)
 langchain-core==1.2.5
 langchain-google-genai==4.1.2
+# Amazon Bedrock (ChatBedrockConverse). 1.2.5 is the newest release compatible
+# with langchain-core 1.2.5; later ones require langchain-core>=1.6.
+langchain-aws==1.2.5
 
+# Deepgram speech-to-text for audio uploads, called over plain REST
+# (app/speech/deepgram.py). Already present transitively via langsmith; pinned
+# because it is now imported directly.
+httpx==0.28.1
 # Prompts, dates, config
 jinja2==3.1.6
 python-dateutil==2.9.0.post0
+# config.yaml, and the .env it reads secrets from
+PyYAML==6.0.3
 python-dotenv==1.2.2
 
 # Database
 psycopg==3.3.4
 psycopg-pool==3.2.7
-# Object storage. Neon Object Storage is S3-compatible, so this is the AWS SDK
-# pointed at a Neon branch endpoint — no AWS account involved. Needed only when
-# TRANSCRIPT_STORAGE=neon_object_storage; the local backend has no dependency, so
-# a checkout without credentials still runs and the test suite stays offline.
+# AWS SDK. Used by langchain-aws for Bedrock, and for transcripts on Neon Object
+# Storage, which is S3-compatible: the SDK pointed at a Neon branch endpoint, with
+# no AWS account involved.
 boto3==1.43.91

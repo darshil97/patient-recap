@@ -1,11 +1,16 @@
 """
 Visit scheduling and lifecycle, scoped to one doctor.
 
-    Schedule  ->  Complete  ->  Add Transcript  ->  Generate Insights
+    Schedule  ->  [Start session]  ->  Complete  ->  Add Transcript  ->  Generate Insights
 
 Each transition is explicit. Attaching a transcript deliberately does *not*
 complete a visit: an implicit status change would contradict the Complete button
-and make the real state depend on the order of two unrelated actions.
+and make the real state depend on the order of two unrelated actions. The UI may
+make both calls for the doctor in one gesture; the server still sees two.
+
+Starting a session is optional. It moves a visit to `in_progress`, which is what
+a live recording requires (§8.24); a doctor who uploads a file afterwards never
+needs it.
 
 Every function takes a `DoctorScope`. A visit has no doctor_id of its own — it
 derives one through its patient — so "which doctor is asking" has to travel down
@@ -20,32 +25,17 @@ from typing import Any, Dict, List, Optional
 
 import psycopg
 
-from app.config import get_settings
-from app.core.errors import ConflictError, NotFoundError, TranscriptError
-from app.db.models import VisitRow
+from app.core.errors import ConflictError, NotFoundError
+from app.db.models import JobRow, VisitRow
 from app.db.repositories import insights as insights_repo
 from app.db.repositories import patients as patients_repo
 from app.db.repositories import visits as visits_repo
+from app.db.repositories import jobs as jobs_repo
 from app.db.tenancy import DoctorScope
-from app.domain.transcripts import normalise_path, resolve_within
-from app.storage import LOCAL
 from app.services import follow_up_service
+from app.services.pagination import Page, clamp_limit
 
 logger = logging.getLogger(__name__)
-
-
-def _check_transcript(path: str) -> str:
-    """Validate a client-supplied transcript path and normalise how it's stored.
-
-    The path is confined to the configured transcripts directory; without that a
-    payload of `../../etc/passwd` would be honoured.
-    """
-    settings = get_settings()
-    resolved = resolve_within(path, settings.transcripts_dir)
-    if not resolved.is_file():
-        raise TranscriptError(f"Transcript not found: {path}",
-                              details={"requested": path})
-    return normalise_path(resolved, settings.transcripts_dir.parent)
 
 
 def schedule_visit(
@@ -57,13 +47,13 @@ def schedule_visit(
     visit_number: Optional[int] = None,
     visit_type: Optional[str] = None,
     visit_status: str = "scheduled",
-    transcript_path: Optional[str] = None,
 ) -> VisitRow:
     """Create a visit for one of the scoped doctor's patients.
 
     visit_number is assigned sequentially when omitted, so callers needn't track
-    it. transcript_path is optional because a scheduled visit has no recording
-    yet; supplying it up front is supported so historical data loads in one call.
+    it. A visit starts with no transcript: attaching one is a separate, explicit
+    step through POST /visits/{visit_id}/transcript, which derives the storage
+    address from the visit id rather than taking one from the caller (§8.19).
 
     Scheduling is what resolves outstanding follow-ups: any open follow-up from
     an earlier visit for this patient is closed here, in the same transaction as
@@ -84,8 +74,6 @@ def schedule_visit(
                 f"Visit number {visit_number} already exists for this patient.",
                 details={"visit_id": clash[0].visit_id})
 
-    stored_path = _check_transcript(transcript_path) if transcript_path else None
-
     with conn.transaction():
         number = visit_number or visits_repo.next_visit_number(conn, scope,
                                                                patient_id)
@@ -101,13 +89,6 @@ def schedule_visit(
             visit_time=visit_time or time(9, 0),
             visit_type=resolved_type,
             visit_status=visit_status,
-            transcript_path=stored_path,
-            # LOCAL, not the configured default, and not the caller's choice.
-            # This path adopts an *already existing* transcript by reference, and
-            # _check_transcript verifies it by stat-ing a file — so the only
-            # backend it can honestly claim is the filesystem. A fresh upload
-            # goes through transcript_service and lands on TRANSCRIPT_STORAGE.
-            transcript_provider=LOCAL if stored_path else None,
         )
         # The INSERT selects its patient under the doctor filter, so None means
         # the patient is not this doctor's. Already caught above; kept because the
@@ -139,28 +120,28 @@ def update_visit(
     conn: psycopg.Connection,
     scope: DoctorScope,
     visit_id: str,
-    transcript_path: Optional[str] = None,
-    visit_status: Optional[str] = None,
     visit_date: Optional[date] = None,
     visit_time: Optional[time] = None,
     visit_type: Optional[str] = None,
 ) -> VisitRow:
-    """Patch a visit's details.
+    """Correct a visit's own details: its date, time and type.
 
-    Attaching a transcript here does not change the status. Completion and
-    cancellation are explicit transitions with their own endpoints, so that the
-    Complete button is the only thing that completes a visit.
+    Deliberately cannot change status or touch the transcript.
+
+    Status is a lifecycle transition, not a field. Allowing it here skipped
+    everything the transitions exist to do -- `/cancel`'s refusal once insights
+    exist, its reopening of the follow-ups that visit had resolved, and the
+    `completed_at` / `cancelled_at` stamps -- so a visit could end up cancelled
+    with its follow-up still closed, silently dropping a patient who needs
+    calling. `/start`, `/complete` and `/cancel` are the only transitions (§8.17).
+
+    The transcript is attached by upload, which derives its address from the
+    visit id; a caller-supplied path could name another doctor's transcript
+    (§8.19).
     """
     get_visit(conn, scope, visit_id)  # 404 if unknown or another doctor's
 
     changes: Dict[str, Any] = {}
-    if transcript_path is not None:
-        # Same reasoning as schedule_visit: the path is verified by stat-ing a
-        # file, so LOCAL is the only provider this can truthfully record.
-        changes["transcript_path"] = _check_transcript(transcript_path)
-        changes["transcript_provider"] = LOCAL
-    if visit_status is not None:
-        changes["visit_status"] = visit_status
     if visit_date is not None:
         changes["visit_date"] = visit_date
     if visit_time is not None:
@@ -171,6 +152,34 @@ def update_visit(
     updated = visits_repo.update(conn, scope, visit_id, changes)
     logger.info("Updated %s: %s", visit_id, ", ".join(changes) or "no changes")
     return updated  # type: ignore[return-value]
+
+
+def start_visit(conn: psycopg.Connection, scope: DoctorScope,
+                visit_id: str) -> VisitRow:
+    """Mark a scheduled consultation as under way (`in_progress`).
+
+    Idempotent for a visit already in progress, so a double click or a second
+    tab is harmless. A completed or cancelled visit cannot be restarted: either
+    would reopen a consultation the record says is over.
+    """
+    visit = get_visit(conn, scope, visit_id)
+    if visit.visit_status == "in_progress":
+        return visit
+    if visit.visit_status != "scheduled":
+        raise ConflictError(
+            f"This visit is {visit.visit_status} and cannot be started.",
+            details={"visit_id": visit_id, "visit_status": visit.visit_status})
+
+    updated = visits_repo.mark_in_progress(conn, scope, visit_id)
+    # The UPDATE re-checks the status, so a visit completed or cancelled since
+    # the read above is left alone and shows up here unchanged.
+    if updated is None or updated.visit_status != "in_progress":
+        raise ConflictError(
+            "This visit changed while it was being started. Reload and try again.",
+            details={"visit_id": visit_id,
+                     "visit_status": updated.visit_status if updated else None})
+    logger.info("Started %s", updated.label)
+    return updated
 
 
 def complete_visit(
@@ -208,6 +217,10 @@ def cancel_visit(
 
     Refused once insights exist: a generated brief is a record of a consultation
     that demonstrably happened, so cancelling it would contradict the data.
+
+    `reason` is stored on the visit. It used to reach a log line and stop there,
+    so the API advertised a field it did not keep and the only answer to "why was
+    this cancelled" was whichever log still existed.
     """
     visit = get_visit(conn, scope, visit_id)
 
@@ -217,22 +230,100 @@ def cancel_visit(
             "This visit has generated insights and cannot be cancelled.",
             details={"visit_id": visit_id})
 
+    cleaned = (reason or "").strip() or None
+
     with conn.transaction():
-        updated = visits_repo.mark_cancelled(conn, scope, visit_id)
+        updated = visits_repo.mark_cancelled(conn, scope, visit_id, cleaned)
         # A cancelled visit no longer answers anything, so follow-ups it closed
         # must return to the queue or the patient is silently dropped.
         reopened = follow_up_service.reopen_for_cancelled_visit(conn, scope,
                                                                visit_id)
 
+    _discard_recordings(conn, scope, visit_id)
+
     logger.info("Cancelled %s%s (reason: %s)",
                 visit.label,
                 f", reopened {len(reopened)} follow-up(s)" if reopened else "",
-                reason or "not given")
+                cleaned or "not given")
     return updated  # type: ignore[return-value]
+
+
+def _discard_recordings(conn: psycopg.Connection, scope: DoctorScope,
+                        visit_id: str) -> None:
+    """Remove a cancelled visit's unfinished recordings, best-effort.
+
+    After the cancel has committed, so a live recording still running in some tab
+    is refused its next chunk rather than accepted for a visit that is over. A
+    failure here is logged, not raised: the cancellation itself is done, and
+    leftovers are tidied by the startup reaper a day later anyway.
+
+    Imported here, not at the top: audio_upload_service imports get_visit from
+    this module.
+    """
+    from app.services import audio_upload_service
+
+    try:
+        audio_upload_service.discard_unfinished_for_visit(conn, scope, visit_id)
+    except Exception:
+        logger.warning("Cancelled %s, but could not discard its unfinished "
+                       "recordings", visit_id, exc_info=True)
+
+
+def list_visits(
+    conn: psycopg.Connection,
+    scope: DoctorScope,
+    patient_id: Optional[str] = None,
+    statuses: Optional[List[str]] = None,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    has_transcript: Optional[bool] = None,
+    pending_only: bool = False,
+    sort: str = "date_desc",
+    limit: Optional[int] = None,
+    offset: int = 0,
+) -> Page[VisitRow]:
+    """One page of the scoped doctor's visits, with the matching total.
+
+    Note the default page size. The repository still accepts `limit=None` and
+    returns everything, which `list_for_patient` below relies on — a timeline
+    must not be truncated — but an *unbounded list endpoint* is a different
+    thing, and having no default is what pushed the schedule screen into picking
+    a number and filtering the rest in the browser.
+
+    A `patient_id` belonging to another doctor yields an empty page rather than
+    an error, which is what a patient with no visits also returns.
+    """
+    limit = clamp_limit(limit)
+    filters = {
+        "patient_id": patient_id,
+        "statuses": statuses,
+        "date_from": date_from,
+        "date_to": date_to,
+        "has_transcript": has_transcript,
+        "pending_only": pending_only,
+    }
+    return Page(
+        items=visits_repo.list_visits(conn, scope, sort=sort, limit=limit,
+                                      offset=offset, **filters),
+        total=visits_repo.count_visits(conn, scope, **filters),
+    )
 
 
 def list_for_patient(conn: psycopg.Connection, scope: DoctorScope,
                      patient_id: str) -> List[VisitRow]:
-    """A patient's visits, newest first."""
+    """A patient's visits, newest first. Deliberately unpaginated: a clinical
+    history with rows silently missing is worse than a long page."""
     return visits_repo.list_visits(conn, scope, patient_id=patient_id,
                                    sort="date_desc")
+
+
+def latest_job(conn: psycopg.Connection, scope: DoctorScope,
+               visit_id: str) -> Optional["JobRow"]:
+    """The most recent insight job for a visit, so a reload can resume polling.
+
+    Goes through get_visit first so an unknown visit 404s and a visit that simply
+    never had a job returns None — the route turns the second into a 204, and the
+    UI needs to tell those apart.
+    """
+    get_visit(conn, scope, visit_id)
+    return jobs_repo.latest_for_visit(conn, scope, visit_id)

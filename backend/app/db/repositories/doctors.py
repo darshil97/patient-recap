@@ -16,15 +16,24 @@ A row found by email gets its `auth_user_id` stamped on first sign-in ("claimed"
 so every subsequent request resolves by the stable key. Without that, a doctor
 who used Better Auth's change-email flow would be resolved as a brand-new doctor
 with an empty patient list while their real records became unreachable.
+
+The fallback is one-way. An *unclaimed* row is claimed by the auth id presented;
+a row already claimed by a **different** auth id is refused, not served. Without
+that second rule the fallback quietly inverted the preference order -- any caller
+naming the right email resolved the tenant regardless of which account they were
+signed in as, making email the real identity and `auth_user_id` decorative.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Optional
 
 import psycopg
 
 from app.db.models import DoctorRow
+
+logger = logging.getLogger(__name__)
 
 _COLUMNS = "doctor_id::text, email, auth_user_id, name, created_at"
 
@@ -142,6 +151,26 @@ def resolve(
         # Pre-seeded by the migration, or created before we knew the subject id.
         if auth_user_id and not by_email.auth_user_id:
             return claim(conn, by_email.doctor_id, auth_user_id) or by_email
+
+        if auth_user_id and by_email.auth_user_id != auth_user_id:
+            # The row is already bound to a *different* Neon Auth account.
+            #
+            # Returning it anyway made email, not auth_user_id, the effective
+            # identity -- which is the opposite of the order this function exists
+            # to enforce. claim() already refuses to re-point a claimed row
+            # (`AND auth_user_id IS NULL`), but nothing stopped that row being
+            # *served* to a mismatched id, so the protection only covered the
+            # write.
+            #
+            # There is no safe reading of this. Either the address moved between
+            # two accounts, or someone is presenting an email that is not theirs.
+            # Both need a human, so refuse and let the caller raise 401.
+            logger.warning(
+                "Doctor %s is bound to a different auth_user_id than the one "
+                "presented; refusing to resolve by email alone.",
+                by_email.doctor_id)
+            return None
+
         return by_email
 
     return create(conn, email=email, auth_user_id=auth_user_id, name=name)

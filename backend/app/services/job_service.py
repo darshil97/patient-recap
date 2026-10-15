@@ -28,7 +28,7 @@ import logging
 import os
 import socket
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from app.core.errors import AppError, ConflictError, NotFoundError, QuotaExhaustedError
 from app.db.models import JobRow
@@ -53,6 +53,16 @@ def reap_orphans() -> int:
     """
     with connection() as conn:
         count = jobs_repo.fail_orphans(conn, WORKER_ID)
+        # Audio uploads are the other in-process background work, so they are
+        # reaped here too: one startup entry point for everything a dead process
+        # can leave half-done. Isolated, so a problem tidying audio cannot stop
+        # insight jobs from being reaped or the app from starting.
+        try:
+            from app.services import audio_upload_service
+
+            audio_upload_service.reap(conn)
+        except Exception:
+            logger.exception("Could not tidy up interrupted audio uploads")
     if count:
         logger.warning("Failed %d orphaned insight job(s) from a previous run", count)
     return count
@@ -174,6 +184,15 @@ def run_job(job_id: str) -> None:
         except Exception as exc:  # pragma: no cover - unexpected
             jobs_repo.mark_failed(conn, job_id, "internal_error", str(exc))
             logger.exception("Job %s failed unexpectedly", job_id)
+
+
+def list_jobs(conn, scope: DoctorScope, limit: int = 50) -> List[JobRow]:
+    """Recent jobs for one doctor.
+
+    No total: this is a fixed-size tail for diagnostics, not a paged list, and a
+    count over every job a practice has ever run answers a question nobody asked.
+    """
+    return jobs_repo.list_recent(conn, scope, limit=limit)
 
 
 def get_job(scope: DoctorScope, job_id: str) -> JobRow:

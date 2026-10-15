@@ -34,20 +34,23 @@ class VisitCreate(BaseModel):
     visit_type: Optional[str] = None
     visit_status: str = "scheduled"
 
-    # Optional: a scheduled visit has no recording yet. Attach it later with
-    # PATCH /visits/{visit_id}. Supplying it here loads historical data in one call.
+    # There is deliberately NO transcript_path and NO transcript_provider field.
     #
-    # There is deliberately NO transcript_provider field. Which backend holds a
-    # transcript is a server-side storage decision (§8.22) and the client cannot
-    # know it: it is TRANSCRIPT_STORAGE for a fresh upload, and 'local' for a path
-    # supplied here, because verifying a pre-existing transcript means stat-ing a
-    # file. Accepting it from the client let a caller either override the
-    # configured backend or, worse, claim a provider that does not hold the bytes
-    # — which makes the transcript unreadable and the visit ungeneratable.
+    # Both are server decisions, and accepting either from a client was the same
+    # mistake twice. A provider the client names may not hold the bytes, which
+    # makes the transcript unreadable and the visit ungeneratable (§8.22). A path
+    # the client names is worse: the only check it could be given is that it
+    # resolves inside `transcripts/`, which proves the file exists but *not* that
+    # it belongs to this doctor — and since the locator is `transcripts/<visit
+    # uuid>.txt` with no doctor_id in it, by design, any valid visit uuid passes.
+    # One doctor could point their own visit at another doctor's transcript and
+    # read a verbatim consultation through GET /visits/{id}/transcript.
     #
-    # Pydantic ignores unknown fields, so an older client still sending
-    # transcript_provider is silently and harmlessly ignored rather than 422'd.
-    transcript_path: Optional[str] = None
+    # The address is now derived from visit_id at upload time and nowhere else:
+    # POST /visits/{visit_id}/transcript is the only way a transcript is attached.
+    #
+    # Pydantic ignores unknown fields, so an older client still sending either one
+    # is silently and harmlessly ignored rather than 422'd.
 
     @model_validator(mode="after")
     def _check_enums(self) -> "VisitCreate":
@@ -59,17 +62,31 @@ class VisitCreate(BaseModel):
 
 
 class VisitUpdate(BaseModel):
-    """Payload for PATCH /visits/{visit_id}.
+    """Payload for PATCH /visits/{visit_id}: correct a visit's own details.
 
-    Mainly used to attach the transcript once the consultation has happened,
-    which also moves the visit to 'completed' unless a status is given.
+    Deliberately narrow. Three things it used to accept and no longer does:
+
+      * `visit_status` — status is a lifecycle transition, not a field. Setting it
+        here skipped everything the transitions exist to do: `/cancel`'s refusal
+        once insights exist, its reopening of the follow-ups that visit had
+        resolved, and the `completed_at` / `cancelled_at` stamps. A cancelled
+        visit whose follow-up was never reopened drops a patient who still needs
+        calling, with no error anywhere. Use `/complete` and `/cancel` (§8.17).
+      * `transcript_path` — see VisitCreate; the address is derived from visit_id
+        at upload time.
+      * `transcript_provider` — a server-side storage decision (§8.22).
+
+    `extra="forbid"`, which is deliberate and is the one place in the API that
+    does this. Everywhere else an unknown field is ignored, so an older client
+    keeps working — and that is right where the field was never honoured
+    (`transcript_provider` on VisitCreate). Here all three removed fields *were*
+    honoured. Ignoring them would answer 200 to "cancel this visit" and do
+    nothing, which is exactly the class of silent failure this change exists to
+    remove. A 422 naming the field says what happened.
     """
 
-    model_config = ConfigDict(str_strip_whitespace=True)
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    # No transcript_provider here either; see VisitCreate above.
-    transcript_path: Optional[str] = None
-    visit_status: Optional[str] = None
     visit_date: Optional[date] = None
     visit_time: Optional[time] = None
     visit_type: Optional[str] = None
@@ -80,8 +97,6 @@ class VisitUpdate(BaseModel):
             raise ValueError("provide at least one field to update")
         if self.visit_type and self.visit_type not in VISIT_TYPES:
             raise ValueError(f"visit_type must be one of {VISIT_TYPES}")
-        if self.visit_status and self.visit_status not in VISIT_STATUSES:
-            raise ValueError(f"visit_status must be one of {VISIT_STATUSES}")
         return self
 
 
@@ -129,5 +144,11 @@ class VisitOut(BaseModel):
 
     completed_at: Optional[datetime] = None
     cancelled_at: Optional[datetime] = None
+
+    # Why, in the doctor's words. NULL means no reason was recorded — which is
+    # every visit cancelled before the column existed, and is deliberately
+    # distinct from an empty one.
+    cancelled_reason: Optional[str] = None
+
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None

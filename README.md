@@ -156,8 +156,8 @@ Because FastAPI trusts the BFF's identity assertion rather than verifying a toke
 
 ```
 GET    /api/v1/stats                          home-screen counters
-GET    /api/v1/health                         service + database + key count
-GET    /api/v1/health/api-keys                which Gemini keys work — never poll
+GET    /api/v1/health                         service + database + model provider
+GET    /api/v1/health/api-keys                does the model key work — never poll
 
 POST   /api/v1/patients                       register a patient
 GET    /api/v1/patients                       list / search (q, X-Total-Count)
@@ -169,10 +169,17 @@ POST   /api/v1/visits                         schedule a consultation
 GET    /api/v1/visits                         list (status/date filters, sort)
 GET    /api/v1/visits/{id}                    single visit
 PATCH  /api/v1/visits/{id}                    correct details
+POST   /api/v1/visits/{id}/start              start the session (in_progress)
 POST   /api/v1/visits/{id}/complete           mark the consultation done
 POST   /api/v1/visits/{id}/cancel             cancel, reopening its follow-ups
 
 POST   /api/v1/visits/{id}/transcript         upload the .txt (multipart)
+POST   /api/v1/visits/{id}/audio-uploads      or a recording: start, get chunk plan
+POST   /api/v1/visits/{id}/audio-uploads/live or record live: sent while recording
+PUT    /api/v1/audio-uploads/{id}/chunks/{i}  one chunk, idempotent
+POST   /api/v1/audio-uploads/{id}/finish      stitch + transcribe -> 202
+POST   /api/v1/audio-uploads/{id}/discard     throw an unfinished one away
+GET    /api/v1/audio-uploads/{id}             poll until completed | failed
 GET    /api/v1/visits/{id}/transcript         read it back
 DELETE /api/v1/visits/{id}/transcript         remove it
 
@@ -277,7 +284,8 @@ python -m cli.load_insights --all         # process everything pending
 python -m cli.load_insights --all --limit 2      # costed trial run
 python -m cli.load_insights --all --pause        # confirm each visit
 python -m cli.load_insights --all --doctor me@example.com   # one doctor only
-python -m cli.check_keys                  # which API keys are usable
+python -m cli.check_keys                  # does the configured provider's key work
+python -m cli.check_keys --provider bedrock      # check the other provider's key
 python -m cli.render_prompt --transcript transcripts/<visit_id>.txt \
   --age 24 --gender Female --call-date 2026-02-16 --layer 1
 ```
@@ -306,10 +314,10 @@ written either way, and re-running skips finished visits.
 cd backend && python -m unittest discover -s tests -t .
 ```
 
-295 tests across six files, all offline: no API calls, no database, no object
-storage. They cover follow-up date resolution against every timing pattern in the
-sample corpus, multi-key rotation with stubbed clients, transcript storage on both
-backends, and the HTTP layer's routing, validation and error mapping.
+All offline: no API calls, no database, no object storage. They cover follow-up
+date resolution against every timing pattern in the sample corpus, configuration
+loading, provider construction and error classification, transcript storage on
+both backends, and the HTTP layer's routing, validation and error mapping.
 
 The most important suite is `TestCrossTenantIsolation` in `tests/test_api.py`: a
 regression there is a real patient data leak, not a cosmetic bug.
@@ -318,35 +326,53 @@ regression there is a real patient data leak, not a cosmetic bug.
 
 ## Configuration
 
-`backend/.env`, see `.env.example`:
+Two files with separate jobs:
 
-| Variable | Purpose |
+- **`backend/config.yaml`** (committed) holds everything about *what to run*:
+  provider, models, timeouts, pool sizes, upload limit, storage backend. It is
+  loaded into a typed tree by `app/config.py`, and an unknown key is a startup
+  error.
+- **`backend/.env`** (gitignored, see `.env.example`) holds secrets only. The YAML
+  reads them by name as `${NAME}` or `${NAME:-fallback}`; on a host without a
+  `.env`, set the same names as environment variables.
+
+```yaml
+llm:
+  provider: gemini            # gemini | bedrock
+  gemini:  { model: gemini-3.7-flash, api_key: ${GOOGLE_API_KEY} }
+  bedrock: { model: openai.gpt-oss-120b-1:0, api_key: ${AWS_BEARER_TOKEN_BEDROCK}, region: us-west-2 }
+```
+
+| Secret / per-host variable | Read as |
 | --- | --- |
-| `CONNSTR` | Postgres connection string |
-| `GOOGLE_API_KEY_1..8` | Gemini keys; the client rotates when one is rate limited |
-| `GOOGLE_API_KEY` | fallback if no numbered keys are set |
-| `GEMINI_MODEL` | model id, default `gemini-3.7-flash` |
-| `API_KEY` | shared secret for the API; unset leaves it open |
-| `CORS_ORIGINS` | comma-separated allowed origins, default `*` |
-| `MAX_TRANSCRIPT_BYTES` | upload ceiling, default 262144 (256 KB) |
-| `TRANSCRIPT_STORAGE` | `local` or `neon_object_storage`; governs new uploads only |
-| `TRANSCRIPT_BUCKET` | bucket name, default `consultation-transcripts` |
+| `GOOGLE_API_KEY` | `llm.gemini.api_key` |
+| `AWS_BEARER_TOKEN_BEDROCK` | `llm.bedrock.api_key` (a Bedrock API key) |
+| `DEEPGRAM_API_KEY` | `speech.deepgram.api_key`; only needed for audio uploads |
+| `CONNSTR` | `database.url` |
+| `API_KEY` | `api.key`; shared secret for the API, unset leaves it open |
+| `CORS_ORIGINS` | `api.cors_origins`, default `*`. A bare value, a comma-separated list, or JSON |
 | `AWS_ENDPOINT_URL_S3` | Neon branch storage endpoint |
 | `AWS_ACCESS_KEY_ID` | the credential's `token_id` |
 | `AWS_SECRET_ACCESS_KEY` | the credential's `s3_secret_access_key` |
-| `AWS_REGION` | `us-east-2` |
+| `AWS_REGION` | Neon storage region, default `us-east-2` |
 
-The `AWS_*` names are standard on purpose, so `neon env pull` writes them directly
-and boto3 finds them without an alias layer. Create the credential in the Neon
-Console under the branch's **Credentials**, with `storage:read` and `storage:write`.
-**The secret is shown once and cannot be retrieved**, and credentials are
-branch-scoped: one minted on the default branch works there and on descendants
-only.
+The variables the old flat configuration read (`LLM_PROVIDER`, `GEMINI_MODEL`,
+`GOOGLE_API_KEY_1..8`, `TRANSCRIPT_STORAGE`, `MAX_TRANSCRIPT_BYTES`, ...) are no
+longer read; if one is still set, startup logs a warning naming its config.yaml
+key.
 
-Free-tier Gemini keys allow 20 requests per day per model per project, and each
-consultation costs 3. Keys in the same Google Cloud project share one bucket, so
-several keys do not guarantee proportionally more requests. `python -m
-cli.check_keys` tells you where you stand.
+The `AWS_*` names are standard on purpose, so `neon env pull` writes them directly.
+Create the credential in the Neon Console under the branch's **Credentials**, with
+`storage:read` and `storage:write`. **The secret is shown once and cannot be
+retrieved**, and credentials are branch-scoped: one minted on the default branch
+works there and on descendants only.
+
+Both providers go through LangChain (`app/llm/providers/`): Gemini through
+`ChatGoogleGenerativeAI`, Bedrock through `ChatBedrockConverse` with the API key as
+a bearer token. Each has one key. Throttling is retried by the provider's client and
+then surfaces as `quota_exhausted` (HTTP 429). Free-tier Gemini allows 20 requests
+per day per model per project, and each consultation costs 3. `python -m
+cli.check_keys` sends one request to confirm the selected provider's key.
 
 ---
 
@@ -359,14 +385,20 @@ so a client can generate types. Over plain HTTP the key travels in clear text, s
 real deployment needs TLS.
 
 **Transcript addresses are always derived from the visit id**, never from the
-client's filename, which is attacker-controlled. On disk that is enforced by
+client's filename and never from the request body. On disk that is enforced by
 resolving paths against the transcripts directory; in object storage there is no
 parent directory to be confined to, so a strict `transcripts/<uuid>.txt` pattern is
-checked on every read, write and delete.
+checked on every read, write and delete. `transcript_path` is not a request field
+on any endpoint — uploading is the only way a transcript is attached (§8.19).
 
-**`CORS_ORIGINS` still defaults to `*`.** It does not affect the app, whose traffic
-is same-origin through the BFF, but it must be narrowed before deployment — `*`
-cannot be combined with credentialed requests.
+**Status is a transition, not a field.** `PATCH /visits/{id}` corrects date, time
+and type only. `/start`, `/complete` and `/cancel` are the only ways `visit_status` changes,
+because each does more than set a column — `/cancel` reopens the follow-ups that
+visit had resolved, and refuses once insights exist (§8.17).
+
+**`CORS_ORIGINS` defaults to `*` locally** and is narrowed to the Vercel origin on
+Render. It does not affect the app, whose traffic is same-origin through the BFF —
+`*` cannot be combined with credentialed requests in any case.
 
 ---
 
@@ -382,7 +414,22 @@ gotchas (HTTPS dev, auth theming).
 
 ## To Dos
   **Frontend | Backend**
-  - [ ] Note it in the docs as a pre-launch task alongside narrowing CORS and JWT verification
+  - [ ] Verify the Neon Auth JWT against the JWKS endpoint and take `doctor_id`
+        from the verified `sub`, so `API_KEY` stops being tenancy-bearing (§8.12).
+        The seam is `require_doctor` and nothing else.
+  - [ ] Validate `insights_json` against a schema at the write, so the frontend's
+        hand-written types stop being an unenforced assertion (§11)
+  - [ ] Move data loading off fetch-on-mount (Suspense + `use()`, or a query
+        library). Seven `react-hooks/set-state-in-effect` warnings track this.
+  - [ ] `visit_insights.transcript_sha256`, so the stale-brief warning compares
+        content rather than timestamps (§11)
+  - [ ] Privacy, announced as "Next, we're..." on the public home page. As each
+        one ships, move it into the present-tense lists in
+        `frontend/app/(home)/page.tsx` and out of the "Next" sentence:
+        - drop `patient_name` and `doctor_name` from every prompt
+        - mask the patient's and doctor's names (`[Patient]` / `[Doctor]`),
+          phone numbers and emails in the transcript at prompt time
+        - send `mip_opt_out=true` on every Deepgram request
   - [ ] Add transcript audio functionality
   - [ ] Add recording functionality
   - [ ] Deploy frontend on Vercel

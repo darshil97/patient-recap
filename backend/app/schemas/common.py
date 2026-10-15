@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from pydantic import BaseModel
 
@@ -18,22 +18,22 @@ class ErrorResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     database: str
+    provider: str
     model: str
-    api_keys_configured: int
-
-
-class KeyHealth(BaseModel):
-    index: int
-    usable: bool
-    kind: str
-    length: int
-    looks_like_google_key: bool
-    detail: str = ""
+    api_key_configured: bool
 
 
 class KeyHealthResponse(BaseModel):
+    """Result of one minimal request with the configured provider's API key."""
+
+    provider: str
     model: str
-    keys: List[KeyHealth]
+    key_variable: str
+    configured: bool
+    usable: bool
+    # ok | not_configured | quota | bad_key | request
+    kind: str
+    detail: str = ""
 
 
 class VisitStatusRow(BaseModel):

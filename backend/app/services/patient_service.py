@@ -16,6 +16,7 @@ from app.db.repositories import patients as patients_repo
 from app.db.repositories import visits as visits_repo
 from app.db.tenancy import DoctorScope
 from app.domain.identity import normalise_phone
+from app.services.pagination import Page, clamp_limit
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,31 @@ def add_patient(
     logger.info("Registered patient %s (%s) for doctor %s",
                 patient.external_id, patient.patient_id, patient.doctor_id)
     return patient
+
+
+def list_patients(
+    conn: psycopg.Connection,
+    scope: DoctorScope,
+    q: Optional[str] = None,
+    sort: str = "name",
+    limit: Optional[int] = None,
+    offset: int = 0,
+) -> Page[PatientRow]:
+    """One page of the scoped doctor's patients, with the matching total.
+
+    The list and the count are taken here, together, from the same arguments.
+    They used to be two calls in the route handler, which is the shape that lets
+    them drift: a count computed over different filters than the list it sits
+    beside is both a wrong number and, if the scopes differ, a disclosure.
+
+    The search runs inside the doctor filter, not alongside it (§8.10).
+    """
+    limit = clamp_limit(limit)
+    return Page(
+        items=patients_repo.list_all(conn, scope, q=q, sort=sort,
+                                     limit=limit, offset=offset),
+        total=patients_repo.count_all(conn, scope, q=q),
+    )
 
 
 def get_patient(conn: psycopg.Connection, scope: DoctorScope,

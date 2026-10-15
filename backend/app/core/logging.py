@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import logging
 
-# The Google client and httpx narrate every HTTP request. The CLI renders its
-# own progress and the API has its own access log, so both are noise here.
+# The provider clients and their HTTP layers narrate every request. The CLI
+# renders its own progress and the API has its own access log, so both are
+# noise here.
 NOISY_LOGGERS = (
     "httpx", "httpcore", "google_genai", "google.genai",
     "google_genai.models", "langchain_google_genai",
+    "botocore", "boto3", "urllib3", "langchain_aws",
 )
 
 
