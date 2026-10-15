@@ -12,8 +12,9 @@ server-side BFF proxy in front of the FastAPI backend.
 ```
 frontend/
 ├── app/
+│   ├── (home)/             "/" -> the public home page (no sign-in needed)
 │   ├── (app)/              authenticated area, wrapped in the clinical shell
-│   │   ├── page.tsx        "/" -> the follow-up queue
+│   │   ├── today/          "/today" -> the follow-up queue, where sign-in lands
 │   │   ├── follow-ups/     same queue under its own name
 │   │   ├── schedule/       visit schedule
 │   │   ├── patients/       list, and [patientId] detail/timeline
@@ -31,7 +32,7 @@ frontend/
 │   ├── auth/               server.ts (secrets) and client.ts (browser)
 │   └── types/api.d.ts      generated — do not hand-edit
 ├── certificates/           self-signed dev cert, gitignored (see HTTPS below)
-├── proxy.ts                route protection (middleware.ts on Next < 16)
+├── proxy.ts                route protection; "/" public, signed-in visitors sent to /today
 ├── legacy-vite/            the previous Vite SPA, reference only
 └── design-history/         mockups and design alternatives
 ```

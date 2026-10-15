@@ -423,6 +423,13 @@ gotchas (HTTPS dev, auth theming).
         library). Seven `react-hooks/set-state-in-effect` warnings track this.
   - [ ] `visit_insights.transcript_sha256`, so the stale-brief warning compares
         content rather than timestamps (§11)
+  - [ ] Privacy, announced as "Next, we're..." on the public home page. As each
+        one ships, move it into the present-tense lists in
+        `frontend/app/(home)/page.tsx` and out of the "Next" sentence:
+        - drop `patient_name` and `doctor_name` from every prompt
+        - mask the patient's and doctor's names (`[Patient]` / `[Doctor]`),
+          phone numbers and emails in the transcript at prompt time
+        - send `mip_opt_out=true` on every Deepgram request
   - [ ] Add transcript audio functionality
   - [ ] Add recording functionality
   - [ ] Deploy frontend on Vercel

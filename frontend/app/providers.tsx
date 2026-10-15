@@ -5,16 +5,27 @@ import { useRouter } from "next/navigation";
 import { NeonAuthUIProvider } from "@neondatabase/auth-ui";
 import { authClient } from "@/lib/auth/client";
 import { ToastProvider } from "@/components/Toast";
-import { StatsProvider } from "@/hooks/StatsContext";
+import { APP_HOME } from "@/lib/routes";
 
 /**
- * Every client-side provider, in the order the Vite app used: toasts outermost
- * so anything inside can raise one, then the shared stats used by the nav
- * counters.
+ * Client-side providers shared by every page: the public home page, the auth
+ * views and the app.
  *
- * NeonAuthUIProvider wraps them so the pre-built auth components work anywhere,
- * including the <UserButton> in the shell. It is given Next's router and Link so
- * the auth UI navigates client-side instead of doing full page loads.
+ * NeonAuthUIProvider wraps the rest so the pre-built auth components work
+ * anywhere, including the <UserButton> in the shell. It is given Next's router
+ * and Link so the auth UI navigates client-side instead of doing full page loads.
+ *
+ * The /stats counters are deliberately not here; StatsProvider lives in the
+ * (app) layout. At the root it fetched /api/v1/stats on mount on every page, so
+ * the public home page and the sign-in screen sent an unauthenticated request
+ * and got a 401 for every visitor. Root providers also survive client-side
+ * navigation, so after an email sign-in (which navigates client-side) that
+ * failed result stayed in the nav until some action happened to reload it.
+ *
+ * `redirectTo` is where every sign-in lands, and for Google it is also the OAuth
+ * callback URL, which proxy.ts must see to finish the exchange. It used to be the
+ * default "/", which was the queue; "/" is now the public home page, so it points
+ * at APP_HOME directly rather than bouncing through a redirect.
  *
  * `social.providers` is what renders the "Continue with Google" button in
  * <AuthView>. Google is already enabled on this Neon project with shared
@@ -36,12 +47,11 @@ export function Providers({ children }: { children: React.ReactNode }) {
       authClient={authClient}
       navigate={(href: string) => router.push(href)}
       Link={Link}
+      redirectTo={APP_HOME}
       social={{ providers: ["google"] }}
       defaultTheme="light"
     >
-      <ToastProvider>
-        <StatsProvider>{children}</StatsProvider>
-      </ToastProvider>
+      <ToastProvider>{children}</ToastProvider>
     </NeonAuthUIProvider>
   );
 }

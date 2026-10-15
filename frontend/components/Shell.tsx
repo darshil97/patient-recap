@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import { UserButton } from "@neondatabase/auth-ui";
 import { useStatsContext } from "@/hooks/StatsContext";
 import { RecordingBar } from "@/features/recording/RecordingBar";
+import { APP_HOME } from "@/lib/routes";
 
 /**
  * The top-navbar app shell from the approved design (frontend/design-history/
@@ -32,11 +33,12 @@ export function Shell({ children }: { children: React.ReactNode }) {
     (stats?.visits.in_progress ?? 0);
   const patientCount = stats?.patients;
 
-  // "/" and "/follow-ups" render the same queue page, but they are still two
-  // distinct nav links — each highlights only when it is the current route.
-  // (Previously both used one shared flag, which marked Follow-ups active
-  // whenever you were on "/", giving it a permanently solid teal pill.)
-  const isTodayActive = pathname === "/";
+  // APP_HOME (/today) and "/follow-ups" render the same queue page, but they are
+  // still two distinct nav links — each highlights only when it is the current
+  // route. (Previously both used one shared flag, which marked Follow-ups active
+  // whenever you were on Today, giving it a permanently solid teal pill.)
+  // Today is not "/": that is the public home page, outside this shell.
+  const isTodayActive = pathname === APP_HOME;
   const isFollowUpsActive = pathname === "/follow-ups";
 
   return (
@@ -54,7 +56,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
             </div>
           </div>
           <nav className="nav" aria-label="Main">
-            <Link href="/" className={isTodayActive ? "active" : ""}>
+            <Link href={APP_HOME} className={isTodayActive ? "active" : ""}>
               Today
               {openFollowUps !== undefined && (
                 <span className="count">{openFollowUps}</span>

@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { APP_HOME } from "@/lib/routes";
 
 export function NotFoundPage() {
   return (
@@ -10,7 +11,7 @@ export function NotFoundPage() {
         <p className="empty-text">
           The page you were looking for doesn&rsquo;t exist.
         </p>
-        <Link href="/" className="btn btn--primary">
+        <Link href={APP_HOME} className="btn btn--primary">
           Back to Today
         </Link>
       </div>

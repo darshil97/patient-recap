@@ -33,9 +33,12 @@
  * of its internal classes, and keeps working when those classes change — which
  * matters for a package still on a beta version.
  *
- * Scoped to .neon-auth-ui (the wrapper NeonAuthUIProvider renders) so none of it
- * leaks into the app's own surfaces, and so the <UserButton> in the shell picks
- * up the same treatment for free.
+ * Scoped to .neon-auth-ui (the wrapper NeonAuthUIProvider renders), so the
+ * <UserButton> in the shell picks up the same treatment for free. Note that the
+ * wrapper encloses the entire app, not only auth-ui's components: the --neon-*
+ * tokens are harmless there because nothing of ours reads them, but any
+ * *element* rule below (a, input) reaches every page and has to be written so
+ * it cannot beat the design system's own classes — see the link rule.
  *
  * The accent still lives in exactly one place: design-system.css's :root. These
  * are all var() references, so changing the accent there changes the sign-in
@@ -153,13 +156,22 @@
   color: var(--ink-2);
 }
 
-/* Links (Forgot your password?, Sign Up) in the accent, like the rest of the app. */
-.neon-auth-ui a {
+/* Links (Forgot your password?, Sign Up) in the accent, like the rest of the app.
+ *
+ * Scoped to auth-ui's card on purpose. NeonAuthUIProvider renders its
+ * .neon-auth-ui wrapper around the *whole* tree (app/providers.tsx), not just
+ * the auth components, so this used to be `.neon-auth-ui a` and reached every
+ * link on every page. At (0,1,1) it outranked .btn--primary's white text
+ * (0,1,0), so every <Link> styled as a primary button — the home page's "Get
+ * started", the schedule's "Open session" — drew teal text on a teal pill, and
+ * it recoloured the home page's nav links. Both auth links live inside the
+ * card. */
+.neon-auth-ui [data-slot="card"] a {
   color: var(--accent-ink);
   font-weight: 500;
 }
 
-.neon-auth-ui a:hover {
+.neon-auth-ui [data-slot="card"] a:hover {
   color: var(--accent);
 }
 
@@ -194,9 +206,13 @@
   gap: 18px;
 }
 
-/* Centres the shell's brand row, which is left-aligned in the navbar. */
+/* Centres the shell's brand row, which is left-aligned in the navbar. It is a
+ * link back to the public home page here, so it also opts out of the global
+ * link colour and hover underline: it should read as the logo, not as text. */
 .auth-panel .brand {
   justify-content: center;
+  color: var(--ink);
+  text-decoration: none;
 }
 
 .auth-note {

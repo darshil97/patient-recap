@@ -1,5 +1,7 @@
+import Link from "next/link";
 import { AuthView } from "@neondatabase/auth-ui";
 import { authViewPaths } from "@neondatabase/auth-ui/server";
+import { PUBLIC_HOME } from "@/lib/routes";
 
 /**
  * Every auth view (sign-in, sign-up, callback, forgot-password, ...) rendered by
@@ -30,12 +32,14 @@ export default async function AuthPage({
     <main className="auth">
       <div className="auth-panel">
         {/* The same .brand markup the shell uses, so the gradient tile and the
-            wordmark cannot drift apart between signed-out and signed-in. */}
-        <div className="brand">
+            wordmark cannot drift apart between signed-out and signed-in. It
+            links back to the public home page, which is where most visitors
+            arrive here from. */}
+        <Link href={PUBLIC_HOME} className="brand" aria-label="Consultation Insights, home">
           <div>
             <div className="brand-name">Consultation Insights</div>
           </div>
-        </div>
+        </Link>
 
         <AuthView path={path} />
 

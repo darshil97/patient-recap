@@ -1,0 +1,1054 @@
+/*
+ * The public home page.
+ *
+ * A CSS Module rather than more rules in globals.css: this is the one page that
+ * is marketing rather than clinical, and its larger type and roomier spacing must
+ * not leak into the app's dense screens. Module class names are scoped, so it
+ * cannot collide with design-system.css however it grows.
+ *
+ * It still speaks the design system's language — every colour, radius and shadow
+ * is a token from design-system.css's :root, and the brand mark, buttons and the
+ * recorded/suggested tags are the app's own global classes — so the page a
+ * visitor sees first and the app they sign in to look like one product.
+ */
+
+.root {
+  font-size: 15.5px;
+  line-height: 1.6;
+  color: var(--ink);
+  background: var(--bg);
+}
+
+/* Links in this page are buttons, nav items and cards; the app's global
+ * underline-on-hover is right for inline links in a record, not for these. */
+.root a:hover {
+  text-decoration: none;
+}
+
+/* Horizontal padding only, as longhands: .container is combined with classes
+ * that set their own vertical padding (.heroInner), and a `padding` shorthand
+ * here, or in the phone breakpoint below, would silently zero it. */
+.container {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding-left: 28px;
+  padding-right: 28px;
+}
+
+/* --- top bar ------------------------------------------------------------- */
+
+.header {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  background: rgba(255, 255, 255, 0.88);
+  backdrop-filter: saturate(160%) blur(10px);
+  -webkit-backdrop-filter: saturate(160%) blur(10px);
+  border-bottom: 1px solid var(--border);
+}
+
+.headerInner {
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  height: 64px;
+}
+
+/* .brand is the shell's own mark (gradient tile + wordmark); this only stops it
+ * turning teal and underlined now that it is a link. */
+.brandLink {
+  color: var(--ink);
+}
+
+.navLinks {
+  display: flex;
+  gap: 4px;
+  flex: 1;
+}
+
+.navLinks a {
+  padding: 7px 12px;
+  border-radius: 999px;
+  color: var(--ink-2);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.navLinks a:hover {
+  background: var(--surface-sunken);
+  color: var(--ink);
+}
+
+.headerActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+/* --- buttons: the app's .btn, sized for a page rather than a toolbar ------
+ * Prefixed with .root so these outrank .btn / .btn--primary (one class each)
+ * by specificity rather than relying on stylesheet order, which Next does not
+ * promise between a layout's global CSS and a page's module. */
+
+.root .btnLg {
+  height: 44px;
+  padding: 0 20px;
+  font-size: 14.5px;
+}
+
+.btnLg svg {
+  transition: transform 0.15s ease;
+}
+
+.btnLg:hover svg {
+  transform: translateX(2px);
+}
+
+/* --- hero ---------------------------------------------------------------- */
+
+.hero {
+  position: relative;
+  overflow: hidden;
+  background:
+    radial-gradient(900px 480px at 88% -8%, rgba(12, 117, 119, 0.13), transparent 62%),
+    radial-gradient(700px 420px at -10% 110%, rgba(191, 232, 232, 0.55), transparent 60%),
+    var(--bg);
+}
+
+.heroInner {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 64px;
+  padding-top: 76px;
+  padding-bottom: 96px;
+}
+
+.eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px 5px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--accent-border);
+  background: var(--accent-bg);
+  color: var(--accent-ink);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.eyebrowDot {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  display: grid;
+  place-items: center;
+}
+
+.h1 {
+  margin-top: 20px;
+  font-size: clamp(34px, 4.4vw, 52px);
+  line-height: 1.07;
+  letter-spacing: -0.028em;
+  font-weight: 800;
+}
+
+.h1Accent {
+  color: var(--accent);
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+.lead {
+  margin-top: 20px;
+  max-width: 54ch;
+  font-size: 17.5px;
+  line-height: 1.6;
+  color: var(--ink-2);
+}
+
+.ctas {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 30px;
+}
+
+.reassure {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  margin-top: 22px;
+  font-size: 13.5px;
+  color: var(--ink-2);
+}
+
+.reassure span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.reassure svg {
+  color: var(--good);
+  flex: 0 0 auto;
+}
+
+/* .root-prefixed so it outranks `.root a:hover`, which would otherwise drop the
+ * underline exactly when the pointer arrives. */
+.root .reassureLink {
+  color: var(--ink-2);
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 3px;
+}
+
+.root .reassureLink:hover {
+  color: var(--ink);
+  text-decoration: underline;
+}
+
+/* Photo with the example brief laid over its corner. */
+.heroVisual {
+  position: relative;
+  padding: 0 0 40px 40px;
+}
+
+.heroPhoto {
+  position: relative;
+  aspect-ratio: 1 / 1.08;
+  border-radius: 22px;
+  overflow: hidden;
+  box-shadow: var(--shadow-lg);
+  background: var(--surface-sunken);
+}
+
+.cover {
+  object-fit: cover;
+}
+
+.floatChip {
+  position: absolute;
+  top: 26px;
+  right: -14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 14px;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-lg);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.floatChipDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--good);
+  box-shadow: 0 0 0 4px var(--good-bg);
+}
+
+/* --- the example brief (a static mock of the real one) ------------------- */
+
+.brief {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: min(350px, 82%);
+  margin: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: var(--shadow-lg);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow: hidden;
+}
+
+.briefHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-sunken);
+}
+
+.briefTitle {
+  font-size: 11.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-2);
+}
+
+.briefBody {
+  padding: 14px 16px 16px;
+  display: grid;
+  gap: 12px;
+}
+
+.briefLabel {
+  display: block;
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-2);
+  margin-bottom: 3px;
+}
+
+.briefLede {
+  font-size: 14px;
+  color: var(--ink);
+}
+
+.briefWatch {
+  border: 1px solid var(--critical-border);
+  background: var(--critical-bg);
+  border-radius: 10px;
+  padding: 9px 11px;
+}
+
+.briefWatch .briefLabel {
+  color: var(--critical);
+}
+
+.briefFollow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
+}
+
+.briefQuote {
+  font-style: italic;
+  color: var(--ink-2);
+}
+
+/* --- proof strip --------------------------------------------------------- */
+
+.proof {
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.proofInner {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.proofItem {
+  padding: 28px 24px;
+  text-align: center;
+}
+
+.proofItem + .proofItem {
+  border-left: 1px solid var(--border);
+}
+
+.proofNum {
+  display: block;
+  font-size: 30px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  color: var(--accent-ink);
+  line-height: 1.1;
+}
+
+.proofText {
+  display: block;
+  margin-top: 6px;
+  font-size: 14px;
+  color: var(--ink-2);
+}
+
+/* --- sections ------------------------------------------------------------ */
+
+.section {
+  padding: 96px 0;
+  /* The header is sticky, so an anchor jump must stop short of it. */
+  scroll-margin-top: 64px;
+}
+
+.sectionSunken {
+  background: var(--surface-sunken);
+}
+
+.sectionHead {
+  max-width: 680px;
+  margin: 0 auto 52px;
+  text-align: center;
+}
+
+.kicker {
+  display: block;
+  font-size: 12.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent-ink);
+}
+
+.h2 {
+  margin-top: 10px;
+  font-size: clamp(26px, 3vw, 36px);
+  line-height: 1.15;
+  letter-spacing: -0.022em;
+  font-weight: 800;
+}
+
+.sub {
+  margin-top: 14px;
+  font-size: 16.5px;
+  color: var(--ink-2);
+}
+
+/* --- how it works -------------------------------------------------------- */
+
+.steps {
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 18px;
+  counter-reset: step;
+}
+
+.step {
+  position: relative;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 24px 22px 22px;
+  box-shadow: var(--shadow-sm);
+}
+
+.stepTop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 18px;
+}
+
+.stepNum {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--ink-2);
+  letter-spacing: 0.04em;
+}
+
+.iconTile {
+  width: 42px;
+  height: 42px;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  background: var(--accent-bg);
+  color: var(--accent-ink);
+  flex: 0 0 auto;
+}
+
+.h3 {
+  font-size: 17px;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+  font-weight: 700;
+}
+
+.cardText {
+  margin-top: 8px;
+  font-size: 14.5px;
+  color: var(--ink-2);
+}
+
+/* --- image + text splits ------------------------------------------------- */
+
+.split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 72px;
+}
+
+.split + .split {
+  margin-top: 112px;
+}
+
+.splitReverse .splitMedia {
+  order: 2;
+}
+
+.splitMedia {
+  position: relative;
+  aspect-ratio: 4 / 3.2;
+  border-radius: 20px;
+  overflow: hidden;
+  box-shadow: var(--shadow-lg);
+  background: var(--surface-sunken);
+}
+
+.splitText .h2 {
+  margin-top: 10px;
+}
+
+.splitText .sub {
+  margin-top: 14px;
+}
+
+.checklist {
+  list-style: none;
+  margin-top: 26px;
+  display: grid;
+  gap: 16px;
+}
+
+.checklist li {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.checkMark {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  margin-top: 1px;
+  background: var(--accent-bg);
+  color: var(--accent-ink);
+}
+
+.checkTitle {
+  display: block;
+  font-weight: 650;
+  color: var(--ink);
+}
+
+.checkText {
+  display: block;
+  color: var(--ink-2);
+  font-size: 14.5px;
+}
+
+/* The three passes. Reuses the brief's own recorded / suggested tags, so the
+ * distinction a visitor reads here is drawn exactly as the app draws it. */
+.layers {
+  list-style: none;
+  margin-top: 26px;
+  display: grid;
+  gap: 12px;
+}
+
+.layer {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 14px;
+  padding: 16px 18px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow-sm);
+}
+
+.layerSuggested {
+  background: var(--suggest-bg);
+  border-color: var(--suggest-border);
+  border-left: 4px solid var(--suggest-rule);
+}
+
+.layerNum {
+  grid-row: span 2;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 13px;
+  font-weight: 700;
+  background: var(--accent);
+  color: #fff;
+}
+
+.layerHead {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.layerName {
+  font-weight: 700;
+}
+
+.layerText {
+  font-size: 14.5px;
+  color: var(--ink-2);
+}
+
+.aside {
+  margin-top: 18px;
+  font-size: 14px;
+  color: var(--ink-2);
+  border-left: 3px solid var(--accent-border);
+  padding-left: 12px;
+}
+
+/* --- feature grid --------------------------------------------------------
+ * Two by two, icon beside the text: four cards in a three-column grid left a
+ * hole in the second row. */
+
+.features {
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+  max-width: 980px;
+  margin: 0 auto;
+}
+
+.feature {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-content: start;
+  gap: 2px 18px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: var(--shadow-sm);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.feature:hover {
+  border-color: var(--accent-border);
+  box-shadow: var(--shadow);
+}
+
+.feature .iconTile {
+  grid-row: span 2;
+}
+
+.feature .cardText {
+  margin-top: 4px;
+}
+
+/* --- privacy -------------------------------------------------------------
+ * The one dark section, so it reads as a statement rather than one more grid
+ * of features. Colours are the design system's ink and accent tokens; the
+ * white-on-ink text is well above 4.5:1 at every alpha used here. */
+
+.privacy {
+  background:
+    radial-gradient(700px 360px at 12% 0%, rgba(12, 117, 119, 0.35), transparent 65%),
+    var(--ink);
+  color: #fff;
+}
+
+.privacy .h2,
+.privacy .h3 {
+  color: #fff;
+}
+
+.privacy .cardText {
+  color: rgba(255, 255, 255, 0.74);
+}
+
+.kickerOnDark {
+  color: var(--accent-border);
+}
+
+.subOnDark {
+  color: rgba(255, 255, 255, 0.78);
+}
+
+/* The two columns are the same height: the grid stretches both to the taller
+ * one, the card pins its note to the bottom, and the three points share the
+ * column equally. */
+.privacyGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.8fr);
+  gap: 28px;
+  align-items: stretch;
+}
+
+.aiCard {
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  color: var(--ink);
+  border-radius: 18px;
+  padding: 28px;
+  box-shadow: var(--shadow-lg);
+}
+
+/* Takes the card's spare height, so the note sits on the bottom edge. */
+.aiCard .aiCols {
+  flex: 1;
+}
+
+.aiCols {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 28px;
+}
+
+.aiHead {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--ink-2);
+  padding-bottom: 12px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.aiList {
+  list-style: none;
+}
+
+.aiList li {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 0;
+  border-bottom: 1px dashed var(--border);
+  font-size: 14.5px;
+}
+
+.aiList li:last-child {
+  border-bottom: 0;
+}
+
+.aiMarkSees,
+.aiMarkNever {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+}
+
+.aiMarkSees {
+  background: var(--accent-bg);
+  color: var(--accent-ink);
+}
+
+.aiMarkNever {
+  background: var(--surface-sunken);
+  border: 1px solid var(--border-strong);
+  color: var(--ink-2);
+}
+
+.aiNote {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  font-size: 13.5px;
+  color: var(--ink-2);
+}
+
+.privacyPoints {
+  list-style: none;
+  display: grid;
+  grid-auto-rows: 1fr;
+  gap: 14px;
+}
+
+.privacyPoint {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 20px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.iconTileOnDark {
+  width: 42px;
+  height: 42px;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  background: rgba(79, 185, 187, 0.18);
+  color: var(--accent-bg);
+}
+
+/* --- principles ---------------------------------------------------------- */
+
+.principles {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  gap: 64px;
+  align-items: center;
+}
+
+.principleList {
+  list-style: none;
+  margin-top: 28px;
+  display: grid;
+  gap: 14px;
+}
+
+.principle {
+  display: flex;
+  gap: 14px;
+  padding: 18px 20px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+}
+
+/* --- closing call to action --------------------------------------------- */
+
+.cta {
+  position: relative;
+  overflow: hidden;
+  border-radius: 24px;
+  padding: 64px 56px;
+  /* accent-ink -> accent only: white text on the lighter accent-light falls
+   * below 4.5:1, so the gradient stops short of it. */
+  background:
+    radial-gradient(600px 300px at 100% 0%, rgba(255, 255, 255, 0.14), transparent 60%),
+    linear-gradient(135deg, var(--accent-ink), var(--accent));
+  color: #fff;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 32px;
+  align-items: center;
+  box-shadow: var(--shadow-lg);
+}
+
+.cta .h2 {
+  margin-top: 0;
+  color: #fff;
+}
+
+.ctaText {
+  margin-top: 12px;
+  font-size: 16.5px;
+  color: rgba(255, 255, 255, 0.9);
+  max-width: 52ch;
+}
+
+.ctaActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+/* On the teal band the primary action inverts: white pill, teal text. */
+.root .btnOnDark {
+  background: #fff;
+  border-color: #fff;
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.root .btnOnDark:hover {
+  background: var(--accent-bg);
+  border-color: var(--accent-bg);
+}
+
+.root .btnGhostOnDark {
+  background: transparent;
+  border-color: rgba(255, 255, 255, 0.6);
+  color: #fff;
+}
+
+.root .btnGhostOnDark:hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: #fff;
+}
+
+/* The global focus ring is teal, which vanishes on a teal band. */
+.root .btnGhostOnDark:focus-visible,
+.root .btnOnDark:focus-visible {
+  outline-color: #fff;
+}
+
+/* --- footer -------------------------------------------------------------- */
+
+.footer {
+  border-top: 1px solid var(--border);
+  padding: 36px 0 44px;
+  font-size: 13.5px;
+  color: var(--ink-2);
+}
+
+.footerInner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.footerNote {
+  margin-top: 8px;
+  max-width: 46ch;
+}
+
+.footerLinks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+}
+
+.footerLinks a {
+  color: var(--ink-2);
+}
+
+.footerLinks a:hover {
+  color: var(--ink);
+  text-decoration: underline;
+}
+
+.footerFine {
+  margin-top: 20px;
+  font-size: 12.5px;
+}
+
+/* --- responsive ---------------------------------------------------------- */
+
+@media (max-width: 980px) {
+  .heroInner {
+    grid-template-columns: 1fr;
+    gap: 48px;
+    padding-top: 52px;
+    padding-bottom: 72px;
+  }
+
+  .heroVisual {
+    max-width: 560px;
+    width: 100%;
+    margin: 0 auto;
+  }
+
+  .steps {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .split,
+  .principles {
+    grid-template-columns: 1fr;
+    gap: 36px;
+  }
+
+  .splitReverse .splitMedia {
+    order: 0;
+  }
+
+  .split + .split {
+    margin-top: 80px;
+  }
+
+  .privacyGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .cta {
+    grid-template-columns: 1fr;
+    padding: 48px 32px;
+  }
+}
+
+@media (max-width: 720px) {
+  .navLinks {
+    display: none;
+  }
+
+  .section {
+    padding: 72px 0;
+  }
+}
+
+@media (max-width: 640px) {
+  .container {
+    padding-left: 18px;
+    padding-right: 18px;
+  }
+
+  .headerInner {
+    gap: 12px;
+  }
+
+  /* Two buttons and the wordmark do not fit a phone; Sign in survives as the
+   * text link, the primary action keeps its pill. */
+  .hideOnPhone {
+    display: none;
+  }
+
+  .heroVisual {
+    padding: 0;
+  }
+
+  /* The brief cannot overlap the photo on a phone without covering it, so it
+   * drops below and overlaps only the bottom edge. */
+  .brief {
+    position: relative;
+    width: auto;
+    margin: -56px 14px 0;
+  }
+
+  .floatChip {
+    right: 12px;
+    top: 12px;
+  }
+
+  .proofInner {
+    grid-template-columns: 1fr;
+  }
+
+  .proofItem + .proofItem {
+    border-left: 0;
+    border-top: 1px solid var(--border);
+  }
+
+  .steps,
+  .features,
+  .aiCols {
+    grid-template-columns: 1fr;
+  }
+
+  .aiCols {
+    gap: 22px;
+  }
+
+  .aiCard {
+    padding: 22px 20px;
+  }
+
+  .cta {
+    padding: 40px 24px;
+    border-radius: 18px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .btnLg svg,
+  .feature {
+    transition: none;
+  }
+
+  .btnLg:hover svg {
+    transform: none;
+  }
+}

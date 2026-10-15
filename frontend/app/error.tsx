@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect } from "react";
+import { APP_HOME } from "@/lib/routes";
 
 /**
  * Route-level error boundary.
@@ -46,12 +47,14 @@ export default function Error({
             <button className="btn btn--primary" onClick={reset}>
               Try again
             </button>
-            {/* eslint-disable-next-line @next/next/no-html-link-for-pages --
-                a deliberate full page load. This is the escape hatch from a
-                render that already failed, so client-side navigation is exactly
-                what should not be relied on: <Link> keeps the same broken React
-                tree alive, and the state that caused the throw with it. */}
-            <a className="btn btn--subtle" href="/">
+            {/* A plain <a>, not <Link>: a deliberate full page load. This is the
+                escape hatch from a render that already failed, so client-side
+                navigation is exactly what should not be relied on: <Link> keeps
+                the same broken React tree alive, and the state that caused the
+                throw with it. (@next/next/no-html-link-for-pages only inspects
+                string literals, so it no longer needs disabling here now that
+                the href is APP_HOME.) */}
+            <a className="btn btn--subtle" href={APP_HOME}>
               Back to Today
             </a>
           </div>

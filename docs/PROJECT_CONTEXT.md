@@ -291,8 +291,9 @@ design history:
 ```
 frontend/
 ├── app/                    App Router
+│   ├── (home)/             "/" -> the public home page: what the product is, sign-in/sign-up CTAs
 │   ├── (app)/              authenticated area, wrapped in the clinical shell
-│   │   ├── page.tsx        "/" -> the follow-up queue
+│   │   ├── today/          "/today" -> the follow-up queue, where sign-in lands
 │   │   ├── follow-ups/     same queue under its own name
 │   │   ├── schedule/       visit schedule
 │   │   ├── patients/       list, and [patientId] detail/timeline
@@ -312,6 +313,7 @@ frontend/
 │   ├── recording/          pure: format picker, exact-size chunker, uploader, level meter maths
 │   ├── api/                openapi-fetch wrappers, same-origin only
 │   ├── auth/               server.ts (secrets) and client.ts (browser)
+│   ├── routes.ts           PUBLIC_HOME, APP_HOME, SIGN_IN, SIGN_UP: paths several modules must agree on
 │   └── types/api.d.ts      generated from /openapi.json
 ├── tests/                  Vitest: dates, the polling hook, the BFF proxy
 ├── eslint.config.mjs       Next's rule set; `npm run lint`
@@ -336,9 +338,27 @@ because constructing one throws.
 
 Auth is Neon Auth (Managed Better Auth, `@neondatabase/auth`), already enabled on
 this project with Google OAuth on shared development credentials. `proxy.ts`
-protects every route except `/auth/*` and `/api/auth/*`; the BFF repeats the
+protects every route except `/`, `/auth/*` and `/api/auth/*`; the BFF repeats the
 session check for its own requests, since middleware guards navigation and says
 nothing about a later fetch.
+
+**`/` is public, but still runs through Neon Auth's middleware.** That middleware
+is what completes Google sign-in: the OAuth callback returns to the provider's
+`redirectTo` with a session verifier in the query string, and the middleware
+exchanges it on whatever page it lands on. Excluding `/` from the matcher would
+break any callback that arrives there. Neon Auth's Next adapter cannot be given
+extra public routes, so `proxy.ts` interprets its answer for `/` instead: a
+redirect to the sign-in page means signed out (serve the home page), being let
+through means signed in (redirect to `/today`), and any other redirect is the
+OAuth exchange (pass through). `NeonAuthUIProvider`'s `redirectTo` is `/today`
+(`APP_HOME` in `lib/routes.ts`), so sign-in lands on the queue directly rather
+than bouncing off the home page.
+
+`NeonAuthUIProvider`'s `.neon-auth-ui` wrapper encloses the whole app, not just
+auth-ui's components, so an element selector under it in `globals.css` reaches
+every page. A `.neon-auth-ui a` rule once outranked `.btn--primary` and drew teal
+text on every teal `<Link>` button; it is now scoped to auth-ui's
+`[data-slot="card"]`.
 
 One thing this depends on staying true: the OpenAPI schema at `/openapi.json` is
 the source of truth for types (`npm run gen:api`, don't hand-write).
@@ -1882,6 +1902,17 @@ you extract changes.
 
 - Prompts are data, not code. Change behaviour by editing `prompts/*.md` where
   possible.
+- **The public home page states what reaches the model.** Its privacy section
+  (`AI_WORKS_FROM`, `AI_KEPT_FROM` and `PRIVACY_POINTS` in
+  `frontend/app/(home)/page.tsx`) is a statement to practitioners about patient
+  data. Any change to what a prompt or the speech-to-text request receives must
+  update it in the same change. The lists are present tense and must stay
+  true; planned work is the note's "Next, we're..." sentence (name and
+  contact masking, removing `patient_name` / `doctor_name`, Deepgram's
+  `mip_opt_out`). Move each into the lists only when it ships (README To
+  Dos). "The AI model we use does not train on your consultations" holds for
+  Bedrock and not for Gemini's free tier, so revisit it if `llm.provider`
+  changes.
 - Anything deterministic — dates, arithmetic, validation, id lookups — belongs in
   Python, not in a prompt.
 - The database is the source of truth for patient facts (age, gender, dates).
