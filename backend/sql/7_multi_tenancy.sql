@@ -102,7 +102,7 @@ DECLARE
     -- recoverable with a one-line UPDATE, but it is alarming, so it is worth
     -- being sure before running this.
     -- =======================================================================
-    FIRST_DOCTOR_EMAIL TEXT := 'owner@example.com';
+    FIRST_DOCTOR_EMAIL TEXT := 'REPLACE_WITH_YOUR_NEON_AUTH_EMAIL';
     FIRST_DOCTOR_NAME  TEXT := 'Darshil';
     -- =======================================================================
 

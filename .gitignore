@@ -5,8 +5,7 @@
 !.env.example
 
 # Patient data. Uploaded transcripts must never be committed. The synthetic
-# seed transcripts live in backend/archive/transcripts_json/ and are tracked,
-# so a fresh clone can rebuild these with `python -m cli.convert_transcripts`.
+# seed transcripts are kept outside the repo (see .private/).
 backend/transcripts/*.txt
 # Consultation recordings and in-flight upload chunks (local storage backend).
 backend/audio/
@@ -46,3 +45,6 @@ archive
 .run_local/
 
 *.ipynb
+# Private notes and data kept out of the public repo
+.private/
+backend/archive/transcripts_json/

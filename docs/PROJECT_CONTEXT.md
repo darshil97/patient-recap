@@ -256,7 +256,7 @@ backend/
 │   ├── check_keys.py            does the model provider's key work
 │   └── convert_transcripts.py   one-off JSON -> .txt migration (already run)
 │
-├── archive/transcripts_json/    the 16 original synthetic transcripts, tracked
+├── archive/transcripts_json/    the 16 original synthetic transcripts, kept locally, not in git
 │
 ├── prompts/                     Jinja2 templates, one per layer
 ├── transcripts/                 the 18 originals, <visit_id>.txt (§8.22)
@@ -401,8 +401,8 @@ key.
 
 Transcripts were originally JSON with `patient_name`, `disease` and `transcript`
 keys. `cli/convert_transcripts.py` migrated all 16 to `.txt`; the originals are
-archived in `backend/archive/transcripts_json/` and tracked in git so a fresh
-clone can rebuild the text files. `patient_name` was redundant (the pipeline
+archived locally in `backend/archive/transcripts_json/`, which is not in the public
+repo. `patient_name` was redundant (the pipeline
 takes the name from the database) and `disease` was only ever a prop for
 generating the synthetic transcripts, so neither survives (§8.3).
 
